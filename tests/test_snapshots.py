@@ -57,6 +57,32 @@ def test_migrate_is_idempotent(db: str) -> None:
     assert {"snapshot", "product"} <= tables
 
 
+def test_newer_database_is_left_alone(db: str) -> None:
+    """Базу от более новой версии нельзя «понижать»: та версия применила бы
+    свои миграции повторно и упала на уже существующей колонке."""
+    with store.connect(db) as connection:
+        connection.execute(f"PRAGMA user_version = {schema.VERSION + 5}")
+        connection.commit()
+
+    with store.connect(db) as connection:
+        assert schema.migrate(connection) == schema.VERSION + 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.VERSION + 5
+
+
+def test_half_applied_migration_recovers(db: str) -> None:
+    """Колонка уже добавлена, а номер версии откатился — так выглядела база
+    после того, как её открыл exe предыдущей версии."""
+    with store.connect(db) as connection:
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+
+    with store.connect(db) as connection:          # не должно падать
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.VERSION
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(snapshot)")}
+        assert "layout" in columns
+        assert len([c for c in columns if c == "layout"]) == 1
+
+
 def test_missing_database_is_created(db: str) -> None:
     assert store.list_snapshots(db) == []
     assert Path(db).exists()

@@ -57,23 +57,54 @@ CREATE INDEX IF NOT EXISTS snapshot_created ON snapshot(created_at DESC);
 # может читаться из разных колонок (доллары или рубли за разный объём заказа),
 # и после смены колонки в настройках нужен новый снимок, а не отказ по дублю.
 _V3 = """
-ALTER TABLE snapshot ADD COLUMN layout TEXT NOT NULL DEFAULT '';
 DROP INDEX IF EXISTS snapshot_content;
 CREATE UNIQUE INDEX snapshot_content
     ON snapshot(source_file_hash, sheet_name, layout);
 """
 
-_MIGRATIONS: tuple[str, ...] = (_V1, _V2, _V3)
+
+def _step_1(connection: sqlite3.Connection) -> None:
+    connection.executescript(_V1)
+
+
+def _step_2(connection: sqlite3.Connection) -> None:
+    connection.executescript(_V2)
+
+
+def _step_3(connection: sqlite3.Connection) -> None:
+    _add_column(connection, "snapshot", "layout", "TEXT NOT NULL DEFAULT ''")
+    connection.executescript(_V3)
+
+
+_MIGRATIONS = (_step_1, _step_2, _step_3)
 VERSION = len(_MIGRATIONS)
+
+
+def _add_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Добавляет колонку, если её ещё нет.
+
+    В SQLite у ALTER TABLE нет IF NOT EXISTS, а миграция может оказаться
+    применённой наполовину — например, если базу успел открыть exe более
+    старой версии. Без этой проверки повторный проход падал бы с
+    «duplicate column name».
+    """
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def migrate(connection: sqlite3.Connection) -> int:
     """Доводит схему до актуальной версии. Повторный вызов ничего не меняет."""
     current = connection.execute("PRAGMA user_version").fetchone()[0]
+    if current >= VERSION:
+        # База сделана более новой версией приложения. Понижать номер нельзя:
+        # тогда та версия применила бы свои миграции заново, поверх готовой
+        # схемы. Работаем с тем, что есть, — колонки нужных нам версий на месте.
+        return current
+
     for step in range(current, VERSION):
-        connection.executescript(_MIGRATIONS[step])
-    if current != VERSION:
-        # Параметры в PRAGMA не подставляются — значение только из своего кода.
-        connection.execute(f"PRAGMA user_version = {VERSION}")
-        connection.commit()
+        _MIGRATIONS[step](connection)
+    # Параметры в PRAGMA не подставляются — значение только из своего кода.
+    connection.execute(f"PRAGMA user_version = {VERSION}")
+    connection.commit()
     return VERSION
