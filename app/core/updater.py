@@ -79,8 +79,23 @@ def apply_update(new_exe_path: str, current_path: str | None = None) -> None:
         os.remove(old_path)
     os.rename(current, old_path)
     os.replace(new_exe_path, current)
-    subprocess.Popen([current], close_fds=True,
+    subprocess.Popen([current], env=child_environment(), close_fds=True,
                       creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+
+
+def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Окружение для новой версии — без служебных переменных PyInstaller.
+
+    Onefile-сборка держит распакованные файлы во временной папке и сообщает
+    её путь через `_PYI_APPLICATION_HOME_DIR`. Унаследовав эту переменную,
+    новый процесс не распаковывался бы заново, а сел бы в папку старого — а
+    тот, завершаясь, её удаляет. Приложение запускалось и падало позже, на
+    первом обращении к файлу ресурсов.
+    """
+    environment = dict(os.environ if source is None else source)
+    for name in [n for n in environment if n.startswith(("_PYI", "_MEIPASS"))]:
+        del environment[name]
+    return environment
 
 
 def cleanup_leftover(current_path: str | None = None) -> None:

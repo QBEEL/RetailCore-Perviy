@@ -71,7 +71,12 @@ def test_apply_update_renames_and_replaces(tmp_path: Path, monkeypatch: pytest.M
     new_exe.write_bytes("новая версия".encode("utf-8"))
 
     captured: dict[str, object] = {}
-    monkeypatch.setattr(updater.subprocess, "Popen", lambda args, **kwargs: captured.setdefault("args", args))
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+
+    monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
 
     updater.apply_update(str(new_exe), current_path=str(current))
 
@@ -79,6 +84,26 @@ def test_apply_update_renames_and_replaces(tmp_path: Path, monkeypatch: pytest.M
     old_exe = tmp_path / "RetailCore.old.exe"
     assert old_exe.read_bytes() == "старая версия".encode("utf-8")
     assert captured["args"] == [str(current)]
+    # Новую версию нельзя запускать с окружением старой (см. child_environment).
+    assert captured["env"] is not None
+    assert not [name for name in captured["env"] if name.startswith(("_PYI", "_MEIPASS"))]
+
+
+def test_child_environment_drops_pyinstaller_variables() -> None:
+    """Унаследованный _PYI_APPLICATION_HOME_DIR уводил новый процесс в чужую
+    временную папку, которую старый удалял при выходе."""
+    source = {
+        "PATH": "C:/Windows",
+        "APPDATA": "C:/Users/u/AppData/Roaming",
+        "_PYI_APPLICATION_HOME_DIR": "C:/Temp/_MEI111162",
+        "_PYI_ARCHIVE_FILE": "C:/App/RetailCore.exe",
+        "_PYI_PARENT_PROCESS_LEVEL": "0",
+        "_MEIPASS2": "C:/Temp/_MEI111162",
+    }
+
+    result = updater.child_environment(source)
+
+    assert result == {"PATH": "C:/Windows", "APPDATA": "C:/Users/u/AppData/Roaming"}
 
 
 def test_cleanup_leftover_removes_old_exe(tmp_path: Path) -> None:

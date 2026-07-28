@@ -76,6 +76,28 @@ def connect(path: str | None = None) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def layout_signature(sheet: Sheet) -> str:
+    """Из каких колонок прочитаны отслеживаемые поля.
+
+    В прайсе дистрибьютора цена есть и в долларах, и в рублях для нескольких
+    объёмов заказа. Пользователь выбирает нужную колонку в настройках, и такой
+    выбор обязан порождать новый снимок: содержимое файла то же, а цифры в
+    истории — уже другие.
+    """
+    tracked = (FieldRole.ARTICLE, FieldRole.EAN, FieldRole.SKU, FieldRole.NAME,
+               FieldRole.BRAND, FieldRole.CATEGORY, FieldRole.VOLUME, FieldRole.PRICE)
+    parts = []
+    for role in tracked:
+        if (column := sheet.column_for(role)) is not None:
+            parts.append(f"{role.value}={column.index}")
+    return ",".join(parts)
+
+
+def price_column(sheet: Sheet) -> str:
+    column = sheet.column_for(FieldRole.PRICE)
+    return column.title if column is not None else ""
+
+
 def file_hash(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -96,13 +118,15 @@ def create(
     повторный выбор того же файла не должны плодить одинаковые версии.
     """
     digest = file_hash(sheet.path)
+    layout = layout_signature(sheet)
     records = sheet.records
     total = len(records)
 
     with connect(path) as connection:
         existing = connection.execute(
-            "SELECT id FROM snapshot WHERE source_file_hash = ? AND sheet_name = ?",
-            (digest, sheet.sheet_name),
+            "SELECT id FROM snapshot WHERE source_file_hash = ? AND sheet_name = ?"
+            " AND layout = ?",
+            (digest, sheet.sheet_name, layout),
         ).fetchone()
         if existing is not None:
             _log(f"Import started\nFile: {os.path.basename(sheet.path)}\n"
@@ -113,12 +137,12 @@ def create(
         cursor = connection.execute(
             """INSERT INTO snapshot (created_at, source_file_name, source_file_path,
                                      source_file_hash, sheet_name, total_products,
-                                     brand, category, user_id, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     brand, category, user_id, description, layout)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (datetime.now().isoformat(timespec="seconds"), os.path.basename(sheet.path),
              sheet.path, digest, sheet.sheet_name, total,
              _dominant(records, FieldRole.BRAND), _dominant(records, FieldRole.CATEGORY),
-             _user(), description),
+             _user(), description or price_column(sheet), layout),
         )
         snapshot_id = int(cursor.lastrowid)
 

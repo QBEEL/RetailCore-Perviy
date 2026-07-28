@@ -25,12 +25,7 @@ def selftest(argv: list[str]) -> int:
         ok &= exists
         report.append(f"ресурс {name}: {'найден' if exists else 'ОТСУТСТВУЕТ'}")
 
-    try:
-        import qtawesome  # noqa: F401
-        report.append("qtawesome: доступен")
-    except ImportError as error:
-        ok = False
-        report.append(f"qtawesome: ОШИБКА — {error}")
+    ok &= _check_icons(report)
 
     catalog = None
     if len(argv) >= 2:
@@ -64,6 +59,39 @@ def selftest(argv: list[str]) -> int:
         except (OSError, ValueError):
             pass
     return 0 if ok else 1
+
+
+def _check_icons(report: list[str]) -> bool:
+    """Рисует иконку по-настоящему: шрифты подгружаются только в этот момент.
+
+    Одного `import qtawesome` мало — файлы .ttf открываются лениво, и сборка
+    без них проходила бы проверку, а падала уже у пользователя при первом
+    построении окна.
+    """
+    try:
+        import qtawesome  # noqa: F401
+    except ImportError as error:
+        report.append(f"qtawesome: ОШИБКА — {error}")
+        return False
+
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from app.ui import icons
+
+        application = QApplication.instance() or QApplication([])
+        drawn = [name for name in ("match", "history", "update", "settings")
+                 if not icons.icon(name).pixmap(16, 16).isNull()]
+        del application
+    except Exception as error:  # noqa: BLE001 — отчёт важнее аккуратного типа
+        report.append(f"иконки: ОШИБКА — {error}")
+        return False
+
+    if len(drawn) < 4:
+        report.append(f"иконки: ОШИБКА — отрисовано {len(drawn)} из 4 (нет шрифтов?)")
+        return False
+    report.append("иконки: шрифты загружены, 4 из 4 отрисованы")
+    return True
 
 
 def _check_snapshots(catalog, report: list[str]) -> bool:

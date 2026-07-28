@@ -53,7 +53,17 @@ _V2 = """
 CREATE INDEX IF NOT EXISTS snapshot_created ON snapshot(created_at DESC);
 """
 
-_MIGRATIONS: tuple[str, ...] = (_V1, _V2)
+# Разметка колонок входит в тождество снимка: у одного и того же файла цена
+# может читаться из разных колонок (доллары или рубли за разный объём заказа),
+# и после смены колонки в настройках нужен новый снимок, а не отказ по дублю.
+_V3 = """
+ALTER TABLE snapshot ADD COLUMN layout TEXT NOT NULL DEFAULT '';
+DROP INDEX IF EXISTS snapshot_content;
+CREATE UNIQUE INDEX snapshot_content
+    ON snapshot(source_file_hash, sheet_name, layout);
+"""
+
+_MIGRATIONS: tuple[str, ...] = (_V1, _V2, _V3)
 VERSION = len(_MIGRATIONS)
 
 

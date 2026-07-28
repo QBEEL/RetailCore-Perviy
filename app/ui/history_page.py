@@ -93,7 +93,10 @@ class HistoryPage(QWidget):
                    sort_key=lambda s: s.total_products,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             Column("Бренд", lambda s: s.brand, 130),
-            Column("Категория", lambda s: s.category, 170),
+            # Из какой колонки взята цена: в прайсе дистрибьютора их несколько
+            # (доллары, рубли для разного объёма заказа), и без этого непонятно,
+            # что за цифры лежат в истории.
+            Column("Цена из колонки", lambda s: s.description, 190),
             Column("Пользователь", lambda s: s.user_id, 130),
         ]
 

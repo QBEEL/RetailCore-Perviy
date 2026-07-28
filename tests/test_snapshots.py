@@ -100,6 +100,39 @@ def test_identical_content_does_not_create_second_snapshot(tmp_path: Path, db: s
     assert len(store.list_snapshots(db)) == 1
 
 
+def test_other_price_column_creates_new_snapshot(tmp_path: Path, db: str) -> None:
+    """У дистрибьютора цена есть в долларах и в рублях. Смена колонки в
+    настройках обязана дать новый снимок, а не отказ по дублю."""
+    path = _catalog_file(tmp_path, "distributor.xlsx", "июнь")
+    rows = [["a1", "1", "Товар", 10.7, "AHC", 916.68]]
+
+    usd = _sheet(path, rows)
+    first = store.create(usd, db)
+
+    # Роль «цена» переставлена на колонку с рублями — как это делает
+    # пользователь в «Настройках» → «Колонки файла».
+    rub = _sheet(path, rows)
+    rub.columns[3].role = FieldRole.OTHER
+    rub.columns[5].role = FieldRole.PRICE
+    for record in rub.records:
+        record.by_role[FieldRole.PRICE] = record.values[5]
+    second = store.create(rub, db)
+
+    assert first is not None and second is not None
+    assert second.id != first.id
+    assert store.products(first.id, db)[0].price == 10.7
+    assert store.products(second.id, db)[0].price == 916.68
+
+
+def test_snapshot_records_price_column(tmp_path: Path, db: str) -> None:
+    """Из какой колонки взята цена — видно в истории, иначе цифры необъяснимы."""
+    path = _catalog_file(tmp_path, "distributor.xlsx", "июнь")
+    snapshot = store.create(_sheet(path, [["a1", "1", "Товар", 10.7, "AHC", None]]), db)
+
+    assert snapshot is not None
+    assert snapshot.description == "РРЦ"
+
+
 def test_changed_file_creates_new_version(tmp_path: Path, db: str) -> None:
     august = _catalog_file(tmp_path, "catalog.xlsx", "август")
     store.create(_sheet(august, [["a1", "1", "Товар", 100, "Z&R", None]]), db)

@@ -75,6 +75,7 @@ class SnapshotViewDialog(QDialog):
             f"Загружен {snapshot.created_at:%d.%m.%Y в %H:%M} · лист «{snapshot.sheet_name}» · "
             f"товаров {snapshot.total_products}"
             + (f" · бренд {snapshot.brand}" if snapshot.brand else "")
+            + (f" · цена из колонки «{snapshot.description}»" if snapshot.description else "")
             + (f" · пользователь {snapshot.user_id}" if snapshot.user_id else ""), self))
 
         search = QLineEdit(self)
@@ -184,12 +185,26 @@ class SnapshotCompareDialog(QDialog):
         if len(self._snapshots) > 1:
             self._compare()
 
+    def _snapshot(self, snapshot_id: int) -> Snapshot:
+        return next(s for s in self._snapshots if s.id == snapshot_id)
+
     def _compare(self) -> None:
         before_id, after_id = self.before.currentData(), self.after.currentData()
         if before_id == after_id:
             self.summary.setText("Выбрана одна и та же версия — сравнивать нечего.")
             self.table.set_items([])
             return
+        before = self._snapshot(before_id)
+        after = self._snapshot(after_id)
+        # Цена из разных колонок (доллары против рублей) дала бы «рост на 9000 %»
+        # там, где просто сменилась единица измерения.
+        if before.description != after.description and before.description and after.description:
+            self.summary.setText(
+                f"⚠ Цены взяты из разных колонок: «{before.description}» и "
+                f"«{after.description}». Сравнивать их между собой нельзя.")
+            self.table.set_items([])
+            return
+
         result = diff(self._loader(before_id), self._loader(after_id))
         self.table.set_items(_rows(result))
         if not result.total:
