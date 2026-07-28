@@ -280,9 +280,55 @@ def _price(value: Any) -> float | None:
 
 
 def _dominant(records: Sequence[Record], role: FieldRole) -> str:
-    """Самое частое значение роли: бренд и категория описывают файл целиком."""
+    """Описание роли одной строкой: имя, если файл про один бренд, иначе счёт.
+
+    У дистрибьютора в прайсе десятки брендов, и «самый частый» из них
+    подписывал бы файл именем случайного бренда — в истории это выглядело бы
+    так, будто весь прайс принадлежит ему.
+    """
     counter = Counter(text for record in records if (text := record.text(role)))
-    return counter.most_common(1)[0][0] if counter else ""
+    if not counter:
+        return ""
+    top, count = counter.most_common(1)[0]
+    if len(counter) == 1:
+        return top
+    total = sum(counter.values())
+    if count / total >= 0.8:
+        return f"{top} и ещё {_plural(len(counter) - 1, 'бренд', 'бренда', 'брендов')}"
+    return _plural(len(counter), "бренд", "бренда", "брендов")
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    tail, hundred = count % 10, count % 100
+    if tail == 1 and hundred != 11:
+        word = one
+    elif 2 <= tail <= 4 and not 12 <= hundred <= 14:
+        word = few
+    else:
+        word = many
+    return f"{count} {word}"
+
+
+def is_trackable(sheet: Sheet) -> bool:
+    """Стоит ли вести историю по этому листу.
+
+    В книгах поставщиков первым идёт лист-обложка («Главная», бланк для
+    заполнения), и снимок с него засорял бы историю строками вроде «ФИО
+    получателя». Лист считается каталогом, если у заметной доли строк есть
+    идентификатор товара либо цена.
+    """
+    total = len(sheet.records)
+    if total < 5:
+        return False
+    identifiers = sum(
+        1 for record in sheet.records
+        if any(record.by_role.get(role) is not None
+               for role in (FieldRole.ARTICLE, FieldRole.EAN, FieldRole.SKU))
+    )
+    if identifiers / total >= 0.25:
+        return True
+    prices = sum(1 for record in sheet.records if record.by_role.get(FieldRole.PRICE) is not None)
+    return total >= 20 and prices / total >= 0.5
 
 
 def _user() -> str:

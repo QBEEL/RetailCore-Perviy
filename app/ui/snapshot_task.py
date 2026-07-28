@@ -28,7 +28,7 @@ def capture(
     `status` получает короткий текст о ходе работы: на больших каталогах
     запись занимает заметное время, и пользователь должен видеть, что идёт.
     """
-    if not settings.snapshots_enabled:
+    if not settings.snapshots_enabled or not snapshots.is_trackable(sheet):
         return
     run_task(
         snapshots.create,

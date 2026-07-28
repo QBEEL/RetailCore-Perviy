@@ -7,6 +7,7 @@ from .store import (
     database_size,
     delete,
     get,
+    is_trackable,
     list_snapshots,
     products,
 )
@@ -14,5 +15,5 @@ from .store import (
 __all__ = [
     "ProductChange", "Snapshot", "SnapshotDiff", "SnapshotProduct",
     "changed_fields", "create", "database_path", "database_size", "delete",
-    "diff", "get", "list_snapshots", "products",
+    "diff", "get", "is_trackable", "list_snapshots", "products",
 ]

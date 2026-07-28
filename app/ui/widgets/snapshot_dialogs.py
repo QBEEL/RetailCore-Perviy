@@ -20,13 +20,42 @@ from .common import Hint, SectionTitle
 from .inputs import SelectBox
 from .table import Column, DataTable
 
-# Как показывается вид различия: подпись и цвет строки.
+# Как показывается вид различия: подпись и цвет строки. Рост цены для
+# закупщика — плохая новость, снижение — хорошая, поэтому цвета разные.
 _KINDS = {
     "added": ("+ новый", Palette.SUCCESS),
     "removed": ("− удалён", Palette.DANGER),
-    "price": ("↑ цена", Palette.WARNING),
-    "changed": ("↑ характеристики", Palette.PRIMARY),
+    "price_up": ("↑ цена выросла", Palette.DANGER),
+    "price_down": ("↓ цена упала", Palette.SUCCESS),
+    # Цена появилась или пропала: направление посчитать не от чего, и выдавать
+    # это за подорожание нельзя.
+    "price_set": ("~ цена появилась", Palette.PRIMARY),
+    "price_gone": ("~ цены больше нет", Palette.WARNING),
+    "changed": ("~ характеристики", Palette.PRIMARY),
 }
+
+# Порядок сортировки по умолчанию: сначала подорожания, они важнее всего.
+_ORDER = {"price_up": 0, "price_down": 1, "price_gone": 2, "price_set": 3,
+          "added": 4, "removed": 5, "changed": 6}
+
+
+class _Row:
+    """Строка таблицы различий."""
+
+    __slots__ = ("kind", "name", "brand", "code", "before", "after", "delta", "sort")
+
+    def __init__(self, kind: str, product: SnapshotProduct, before: str = "",
+                 after: str = "", delta: str = "", sort: float = 0.0) -> None:
+        self.kind = kind
+        self.name = product.label
+        self.brand = product.brand
+        # У дистрибьютора артикулов может не быть вовсе — тогда товар
+        # опознаётся по штрихкоду, и показывать нужно именно его.
+        self.code = product.article or product.ean
+        self.before = before
+        self.after = after
+        self.delta = delta
+        self.sort = sort
 
 
 class SnapshotViewDialog(QDialog):
@@ -120,15 +149,27 @@ class SnapshotCompareDialog(QDialog):
         self.summary = Hint("Выберите версии и нажмите «Сравнить».", self)
         root.addWidget(self.summary)
 
+        self.search = QLineEdit(self)
+        self.search.setPlaceholderText("Фильтр по бренду, названию или штрихкоду…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda text: _filter(self.table, text))
+        root.addWidget(self.search)
+
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         self.table = DataTable([
-            Column("Что", lambda r: _KINDS[r[0]][0], 150,
-                   color=lambda r: QColor(_KINDS[r[0]][1])),
-            Column("Наименование", lambda r: r[1], 320),
-            Column("Артикул", lambda r: r[2], 150),
-            Column("Было", lambda r: r[3], 150,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            Column("Стало", lambda r: r[4], 150,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            Column("Что", lambda r: _KINDS[r.kind][0], 145,
+                   sort_key=lambda r: (_ORDER[r.kind], -abs(r.sort)),
+                   color=lambda r: QColor(_KINDS[r.kind][1])),
+            Column("Бренд", lambda r: r.brand, 130, highlight=True),
+            Column("Наименование", lambda r: r.name, 280, highlight=True),
+            Column("Артикул / штрихкод", lambda r: r.code, 150, highlight=True),
+            Column("Было", lambda r: r.before, 90, align=right,
+                   sort_key=lambda r: _number(r.before)),
+            Column("Стало", lambda r: r.after, 90, align=right,
+                   sort_key=lambda r: _number(r.after)),
+            Column("Изменение", lambda r: r.delta, 100, align=right,
+                   sort_key=lambda r: r.sort,
+                   color=lambda r: QColor(_KINDS[r.kind][1]) if r.delta else None),
         ], self)
         root.addWidget(self.table, 1)
 
@@ -151,39 +192,79 @@ class SnapshotCompareDialog(QDialog):
             return
         result = diff(self._loader(before_id), self._loader(after_id))
         self.table.set_items(_rows(result))
-        self.summary.setText(
-            f"Новых: {len(result.added)} · удалённых: {len(result.removed)} · "
-            f"изменение цены: {len(result.price_changes)} · "
-            f"изменение характеристик: {len(result.changed) - len(result.price_changes)}"
-            if result.total else "Различий не найдено — версии совпадают.")
+        if not result.total:
+            self.summary.setText("Различий не найдено — версии совпадают.")
+            return
+        price = result.price_changes
+        up = sum(1 for change in price if change.price_rose is True)
+        down = sum(1 for change in price if change.price_rose is False)
+        parts = [f"Новых: {len(result.added)}", f"удалённых: {len(result.removed)}",
+                 f"подорожало: {up}", f"подешевело: {down}"]
+        if other := len(price) - up - down:
+            parts.append(f"цена появилась или пропала: {other}")
+        parts.append(f"изменение характеристик: {len(result.changed) - len(price)}")
+        self.summary.setText(" · ".join(parts))
 
 
-def _rows(result: SnapshotDiff) -> list[tuple[str, str, str, str, str]]:
-    """Плоские строки таблицы: вид различия, товар и значения до/после."""
-    rows: list[tuple[str, str, str, str, str]] = [
-        ("added", product.label, product.article, "", _money(product.price))
-        for product in result.added
-    ]
-    rows += [("removed", product.label, product.article, _money(product.price), "")
+def _rows(result: SnapshotDiff) -> list[_Row]:
+    """Строки таблицы различий, отсортированные по важности для закупщика."""
+    rows = [_Row("added", product, after=_money(product.price))
+            for product in result.added]
+    rows += [_Row("removed", product, before=_money(product.price))
              for product in result.removed]
+
     for change in result.changed:
         if change.price_changed:
-            rows.append(("price", change.after.label, change.after.article,
-                         _money(change.before.price), _money(change.after.price)))
+            percent = change.price_percent
+            before, after = _pair(change.before.price, change.after.price)
+            rows.append(_Row(
+                _price_kind(change), change.after, before=before, after=after,
+                delta=f"{percent:+.1f}%" if percent is not None else "",
+                sort=percent or 0.0))
         if other := [f for f in change.fields if f != "price"]:
-            rows.append(("changed", change.after.label, change.after.article,
-                         _fields(change.before, other), _fields(change.after, other)))
+            rows.append(_Row("changed", change.after,
+                             before=_fields(change.before, other),
+                             after=_fields(change.after, other)))
+
+    # Сначала подорожания, внутри — по величине: это то, из-за чего вообще
+    # открывают сравнение.
+    rows.sort(key=lambda row: (_ORDER[row.kind], -abs(row.sort)))
     return rows
+
+
+def _price_kind(change) -> str:  # type: ignore[no-untyped-def]
+    """Направление изменения цены — только когда есть обе цены."""
+    rose = change.price_rose
+    if rose is not None:
+        return "price_up" if rose else "price_down"
+    return "price_gone" if change.after.price is None else "price_set"
 
 
 def _fields(product: SnapshotProduct, names: Sequence[str]) -> str:
     return " · ".join(str(getattr(product, name, "")) for name in names)
 
 
-def _money(value: float | None) -> str:
+def _pair(before: float | None, after: float | None) -> tuple[str, str]:
+    """Обе цены одного вида: «4.30 → 4» читалось бы как разные величины."""
+    fractional = any(value is not None and not float(value).is_integer()
+                     for value in (before, after))
+    return _money(before, fractional), _money(after, fractional)
+
+
+def _money(value: float | None, fractional: bool | None = None) -> str:
     if value is None:
         return ""
-    return f"{value:.0f}" if float(value).is_integer() else f"{value:.2f}"
+    if fractional is None:
+        fractional = not float(value).is_integer()
+    digits = 2 if fractional else 0
+    return f"{value:,.{digits}f}".replace(",", " ")
+
+
+def _number(text: str) -> float:
+    try:
+        return float(text.replace(" ", "").replace(",", "."))
+    except (AttributeError, ValueError):
+        return -1.0
 
 
 def _filter(table: DataTable, text: str) -> None:

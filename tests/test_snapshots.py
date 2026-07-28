@@ -196,6 +196,67 @@ def test_diff_ignores_price_rounding_noise() -> None:
     assert compare.diff([_product("a1", price=None)], [_product("a1", price=None)]).total == 0
 
 
+def test_price_direction_and_percent() -> None:
+    """Направление обязано отличать подорожание от подешевения."""
+    up = compare.diff([_product("a1", price=100.0)], [_product("a1", price=125.0)]).changed[0]
+    assert up.price_rose is True
+    assert up.price_percent == pytest.approx(25.0)
+
+    down = compare.diff([_product("a1", price=100.0)], [_product("a1", price=75.0)]).changed[0]
+    assert down.price_rose is False
+    assert down.price_percent == pytest.approx(-25.0)
+
+
+def test_price_direction_unknown_when_one_side_missing() -> None:
+    """Появившаяся цена — не подешевение: направление считать не от чего."""
+    appeared = compare.diff([_product("a1", price=None)], [_product("a1", price=50.0)]).changed[0]
+    assert appeared.price_rose is None
+    assert appeared.price_percent is None
+
+    gone = compare.diff([_product("a1", price=50.0)], [_product("a1", price=None)]).changed[0]
+    assert gone.price_rose is None
+
+
+# --- описание файла и пригодность листа -------------------------------------------
+
+def test_brand_of_multibrand_file_is_not_a_single_name(tmp_path: Path, db: str) -> None:
+    """У дистрибьютора десятки брендов — подписывать файл одним из них нельзя."""
+    path = _catalog_file(tmp_path, "distributor.xlsx", "июнь")
+    rows = [[f"a{i}", str(i), f"Товар {i}", 100, f"Бренд {i % 12}", None] for i in range(60)]
+
+    snapshot = store.create(_sheet(path, rows), db)
+
+    assert snapshot is not None
+    assert snapshot.brand == "12 брендов"
+
+
+def test_brand_of_single_brand_file_is_its_name(tmp_path: Path, db: str) -> None:
+    path = _catalog_file(tmp_path, "brand.xlsx", "июнь")
+    rows = [[f"a{i}", str(i), f"Товар {i}", 100, "Z&R", None] for i in range(30)]
+
+    snapshot = store.create(_sheet(path, rows), db)
+
+    assert snapshot is not None
+    assert snapshot.brand == "Z&R"
+
+
+def test_service_sheet_is_not_trackable(tmp_path: Path) -> None:
+    """Лист-обложка «Главная» не должен попадать в историю."""
+    path = _catalog_file(tmp_path, "supplier.xlsx", "июнь")
+    cover = _sheet(path, [
+        [None, None, "Контактная информация", None, None, None],
+        [None, None, "Дата заказа", None, None, None],
+        [None, None, "ФИО получателя", None, None, None],
+        [None, None, "Город получателя", None, None, None],
+        [None, None, "Контактный телефон", None, None, None],
+        [None, None, "Комментарий", None, None, None],
+    ])
+    assert store.is_trackable(cover) is False
+
+    catalog = _sheet(path, [[f"a{i}", str(i), f"Товар {i}", 100, "Z&R", None] for i in range(30)])
+    assert store.is_trackable(catalog) is True
+
+
 def test_diff_matches_by_ean_when_article_missing() -> None:
     before = [_product("", ean="4603720459040", price=100.0)]
     after = [_product("", ean="4603720459040", price=150.0)]

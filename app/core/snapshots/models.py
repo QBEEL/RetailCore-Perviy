@@ -82,6 +82,21 @@ class ProductChange:
             return None
         return self.after.price - self.before.price
 
+    @property
+    def price_percent(self) -> float | None:
+        """На сколько процентов изменилась цена. Важнее абсолютной разницы:
+        рост на рубль у позиции за 5 и за 500 — совершенно разные новости."""
+        delta = self.price_delta
+        if delta is None or not self.before.price:
+            return None
+        return delta / abs(self.before.price) * 100
+
+    @property
+    def price_rose(self) -> bool | None:
+        """True — подорожало, False — подешевело, None — цену не сравнить."""
+        delta = self.price_delta
+        return None if delta is None or delta == 0 else delta > 0
+
 
 @dataclass(slots=True)
 class SnapshotDiff:
