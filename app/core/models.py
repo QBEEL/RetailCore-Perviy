@@ -210,6 +210,10 @@ class Candidate:
     record: Record
     score: float
     stage: str
+    # Насколько оценка снижена уточнением по объёму и названию. Нужна отдельно:
+    # порог доверия проверяется по надёжности этапа, а не по результату
+    # уточнения, задача которого — лишь развести кандидатов между собой.
+    penalty: float = 0.0
     volume_conflict: bool = False
     # Из какого каталога взята запись: имя файла для показа и номер для приоритета.
     origin: str = ""
@@ -232,6 +236,11 @@ class MatchResult:
     @property
     def score(self) -> float:
         return self.candidate.score if self.candidate else 0.0
+
+    @property
+    def stage_score(self) -> float:
+        """Оценка этапа без уточняющего штрафа — по ней проверяется порог."""
+        return self.candidate.score + self.candidate.penalty if self.candidate else 0.0
 
     @property
     def stage(self) -> str:

@@ -1,6 +1,7 @@
 """Чтение и запись Excel-файлов с кэшированием по времени изменения."""
 from __future__ import annotations
 
+import io
 import os
 from typing import Any, Callable, Iterable, Sequence
 
@@ -30,9 +31,43 @@ _CODE_ROLES = (FieldRole.ARTICLE, FieldRole.SKU)
 
 _cache: dict[tuple[str, str, float, int], Sheet] = {}
 
+# Книга Excel нового формата — это ZIP-архив.
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def open_workbook(
+    path: str,
+    *,
+    data_only: bool = True,
+    read_only: bool = False,
+) -> openpyxl.Workbook:
+    """Открывает книгу, не полагаясь на расширение файла.
+
+    1С выгружает шаблон переоценки с расширением `.xls`, а внутри это обычный
+    xlsx. openpyxl отказывается открывать такой файл по имени — проверка идёт
+    по расширению, — поэтому содержимое передаётся ему потоком. Настоящий
+    старый формат отсекается по сигнатуре: его openpyxl не читает вовсе, и
+    пользователю нужно понятное объяснение, а не трассировка.
+    """
+    name = os.path.basename(path)
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(len(_ZIP_MAGIC))
+    except OSError as error:
+        raise ValueError(f"Не удалось открыть файл {name}: {error}") from error
+    if head != _ZIP_MAGIC:
+        raise ValueError(
+            f"{name}: файл в старом формате Excel. Откройте его в Excel "
+            "и сохраните как «Книга Excel (*.xlsx)».")
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        return openpyxl.load_workbook(path, read_only=read_only, data_only=data_only)
+    with open(path, "rb") as handle:
+        stream = io.BytesIO(handle.read())
+    return openpyxl.load_workbook(stream, read_only=read_only, data_only=data_only)
+
 
 def list_sheets(path: str) -> list[str]:
-    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    workbook = open_workbook(path, read_only=True)
     try:
         return list(workbook.sheetnames)
     finally:
@@ -43,7 +78,7 @@ def read_raw(
     path: str, sheet_name: str | None = None, limit: int | None = None
 ) -> tuple[list[list[Any]], str]:
     """Сырые строки листа и его имя — для предпросмотра и определения структуры."""
-    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    workbook = open_workbook(path, read_only=True)
     try:
         worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.worksheets[0]
         rows: list[list[Any]] = []
@@ -120,15 +155,19 @@ def _build_records(
             if index < len(values) and values[index] is not None
         }
         record = Record(row=header_index + offset + 2, values=values, by_role=by_role)
-        _prepare(record, noise)
+        prepare_record(record, noise)
         records.append(record)
         if progress and (offset % 250 == 0 or offset == total - 1):
             progress(offset + 1, total)
     return records
 
 
-def _prepare(record: Record, noise: frozenset[str]) -> None:
-    """Считает нормализованные ключи один раз, чтобы поиск не пересчитывал их."""
+def prepare_record(record: Record, noise: frozenset[str]) -> None:
+    """Считает нормализованные ключи один раз, чтобы поиск не пересчитывал их.
+
+    Вызывается и из импортёров переоценки: они строят записи сами, зная
+    структуру файла, но представления для сравнения должны считаться так же.
+    """
     normalized = record.normalized
     for role in _NORMALIZED_ROLES:
         if (value := record.by_role.get(role)) is not None:
@@ -167,6 +206,42 @@ def invalidate_cache(path: str | None = None) -> None:
         del _cache[key]
 
 
+def write_sheet(
+    destination: str,
+    sheet_name: str,
+    titles: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+) -> int:
+    """Создаёт новый файл с одним листом: шапка и строки.
+
+    Нужно для выгрузок, у которых нет исходного файла-образца, — например
+    таблицы оплат. Числа записываются числами, а не строками: иначе в Excel по
+    колонке суммы не посчитать итог.
+    """
+    workbook = openpyxl.Workbook()
+    try:
+        worksheet = workbook.active
+        # Excel не принимает в имени листа : \\ / ? * [ ] и больше 31 знака.
+        worksheet.title = "".join(
+            ch for ch in (sheet_name or "Лист1") if ch not in ':\\/?*[]')[:31] or "Лист1"
+        worksheet.append(list(titles))
+        for cell in worksheet[1]:
+            cell.font = openpyxl.styles.Font(bold=True)
+        written = 0
+        for row in rows:
+            worksheet.append(list(row))
+            written += 1
+        worksheet.freeze_panes = "A2"
+        for index, title in enumerate(titles, start=1):
+            letter = openpyxl.utils.get_column_letter(index)
+            worksheet.column_dimensions[letter].width = min(max(len(str(title)) + 4, 12), 46)
+        worksheet.auto_filter.ref = worksheet.dimensions
+        workbook.save(destination)
+        return written
+    finally:
+        workbook.close()
+
+
 def write_values(
     path: str,
     destination: str,
@@ -179,7 +254,7 @@ def write_values(
     Файл открывается без data_only, иначе openpyxl заменил бы формулы их
     кэшированными значениями при сохранении.
     """
-    workbook = openpyxl.load_workbook(path)
+    workbook = open_workbook(path, data_only=False)
     try:
         worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.worksheets[0]
         written = 0

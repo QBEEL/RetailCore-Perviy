@@ -22,7 +22,7 @@ from app.core.normalize import (
 )
 from app.core.schema import detect_columns, detect_header_row
 from app.core.search import SearchEngine, SearchConfig
-from app.core.workbook import _prepare
+from app.core.workbook import prepare_record
 
 
 # --- нормализация ------------------------------------------------------------
@@ -123,7 +123,7 @@ def _sheet(rows: list[dict[FieldRole, object]], noise: frozenset[str] = frozense
     records = []
     for index, values in enumerate(rows):
         record = Record(row=index + 2, values=list(values.values()), by_role=dict(values))
-        _prepare(record, noise)
+        prepare_record(record, noise)
         records.append(record)
     return Sheet(path="test.xlsx", sheet_name="Лист", header_row=0, columns=columns,
                  records=records, noise_tokens=noise)

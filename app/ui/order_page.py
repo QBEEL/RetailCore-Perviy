@@ -47,10 +47,12 @@ class OrderPage(QWidget):
         settings: AppSettings,
         notify: Callable[[str, ToastKind], None],
         parent: QWidget | None = None,
+        plan_payment: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.notify = notify
+        self._plan_payment = plan_payment
         self.source: OrderSheet | None = None
         self.target: OrderSheet | None = None
         self.index: TargetIndex | None = None
@@ -119,6 +121,14 @@ class OrderPage(QWidget):
         self.run_button.setEnabled(False)
         self.run_button.clicked.connect(self.run_transfer)
         actions.addWidget(self.run_button)
+
+        self.payment_button = QPushButton("Создать оплату", card)
+        self.payment_button.setIcon(icons.icon("payments"))
+        self.payment_button.setToolTip(
+            "Открывает карточку оплаты по этому заказу: дата считается по отсрочке поставщика")
+        self.payment_button.setEnabled(False)
+        self.payment_button.clicked.connect(self.plan_payment)
+        actions.addWidget(self.payment_button)
 
         self.save_button = QPushButton("Сохранить бланк", card)
         self.save_button.setObjectName("Success")
@@ -368,6 +378,8 @@ class OrderPage(QWidget):
     def _update_ready(self) -> None:
         ready = self.source is not None and self.target is not None
         self.run_button.setEnabled(ready)
+        self.payment_button.setEnabled(
+            bool(self.lines) and self._plan_payment is not None)
         if ready:
             self.status_label.setText("Готово — нажмите «Перенести»")
 
@@ -596,6 +608,28 @@ class OrderPage(QWidget):
             return
         self.notify(f"Список сохранён: {os.path.basename(path)}", ToastKind.SUCCESS)
 
+    def plan_payment(self) -> None:
+        """Открывает карточку оплаты по перенесённому заказу.
+
+        Суммы в бланке заказа нет: модуль переносит количества, а не цены.
+        Поставщик берётся из имени файла, дата считается по его отсрочке,
+        а количество позиций и штук уходит в комментарий — чтобы человеку было
+        от чего считать сумму.
+        """
+        if self._plan_payment is None or not self.lines:
+            return
+        source = self.source_picker.path
+        name = _supplier_from_file(source)
+        units = sum(line.quantity for line in self.lines)
+        note = (f"Заказ {os.path.basename(source)}: позиций {len(self.lines)}, "
+                f"штук {units:g}")
+        self._plan_payment(
+            recipient=name,
+            comment=note,
+            origin="order",
+            origin_ref=source,
+        )
+
 
 def _fill_height(widget: QWidget) -> None:
     """Виджет занимает всю свободную высоту, но не требует её.
@@ -641,3 +675,32 @@ def _write_missing(lines: list[OrderLine], path: str) -> None:
     for column, width in zip("ABCDEF", (20, 18, 52, 28, 12, 18)):
         sheet.column_dimensions[column].width = width
     book.save(path)
+
+
+
+
+def _supplier_from_file(path: str) -> str:
+    """Догадка о поставщике по имени файла заказа.
+
+    Сначала ищется заведённая карточка — по названию или по одному из
+    дополнительных имён, которыми поставщик узнаётся в файлах. Если карточки
+    нет, берётся имя, вытащенное из названия файла. Точным это соответствие
+    быть не может, поэтому имя только предлагается: в карточке оплаты поле
+    остаётся доступным для правки.
+    """
+    if not path:
+        return ""
+    try:
+        from ..core import suppliers
+        from ..core.normalize import normalize_text
+
+        stem = normalize_text(os.path.splitext(os.path.basename(path))[0])
+        cards = suppliers.list_suppliers()
+        aliases = suppliers.all_aliases()
+        for card in cards:
+            keys = [card.key, *aliases.get(card.id, [])]
+            if any(key and key in stem for key in keys):
+                return card.name
+        return suppliers.default_supplier_name(path)
+    except Exception:  # noqa: BLE001 — база поставщиков необязательна
+        return ""

@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import appdata, snapshots
 from ..core.models import DEFAULT_SEARCH_ROLES, DEFAULT_WEIGHTS, FieldRole, Sheet
+from ..core.payments import LEVEL_PRESETS
 from ..core.settings import DEFAULT_FILL_ROLES, AppSettings
 from . import icons
 from .theme import Metrics, Palette
 from .widgets.common import Card, Divider, Hint, SectionTitle, Subtitle, Title
-from .widgets.inputs import DecimalInput, SelectBox
+from .widgets.inputs import DecimalInput, NumberInput, SelectBox
 from .widgets.toast import ToastKind
 
 # Поля, доступные для поиска. Порядок — по убыванию значимости.
@@ -79,6 +80,7 @@ class SettingsPage(QWidget):
         self._body.addWidget(self._matching_card())
         self._body.addWidget(self._fill_card())
         self._body.addWidget(self._mapping_card())
+        self._body.addWidget(self._payments_card())
         self._body.addWidget(self._history_card())
         self._body.addWidget(self._updates_card())
         self._body.addStretch(1)
@@ -251,6 +253,103 @@ class SettingsPage(QWidget):
         self._mapping_body.addLayout(self._mapping_grid)
         return card
 
+    def _payments_card(self) -> Card:
+        card = Card(self)
+        body = card.body()
+        body.addWidget(SectionTitle("Оплаты", card))
+        body.addWidget(Hint(
+            "Цвет дня в календаре оплат зависит от суммы за этот день. Значения "
+            "по умолчанию подобраны по вашей истории: медиана дня с оплатами — "
+            "около 1,4 млн, и шкала в сотнях тысяч покрасила бы красным семь "
+            "дней из десяти.", card))
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Готовые шкалы", card))
+        self.levels_preset = SelectBox(card)
+        self.levels_preset.setMinimumWidth(300)
+        for name, values in LEVEL_PRESETS.items():
+            self.levels_preset.addItem(name, list(values))
+        self.levels_preset.activated.connect(self._apply_level_preset)
+        preset_row.addWidget(self.levels_preset)
+        preset_row.addStretch(1)
+        body.addLayout(preset_row)
+
+        levels_row = QHBoxLayout()
+        levels_row.setSpacing(8)
+        self.level_inputs: list[NumberInput] = []
+        captions = ("Зелёный до", "Жёлтый до", "Оранжевый до")
+        for index, caption in enumerate(captions):
+            levels_row.addWidget(QLabel(caption, card))
+            field = NumberInput(card)
+            field.setRange(1_000, 1_000_000_000)
+            field.setSingleStep(50_000)
+            field.setGroupSeparatorShown(True)
+            field.setSuffix(" ₽")
+            field.setValue(int(self.settings.day_levels[index]))
+            field.valueChanged.connect(self._set_levels)
+            levels_row.addWidget(field)
+            self.level_inputs.append(field)
+        levels_row.addStretch(1)
+        body.addLayout(levels_row)
+        self.levels_hint = Hint("", card)
+        body.addWidget(self.levels_hint)
+
+        body.addWidget(Divider(card))
+        warn_row = QHBoxLayout()
+        warn_row.addWidget(QLabel("Предупреждать о бюджете при", card))
+        self.budget_warn = NumberInput(card)
+        self.budget_warn.setRange(50, 100)
+        self.budget_warn.setSuffix(" %")
+        self.budget_warn.setValue(int(self.settings.payment_budget_warn))
+        self.budget_warn.valueChanged.connect(self._set_budget_warn)
+        warn_row.addWidget(self.budget_warn)
+        warn_row.addStretch(1)
+        body.addLayout(warn_row)
+
+        self.import_reminder = QCheckBox(
+            "Напоминать по понедельникам о свежей выгрузке оплат", card)
+        self.import_reminder.setChecked(self.settings.payment_import_reminder)
+        self.import_reminder.toggled.connect(self._set_import_reminder)
+        body.addWidget(self.import_reminder)
+        self._refresh_levels_hint()
+        return card
+
+    def _apply_level_preset(self, index: int) -> None:
+        values = self.levels_preset.itemData(index)
+        if not values:
+            return
+        for field, value in zip(self.level_inputs, values):
+            field.blockSignals(True)
+            field.setValue(int(value))
+            field.blockSignals(False)
+        self._set_levels()
+
+    def _set_levels(self) -> None:
+        """Пороги должны идти по возрастанию, иначе уровень дня не определить."""
+        values = sorted(field.value() for field in self.level_inputs)
+        for field, value in zip(self.level_inputs, values):
+            if field.value() != value:
+                field.blockSignals(True)
+                field.setValue(value)
+                field.blockSignals(False)
+        self.settings.payment_levels = [float(v) for v in values]
+        self.settings.save()
+        self._refresh_levels_hint()
+
+    def _refresh_levels_hint(self) -> None:
+        low, middle, high = self.settings.day_levels
+        self.levels_hint.setText(
+            f"Зелёный до {low:,.0f} ₽ · жёлтый до {middle:,.0f} ₽ · "
+            f"оранжевый до {high:,.0f} ₽ · красный свыше".replace(",", " "))
+
+    def _set_budget_warn(self, value: int) -> None:
+        self.settings.payment_budget_warn = float(value)
+        self.settings.save()
+
+    def _set_import_reminder(self, checked: bool) -> None:
+        self.settings.payment_import_reminder = bool(checked)
+        self.settings.save()
+
     def _history_card(self) -> Card:
         card = Card(self)
         body = card.body()
@@ -339,8 +438,11 @@ class SettingsPage(QWidget):
             self._mapping_grid.addWidget(title, row, 1)
 
             combo = SelectBox(self)
+            # В данные элемента кладётся значение роли, а не сама роль: FieldRole
+            # унаследован от str, и Qt возвращает из currentData() обычную
+            # строку, теряя тип. Роль восстанавливается при чтении.
             for role in FieldRole:
-                combo.addItem(role.title, role)
+                combo.addItem(role.title, role.value)
             current = overrides.get(column.index, column.role)
             combo.setCurrentIndex(list(FieldRole).index(current))
             combo.currentIndexChanged.connect(
@@ -429,7 +531,8 @@ class SettingsPage(QWidget):
         self.settings.overwrite_filled = checked
         self._save()
 
-    def _set_override(self, index: int, role: FieldRole) -> None:
+    def _set_override(self, index: int, role: object) -> None:
+        """Роль приходит из выпадающего списка строкой — приведение делает AppSettings."""
         if self._mapping_sheet is None:
             return
         path = self._mapping_sheet.path

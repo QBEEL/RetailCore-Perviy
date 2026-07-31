@@ -164,7 +164,15 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
     border-color: {Palette.PRIMARY};
 }}
-QLineEdit:disabled {{ background: {Palette.SURFACE_ALT}; color: {Palette.TEXT_FAINT}; }}
+/* Заблокированное поле должно читаться как заблокированное. Правило было
+   только для QLineEdit, из-за чего в карточке чужой оплаты список, сумма и
+   комментарий выглядели обычными, хотя не принимали ввод. */
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled,
+QDoubleSpinBox:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
+    background: {Palette.SURFACE_ALT};
+    color: {Palette.TEXT_FAINT};
+    border-color: {Palette.BORDER};
+}}
 QLineEdit#Path {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }}
 
 QComboBox::drop-down {{ border: none; width: 22px; }}

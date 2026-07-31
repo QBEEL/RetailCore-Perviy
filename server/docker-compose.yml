@@ -1,0 +1,85 @@
+# Серверная часть RetailCore.
+#
+# На машине уже живёт посторонний проект ar-quest под PM2 со своим туннелем
+# Cloudflare, поэтому всё здесь занимает отдельные порты и отдельный том.
+# Наружу смотрит только Caddy; база и API доступны лишь внутри сети compose.
+#
+# Схема применяется при первом запуске (docker-entrypoint-initdb.d срабатывает
+# на пустом томе). Дальнейшие изменения — отдельными миграциями.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: retailcore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Сортировка по-русски: без неё список получателей уедет в порядок ASCII,
+      # где «Ёлка» окажется после «Яблоко».
+      LANG: ru_RU.utf8
+    volumes:
+      - retailcore-db:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/010-schema.sql:ro
+    # Порт наружу оставлен на localhost: он нужен для ручного psql и снятия
+    # копий, но не для приложения — оно ходит через API.
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Сервер однопроцессорный и с 2 ГБ памяти, рядом работает ar-quest.
+    # Ограничения не дают контейнерам выесть память соседа.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  api:
+    build: ./api
+    container_name: retailcore-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      API_SECRET: ${API_SECRET}
+      API_TOKEN_HOURS: ${API_TOKEN_HOURS:-12}
+      API_FILES_DIR: /srv/files
+    volumes:
+      # Та же папка, что копирует backup.sh: вложения переживают пересборку
+      # образа и попадают в резервную копию.
+      - ./files:/srv/files
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: retailcore-caddy
+    restart: unless-stopped
+    # Единственный контейнер, смотрящий наружу. Сертификат для retail.qbeely.ru
+    # Caddy получает и продлевает сам, для этого ему нужны 80 и 443.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  retailcore-db:
+  caddy-data:
+  caddy-config:

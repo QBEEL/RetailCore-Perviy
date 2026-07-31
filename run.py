@@ -46,6 +46,9 @@ def selftest(argv: list[str]) -> int:
     if catalog is not None:
         ok &= _check_snapshots(catalog, report)
 
+    ok &= _check_charts(report)
+    ok &= _check_payments(report)
+
     report.append("РЕЗУЛЬТАТ: " + ("успешно" if ok else "есть ошибки"))
     text = "\n".join(report)
 
@@ -130,6 +133,61 @@ def _snapshot_roundtrip(store, catalog, directory: str, report: list[str]) -> bo
 
     report.append(f"история данных: снимок из {len(saved)} товаров сохранён и прочитан")
     return True
+
+
+def _check_charts(report: list[str]) -> bool:
+    """Графики оплат рисует QtCharts, и в сборке его легко потерять.
+
+    Модуль входит в PySide6, но подключается отложенно, а его биндинг
+    `QtOpenGL` из сборки исключён. Если QtCharts не поднимется, страница оплат
+    молча покажет цифры без графиков — такое лучше увидеть здесь.
+    """
+    try:
+        from PySide6.QtCharts import QChart  # noqa: F401
+
+        report.append("графики: QtCharts доступен")
+        return True
+    except ImportError as error:
+        report.append(f"графики: ОШИБКА — QtCharts не подключился ({error})")
+        return False
+
+
+def _check_payments(report: list[str]) -> bool:
+    """Создаёт базу оплат во временной папке и проходит её насквозь.
+
+    Проверяется то, что ломается при сборке: миграция схемы, запись, чтение и
+    разбор выгрузки. Следов в данных пользователя не остаётся.
+    """
+    try:
+        import tempfile
+        from datetime import date
+
+        from app.core import appdata
+        from app.core.payments import Budget, Payment, PaymentStatus, analytics, store
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_dir, appdata.data_dir = appdata.data_dir, lambda: directory
+            try:
+                database = str(Path(directory) / "payments.db")
+                store.save_payment(Payment(
+                    amount=1000.0, recipient="Проверка ООО",
+                    pay_date=date(2026, 1, 15), status=PaymentStatus.PAID), database)
+                rows = store.list_payments(None, database)
+                stats = analytics.overview(rows)
+                if len(rows) != 1 or stats.total != 1000.0:
+                    report.append("оплаты: ОШИБКА — запись не прочиталась обратно")
+                    return False
+                store.save_budget(Budget(year=2026, month=1, amount=5000.0), database)
+                if not store.budgets(database):
+                    report.append("оплаты: ОШИБКА — бюджет не сохранился")
+                    return False
+            finally:
+                appdata.data_dir = original_dir
+        report.append("оплаты: база создана, платёж и бюджет сохранены и прочитаны")
+        return True
+    except Exception as error:  # noqa: BLE001 — отчёт важнее аккуратного типа
+        report.append(f"оплаты: ОШИБКА — {error}")
+        return False
 
 
 if __name__ == "__main__":

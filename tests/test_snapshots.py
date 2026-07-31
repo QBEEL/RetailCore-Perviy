@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.models import Column, FieldRole, Record, Sheet
 from app.core.snapshots import compare, schema, store
 from app.core.snapshots.models import SnapshotProduct
-from app.core.workbook import _prepare
+from app.core.workbook import prepare_record
 
 _HEADER = ["Артикул", "Штрихкод", "Номенклатура", "РРЦ", "Бренд", "Комментарий"]
 _ROLES = (FieldRole.ARTICLE, FieldRole.EAN, FieldRole.NAME,
@@ -27,7 +27,7 @@ def _sheet(path: Path, rows: list[list[object]], sheet_name: str = "Прайс")
         by_role = {role: value for (_, role), value in zip(zip(_HEADER, _ROLES), values)
                    if role is not FieldRole.OTHER and value is not None}
         record = Record(row=offset + 2, values=list(values), by_role=by_role)
-        _prepare(record, frozenset())
+        prepare_record(record, frozenset())
         records.append(record)
     return Sheet(path=str(path), sheet_name=sheet_name, header_row=0,
                  columns=columns, records=records)

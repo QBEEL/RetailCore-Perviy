@@ -22,6 +22,7 @@ from ..theme import Metrics, Palette
 from .inputs import SelectBox
 
 EXCEL_FILTER = "Excel (*.xlsx *.xlsm *.xls);;Все файлы (*.*)"
+CSV_FILTER = "Выгрузка 1С (*.csv *.txt);;Все файлы (*.*)"
 
 
 class FilePicker(QFrame):
@@ -35,8 +36,10 @@ class FilePicker(QFrame):
         label: str,
         hint: str = "",
         parent: QWidget | None = None,
+        file_filter: str = EXCEL_FILTER,
     ) -> None:
         super().__init__(parent)
+        self._filter = file_filter
         self.setAcceptDrops(True)
         # Поля выбора файла не сжимаются: при нехватке места уступает таблица,
         # у которой есть прокрутка, а не элементы управления.
@@ -139,7 +142,7 @@ class FilePicker(QFrame):
 
     def browse(self) -> None:
         start = os.path.dirname(self._path) if self._path else ""
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл Excel", start, EXCEL_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", start, self._filter)
         if path:
             self.set_path(path)
 

@@ -2,32 +2,43 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 from rapidfuzz import fuzz, process
 
+from . import article
 from .models import Candidate, FieldRole, MatchResult, MatchStatus, Quantity, Record, Sheet
-from .normalize import code_key, digits_only, split_multi
+from .normalize import DEFAULT_KEY_OPTIONS, KeyOptions, code_key, digits_only
 
 ProgressCallback = Callable[[int, int], None]
 # Запись каталога вместе с его порядковым номером — номер задаёт приоритет.
 _Ref = tuple[Record, int]
 
 STAGE_ARTICLE = "Артикул"
+STAGE_ARTICLE_BASE = "Артикул (база)"
 STAGE_EAN = "EAN"
 STAGE_NAME_VOLUME = "Название + объём"
 STAGE_NAME = "Название"
 STAGE_FUZZY = "Нечёткое совпадение"
 
 _IDENTIFIER_SCORE = 100.0
+# Совпадение по базовому артикулу слабее точного: модификацию ещё предстоит
+# подтвердить объёмом или названием.
+_BASE_SCORE = 94.0
 _NAME_VOLUME_SCORE = 96.0
 _NAME_ONLY_SCORE = 88.0
 
 
 @dataclass(slots=True)
 class MatchConfig:
-    """Пороги сопоставления. Объём — жёсткое условие, а не подсказка."""
+    """Пороги сопоставления. Объём — жёсткое условие, а не подсказка.
+
+    Значения по умолчанию повторяют поведение вкладки «Сопоставление»:
+    штрафы выключены, разбор модификаций артикула выключен. Переоценка
+    включает их явно — там ячейка артикула 1С перечисляет варианты одной
+    номенклатуры, и выбрать нужный можно только по близости объёма.
+    """
 
     volume_tolerance: float = 0.05
     enforce_volume: bool = True
@@ -35,6 +46,23 @@ class MatchConfig:
     auto_accept: float = 90.0
     ambiguity_delta: float = 2.0
     max_alternatives: int = 5
+
+    # Какие этапы участвуют в подборе.
+    use_article: bool = True
+    use_sku: bool = True
+    use_ean: bool = True
+    use_name: bool = True
+    use_fuzzy: bool = True
+
+    # Разбор артикула: перечисление вариантов и «база + модификация».
+    separators: str = article.DEFAULT_SEPARATORS
+    modifier_separators: str = ""
+    key_options: KeyOptions = field(default_factory=lambda: DEFAULT_KEY_OPTIONS)
+
+    # Уточнение оценки внутри этапа: чем дальше объём и название кандидата от
+    # искомых, тем ниже его оценка. Ноль — прежнее поведение без уточнения.
+    volume_penalty: float = 0.0
+    name_penalty: float = 0.0
 
 
 class Matcher:
@@ -49,11 +77,20 @@ class Matcher:
         self.config = config or MatchConfig()
         self._origins = [os.path.basename(sheet.path) for sheet in self.sources]
         self._by_code: dict[str, list[_Ref]] = {}
+        self._by_base: dict[str, list[_Ref]] = {}
         self._by_ean: dict[str, list[_Ref]] = {}
         self._by_name: dict[str, list[_Ref]] = {}
         self._names: list[str] = []
         self._name_refs: list[_Ref] = []
         self._build_indexes()
+
+    def _variants(self, value: object) -> list[article.Article]:
+        return article.article_variants(
+            value, self.config.separators, self.config.modifier_separators,
+            self.config.key_options)
+
+    def _code(self, value: object) -> str:
+        return code_key(value, self.config.key_options)
 
     @property
     def source(self) -> Sheet | None:
@@ -65,9 +102,12 @@ class Matcher:
             for record in sheet.records:
                 ref = (record, catalog)
                 for role in (FieldRole.ARTICLE, FieldRole.SKU):
-                    for part in split_multi(record.by_role.get(role)):
-                        if key := code_key(part):
-                            self._by_code.setdefault(key, []).append(ref)
+                    for variant in self._variants(record.by_role.get(role)):
+                        self._by_code.setdefault(variant.key, []).append(ref)
+                        # По базе ищут только когда точного совпадения нет,
+                        # поэтому индекс наполняется всегда — лишним он не бывает.
+                        if variant.base_key:
+                            self._by_base.setdefault(variant.base_key, []).append(ref)
                 if key := digits_only(record.by_role.get(FieldRole.EAN)):
                     self._by_ean.setdefault(key, []).append(ref)
                 if name := record.match_key:
@@ -116,21 +156,40 @@ class Matcher:
         """Артикул и EAN — самые надёжные ключи, проверяются первыми."""
         candidates: list[Candidate] = []
         seen: set[int] = set()
-        for role in (FieldRole.ARTICLE, FieldRole.SKU):
-            for part in split_multi(target.by_role.get(role)):
-                for ref in self._by_code.get(code_key(part), ()):
-                    if id(ref[0]) not in seen:
-                        seen.add(id(ref[0]))
-                        candidates.append(self._candidate(ref, _IDENTIFIER_SCORE, STAGE_ARTICLE))
-        for ref in self._by_ean.get(digits_only(target.by_role.get(FieldRole.EAN)), ()):
+
+        def take(ref: _Ref, score: float, stage: str) -> None:
             if id(ref[0]) not in seen:
                 seen.add(id(ref[0]))
-                candidates.append(self._candidate(ref, _IDENTIFIER_SCORE, STAGE_EAN))
+                candidates.append(self._candidate(ref, score, stage))
+
+        roles = []
+        if self.config.use_article:
+            roles.append(FieldRole.ARTICLE)
+        if self.config.use_sku:
+            roles.append(FieldRole.SKU)
+
+        bases: list[str] = []
+        for role in roles:
+            for variant in self._variants(target.by_role.get(role)):
+                for ref in self._by_code.get(variant.key, ()):
+                    take(ref, _IDENTIFIER_SCORE, STAGE_ARTICLE)
+                if variant.base_key and variant.base_key != variant.key:
+                    bases.append(variant.base_key)
+        if self.config.use_ean:
+            for ref in self._by_ean.get(digits_only(target.by_role.get(FieldRole.EAN)), ()):
+                take(ref, _IDENTIFIER_SCORE, STAGE_EAN)
+        # База проверяется, только если точного артикула нет ни у одной записи:
+        # «ABC123/50» сначала должен найти «ABC123/50», и лишь потом — семейство
+        # «ABC123», из которого нужный вариант выберет объём.
+        if not candidates:
+            for base in bases:
+                for ref in self._by_base.get(base, ()):
+                    take(ref, _BASE_SCORE, STAGE_ARTICLE_BASE)
         return candidates
 
     def _by_name_stage(self, target: Record) -> list[Candidate]:
         name = target.match_key
-        if not name:
+        if not name or not self.config.use_name:
             return []
         stage = STAGE_NAME_VOLUME if target.quantity else STAGE_NAME
         score = _NAME_VOLUME_SCORE if target.quantity else _NAME_ONLY_SCORE
@@ -138,7 +197,7 @@ class Matcher:
 
     def _by_fuzzy(self, target: Record) -> list[Candidate]:
         name = target.match_key
-        if not name or not self._names:
+        if not name or not self._names or not self.config.use_fuzzy:
             return []
         matches = process.extract(
             name,
@@ -171,10 +230,39 @@ class Matcher:
             if conflict and enforce and self.config.enforce_volume:
                 rejected.append(candidate)
             else:
+                candidate.penalty = self._refinement(target, candidate)
+                candidate.score -= candidate.penalty
                 accepted.append(candidate)
         accepted.sort(key=lambda c: (-c.score, c.catalog, c.record.row))
         rejected.sort(key=lambda c: (-c.score, c.catalog, c.record.row))
         return accepted, rejected
+
+    def _refinement(self, target: Record, candidate: Candidate) -> float:
+        """Штраф за неточность внутри допуска: ближний вариант должен выигрывать.
+
+        Ячейка артикула 1С перечисляет варианты одной номенклатуры, и все они
+        попадают в кандидаты с одинаковой оценкой 100. Допуска объёма мало:
+        «195 мл» и «200 мл, банка» отличаются на 2,5 % и проходят оба. Разводит
+        их близость объёма, а при равном объёме — сходство названия.
+        """
+        penalty = 0.0
+        if self.config.volume_penalty:
+            distance = self._volume_distance(target.quantity, candidate.record.quantity)
+            if distance is not None and self.config.volume_tolerance > 0:
+                penalty += self.config.volume_penalty * min(
+                    distance / self.config.volume_tolerance, 1.0)
+        if self.config.name_penalty and target.match_key and candidate.record.match_key:
+            similarity = fuzz.token_set_ratio(target.match_key, candidate.record.match_key)
+            penalty += self.config.name_penalty * (1.0 - similarity / 100.0)
+        return penalty
+
+    @staticmethod
+    def _volume_distance(target: Quantity | None, source: Quantity | None) -> float | None:
+        """Относительное расхождение объёмов; None — сравнивать нечего."""
+        if target is None or source is None or target.unit != source.unit:
+            return None
+        largest = max(abs(target.value), abs(source.value))
+        return 0.0 if largest == 0 else abs(target.value - source.value) / largest
 
     def _volume_conflict(self, target: Quantity | None, source: Quantity | None) -> bool:
         """Конфликт возможен, только если объём известен с обеих сторон."""

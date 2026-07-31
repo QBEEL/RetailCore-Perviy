@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Iterable
 
 from .models import Quantity
@@ -111,18 +112,44 @@ def digits_only(value: object) -> str:
     return "".join(ch for ch in text if ch.isdigit())
 
 
-def code_key(value: object) -> str:
-    """Ключ для артикулов: регистр и разделители не значимы."""
+@dataclass(frozen=True, slots=True)
+class KeyOptions:
+    """Что именно не учитывается при сравнении кодов.
+
+    Значения по умолчанию повторяют обычное поведение приложения: регистр,
+    пробелы и знаки не значимы. Отдельные флаги нужны там, где пользователь
+    сам решает строгость сравнения — например при переоценке, если у двух
+    поставщиков артикулы различаются только регистром.
+    """
+
+    ignore_case: bool = True
+    ignore_spaces: bool = True
+    ignore_symbols: bool = True
+
+
+DEFAULT_KEY_OPTIONS = KeyOptions()
+
+
+def code_key(value: object, options: KeyOptions = DEFAULT_KEY_OPTIONS) -> str:
+    """Ключ для артикулов: регистр и разделители по умолчанию не значимы."""
     if value is None:
         return ""
-    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+    text = str(value)
+    if options.ignore_case:
+        text = text.casefold()
+    if options.ignore_symbols:
+        return "".join(ch for ch in text if ch.isalnum())
+    if options.ignore_spaces:
+        return "".join(text.split())
+    return text.strip()
 
 
-def split_multi(value: object) -> list[str]:
+def split_multi(value: object, separators: str = "/,;") -> list[str]:
     """Артикул может содержать несколько значений через «/», «,» или перенос строки."""
     if value is None:
         return []
     text = str(value).strip()
     if not text or text.startswith("="):
         return []
-    return [part.strip() for part in re.split(r"[/,;\n]", text) if part.strip()]
+    pattern = f"[{re.escape(separators)}\n\r\t]" if separators else r"[\n\r\t]"
+    return [part.strip() for part in re.split(pattern, text) if part.strip()]

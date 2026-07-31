@@ -41,9 +41,26 @@ def main() -> int:
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
 
-    window = MainWindow(AppSettings.load())
+    settings = AppSettings.load()
+    _adopt_profiles(settings)
+    window = MainWindow(settings)
     window.show()
     return app.exec()
+
+
+def _adopt_profiles(settings: AppSettings) -> None:
+    """Переносит профили поставщиков из settings.json в базу.
+
+    Делается один раз, на пустой базе: профили появились раньше базы, и
+    пользователь не должен настраивать соответствие колонок заново. Сбой
+    переноса не мешает запуску — база просто останется пустой.
+    """
+    try:
+        from .core import suppliers
+
+        suppliers.adopt_settings_profiles(settings.supplier_profiles.items)
+    except Exception:  # noqa: BLE001 — приложение обязано стартовать в любом случае
+        pass
 
 
 if __name__ == "__main__":

@@ -15,6 +15,11 @@ NAMES = {
     "match": "mdi6.compare-horizontal",
     "catalog": "mdi6.database-search",
     "order": "mdi6.clipboard-arrow-right-outline",
+    "price": "mdi6.currency-rub",
+    "suppliers": "mdi6.truck-outline",
+    "payments": "mdi6.calendar-month-outline",
+    "budget": "mdi6.wallet-outline",
+    "chart": "mdi6.chart-bar",
     "settings": "mdi6.tune-variant",
     "open": "mdi6.folder-open-outline",
     "run": "mdi6.play-circle-outline",
@@ -44,6 +49,11 @@ NAMES = {
     "compare": "mdi6.compare",
     "trash": "mdi6.trash-can-outline",
     "folder": "mdi6.folder-cog-outline",
+    "admin": "mdi6.shield-account-outline",
+    "refresh": "mdi6.refresh",
+    "plus": "mdi6.plus-circle-outline",
+    "edit": "mdi6.pencil-outline",
+    "key": "mdi6.key-variant",
 }
 
 
