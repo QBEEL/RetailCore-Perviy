@@ -22,7 +22,14 @@ from typing import Any, Sequence
 
 from .. import appdata
 from . import transport
-from .models import Budget, Payment, PaymentFile, PaymentOrigin, PaymentStatus
+from .models import (
+    Budget,
+    Payment,
+    PaymentFile,
+    PaymentOrigin,
+    PaymentStatus,
+    SupplierRow,
+)
 from .recipients import recipient_key
 from .store import Filter
 
@@ -158,7 +165,10 @@ def _params(selection: Filter | None) -> dict[str, Any]:
         "end": chosen.end,
         "statuses": [status.value for status in chosen.statuses],
         "supplier_id": chosen.supplier_id or None,
-        "recipient": chosen.recipient,
+        # Отбор идёт по нормализованному ключу, а не по имени: «НеваЛайн ООО»
+        # и «ООО "Невалайн"» — один получатель. Ключ считается той же
+        # функцией, что и при записи, — двух реализаций у него быть не должно.
+        "recipient_key": recipient_key(chosen.recipient) if chosen.recipient else None,
         "amount_from": chosen.amount_from,
         "amount_to": chosen.amount_to,
         "responsible": chosen.responsible,
@@ -449,6 +459,22 @@ def drop_recipient_link(recipient: str, path: str | None = None) -> bool:
         if error.status == 404:
             return False
         raise
+
+
+def suppliers(responsible: str = "", months: int = 0,
+              path: str | None = None) -> list[SupplierRow]:
+    """Поставщики из оплат с их менеджерами. Считает сервер."""
+    rows = transport.get("/api/payments/suppliers",
+                         {"responsible": responsible, "months": months or None})
+    return [
+        SupplierRow(
+            recipient_key=row["recipient_key"], recipient=row["recipient"],
+            supplier_id=int(row["supplier_id"] or 0),
+            payments=int(row["payments"]), amount=float(row["amount"] or 0.0),
+            last_pay=_date(row["last_pay"]), managers=list(row["managers"]),
+        )
+        for row in rows
+    ]
 
 
 def unlinked_recipients(path: str | None = None) -> list[tuple[str, int, float]]:

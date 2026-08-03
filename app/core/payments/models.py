@@ -169,6 +169,47 @@ class PaymentFile:
 
 
 @dataclass(slots=True)
+class SupplierRow:
+    """Поставщик, каким его видно из оплат.
+
+    Карточки в базе поставщиков заводятся руками и есть далеко не у всех, а
+    получатель приходит с каждой выгрузкой 1С. Поэтому настоящий список
+    поставщиков — этот.
+    """
+
+    recipient_key: str = ""
+    recipient: str = ""
+    supplier_id: int = 0
+    payments: int = 0
+    amount: float = 0.0
+    last_pay: date | None = None
+    # Все, кто платил, от частого к редкому. Почти половина получателей
+    # оплачивается несколькими менеджерами, поэтому владелец здесь не один.
+    managers: list[str] = field(default_factory=list)
+
+    @property
+    def main_manager(self) -> str:
+        return self.managers[0] if self.managers else ""
+
+    @property
+    def shared(self) -> bool:
+        """С поставщиком работает больше одного человека."""
+        return len(self.managers) > 1
+
+    @property
+    def manager_title(self) -> str:
+        if not self.managers:
+            return ""
+        if len(self.managers) == 1:
+            return self.managers[0]
+        return f"{self.managers[0]} + ещё {len(self.managers) - 1}"
+
+    @property
+    def has_card(self) -> bool:
+        return bool(self.supplier_id)
+
+
+@dataclass(slots=True)
 class Budget:
     """Бюджет месяца."""
 

@@ -27,6 +27,7 @@ from .models import (
     PaymentOrigin,
     PaymentStatus,
     SUPPLIER_OPERATION,
+    SupplierRow,
 )
 from . import schema
 from .recipients import recipient_key
@@ -542,6 +543,51 @@ def detach_file(file_id: int, path: str | None = None) -> bool:
     if row is not None:
         _drop_file(row["path"])
     return removed
+
+
+def suppliers(responsible: str = "", months: int = 0,
+              path: str | None = None) -> list[SupplierRow]:
+    """Поставщики из оплат с их менеджерами. Тот же ответ, что даёт сервер."""
+    where: list[str] = ["recipient <> ''"]
+    values: list[Any] = []
+    if months > 0:
+        where.append("pay_date >= date('now', ?)")
+        values.append(f"-{int(months)} months")
+    if responsible:
+        # Отбор оставляет получателя целиком, а не только его оплаты: иначе
+        # «всего оплат» у своего поставщика оказалось бы меньше настоящего.
+        where.append(
+            "recipient_key IN (SELECT recipient_key FROM payment"
+            " WHERE responsible = ? AND recipient <> '')")
+        values.append(responsible)
+    condition = " AND ".join(where)
+
+    with connect(path) as connection:
+        rows = connection.execute(
+            "SELECT recipient_key, MAX(recipient) recipient,"
+            "       MAX(supplier_id) supplier_id, COUNT(*) payments,"
+            "       SUM(amount) amount, MAX(pay_date) last_pay"
+            f" FROM payment WHERE {condition}"
+            " GROUP BY recipient_key ORDER BY SUM(amount) DESC",
+            values).fetchall()
+        managers: dict[str, list[str]] = {}
+        for row in connection.execute(
+                "SELECT recipient_key, responsible, COUNT(*) n FROM payment"
+                f" WHERE {condition} AND responsible <> ''"
+                " GROUP BY recipient_key, responsible"
+                " ORDER BY n DESC, responsible", values).fetchall():
+            managers.setdefault(row["recipient_key"], []).append(row["responsible"])
+
+    return [
+        SupplierRow(
+            recipient_key=row["recipient_key"], recipient=row["recipient"],
+            supplier_id=int(row["supplier_id"] or 0),
+            payments=int(row["payments"]), amount=float(row["amount"] or 0.0),
+            last_pay=_date(row["last_pay"]),
+            managers=managers.get(row["recipient_key"], []),
+        )
+        for row in rows
+    ]
 
 
 def may_edit(payment: Payment | int) -> bool:

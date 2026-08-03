@@ -125,6 +125,20 @@ class RecipientLinkOut(BaseModel):
     updated_at: datetime
 
 
+class SupplierRow(BaseModel):
+    """Поставщик, каким его видно из оплат."""
+
+    recipient_key: str
+    recipient: str
+    supplier_id: int = 0
+    payments: int = 0
+    amount: float = 0.0
+    last_pay: date | None = None
+    # Все, кто платил этому поставщику, от частого к редкому. Список, а не одно
+    # имя: почти половина получателей оплачивается несколькими менеджерами.
+    managers: list[str] = []
+
+
 class UnlinkedRecipient(BaseModel):
     recipient: str
     payments: int

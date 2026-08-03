@@ -3,9 +3,20 @@
 У каждого поставщика свой файл переоценки и своя структура данных. База помнит
 разбор каждого — как читать его прайс и какие позиции пришлось свести вручную, —
 поэтому второй прайс того же поставщика обрабатывается почти без ручной работы.
+
+Список строится из оплат, а не из карточек. Карточку заводят руками и только
+когда нужен разбор прайса, поэтому их единицы; получатель же приходит с каждой
+выгрузкой 1С, и таких — почти шестьсот. Список из карточек показывал бы пустую
+вкладку при полутора тысячах реальных поставщиков.
+
+Отбор по менеджеру сделан фильтром, а не разделением на «своих» и «чужих».
+Половина получателей оплачивается несколькими людьми, и назначение каждому
+единственного владельца было бы выдумкой: поставщик виден у всех, кто с ним
+работал, а первым в подписи стоит тот, у кого оплат больше.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 from PySide6.QtCore import Qt
@@ -27,7 +38,10 @@ from PySide6.QtWidgets import (
 )
 
 from ..core import suppliers
+from ..core.payments import SupplierRow, transport
+from ..core.payments import data as payments
 from ..core.suppliers import Supplier, SupplierLayout, SupplierLink
+from ..core.normalize import normalize_text
 from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
@@ -37,6 +51,97 @@ from .widgets.inputs import SelectBox
 from .widgets.supplier_dialogs import SupplierLayoutDialog
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
+
+
+@dataclass(slots=True)
+class Entry:
+    """Строка списка: поставщик из оплат и его карточка, если она заведена."""
+
+    name: str = ""
+    row: SupplierRow | None = None
+    card: Supplier | None = None
+    # Менеджер, по которому отобран список. Он должен стоять в подписи первым:
+    # иначе при фильтре «мои» у поставщика значится чужое имя — то, у кого
+    # оплат больше, — и строка выглядит попавшей в список по ошибке.
+    focus: str = ""
+
+    @property
+    def id(self) -> int:
+        return self.card.id if self.card else 0
+
+    @property
+    def managers(self) -> list[str]:
+        return self.row.managers if self.row else []
+
+    @property
+    def manager_title(self) -> str:
+        names = self.managers
+        if not names:
+            return ""
+        if self.focus and self.focus in names:
+            others = len(names) - 1
+            return f"{self.focus} + ещё {others}" if others else self.focus
+        return self.row.manager_title if self.row else ""
+
+    @property
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.row and self.row.payments:
+            parts.append(f"оплат: {self.row.payments}")
+            parts.append(f"{self.row.amount:,.0f} ₽".replace(",", " "))
+            if self.row.last_pay:
+                parts.append(f"последняя {self.row.last_pay:%d.%m.%Y}")
+            if self.managers:
+                parts.append(self.manager_title)
+        if self.card:
+            parts.append(f"структур: {self.card.layouts}")
+        else:
+            # Отсутствие карточки — не изъян: она нужна только для разбора
+            # прайса. Но знать об этом, глядя на список, полезно.
+            parts.append("без карточки")
+        return " · ".join(parts)
+
+    @property
+    def haystack(self) -> str:
+        card = self.card
+        extra = f"{card.brands} {card.categories} {card.note}" if card else ""
+        return f"{self.name} {extra} {' '.join(self.managers)}"
+
+
+def _load_all(responsible: str) -> tuple[list[Supplier], list[SupplierRow]]:
+    """Карточки и поставщики из оплат — одним походом, в фоновой задаче."""
+    cards = suppliers.list_suppliers()
+    try:
+        rows = payments.suppliers(responsible)
+    except Exception:  # noqa: BLE001 — оплаты не должны ронять вкладку
+        # Нет входа в общую базу или сервер недоступен: карточки показать
+        # всё равно можно, и это лучше пустого экрана с ошибкой.
+        rows = []
+    return cards, rows
+
+
+def _merge(cards: list[Supplier], rows: list[SupplierRow],
+           focus: str = "") -> list[Entry]:
+    """Сводит поставщиков из оплат с карточками по нормализованному имени."""
+    by_key = {card.key: card for card in cards}
+    entries: list[Entry] = []
+    used: set[str] = set()
+    for row in rows:
+        key = normalize_text(row.recipient)
+        card = by_key.get(key)
+        if card is not None:
+            used.add(key)
+        entries.append(Entry(name=row.recipient, row=row, card=card,
+                             focus=focus))
+    if focus:
+        # При отборе по менеджеру чужие карточки не показываются: человек
+        # просил своих поставщиков, а карточка без оплат под его именем к ним
+        # не относится. Без отбора они видны — в них лежит разбор прайса.
+        return entries
+    for card in cards:
+        if card.key not in used:
+            entries.append(Entry(name=card.name, row=None, card=card))
+    return entries
 
 
 class SuppliersPage(QWidget):
@@ -52,7 +157,9 @@ class SuppliersPage(QWidget):
         self.settings = settings
         self.notify = notify
         self.items: list[Supplier] = []
+        self.entries: list[Entry] = []
         self.current: Supplier | None = None
+        self.chosen: Entry | None = None
         self._layouts: list[SupplierLayout] = []
         self._links: list[SupplierLink] = []
         self._loading = False
@@ -104,8 +211,15 @@ class SuppliersPage(QWidget):
         body.setSpacing(Metrics.GAP - 4)
         body.addWidget(SectionTitle("Список", card))
 
+        self.manager = SelectBox(card)
+        self.manager.setToolTip(
+            "Поставщик виден у каждого, кто ему платил: половина получателей "
+            "оплачивается несколькими менеджерами")
+        self.manager.currentIndexChanged.connect(lambda _: self.reload())
+        body.addWidget(self.manager)
+
         self.search = QLineEdit(card)
-        self.search.setPlaceholderText("Поиск по названию, бренду, категории…")
+        self.search.setPlaceholderText("Поиск по названию, бренду, менеджеру…")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda _: self._fill_list())
         body.addWidget(self.search)
@@ -315,56 +429,86 @@ class SuppliersPage(QWidget):
     # --- данные ---------------------------------------------------------------
 
     def reload(self) -> None:
-        """Читает список из базы. Вызывается при каждом открытии вкладки."""
+        """Читает список. Вызывается при каждом открытии вкладки."""
+        chosen = self.manager.currentData() or ""
         run_task(
-            suppliers.list_suppliers,
+            lambda: _load_all(chosen),
             on_result=self._on_loaded,
             on_error=lambda message: self.notify(
-                f"База поставщиков недоступна: {message}", ToastKind.ERROR),
+                f"Список поставщиков недоступен: {message}", ToastKind.ERROR),
         )
 
-    def _on_loaded(self, items: list[Supplier]) -> None:
-        self.items = items
-        previous = self.current.id if self.current else 0
+    def _on_loaded(self, payload: tuple[list[Supplier], list[SupplierRow]]) -> None:
+        cards, rows = payload
+        self.items = cards
+        self.entries = _merge(cards, rows, self.manager.currentData() or "")
+        self._fill_managers(rows)
+
+        previous = self.chosen.name if self.chosen else ""
         self._fill_list(select=previous)
-        self.tile_suppliers.set_value(len(items))
-        self.tile_layouts.set_value(sum(s.layouts for s in items))
-        self.tile_links.set_value(sum(s.links for s in items))
+        self.tile_suppliers.set_value(len(self.entries))
+        self.tile_layouts.set_value(sum(s.layouts for s in cards))
+        self.tile_links.set_value(sum(s.links for s in cards))
         self.tile_size.set_value(f"{suppliers.database_size() / 1024:.0f} КБ")
         fade_in(self.list)
 
-    def _visible(self) -> list[Supplier]:
+    def _fill_managers(self, rows: list[SupplierRow]) -> None:
+        """Список менеджеров. Свой — первым после «всех»."""
+        if self.manager.count():
+            return
+        names = sorted({name for row in rows for name in row.managers})
+        mine = transport.session.full_name
+        self.manager.blockSignals(True)
+        self.manager.addItem("Все менеджеры", "")
+        if mine in names:
+            self.manager.addItem(f"Мои — {mine}", mine)
+            names.remove(mine)
+        for name in names:
+            self.manager.addItem(name, name)
+        # Свои поставщики нужнее чужих: если вошли под учёткой, начинаем с них.
+        if mine and self.manager.count() > 1 and self.manager.itemData(1) == mine:
+            self.manager.setCurrentIndex(1)
+        self.manager.blockSignals(False)
+        if self.manager.currentIndex() == 1:
+            self.reload()
+
+    def _visible(self) -> list[Entry]:
         query = self.search.text().casefold().replace("ё", "е").strip()
         if not query:
-            return self.items
-        return [
-            item for item in self.items
-            if query in f"{item.name} {item.brands} {item.categories} {item.note}"
-            .casefold().replace("ё", "е")
-        ]
+            return self.entries
+        return [entry for entry in self.entries
+                if query in entry.haystack.casefold().replace("ё", "е")]
 
-    def _fill_list(self, select: int = 0) -> None:
+    def _fill_list(self, select: str = "") -> None:
         self._loading = True
         self.list.clear()
         visible = self._visible()
-        for supplier in visible:
-            item = QListWidgetItem(f"{supplier.name}\n{supplier.summary}")
-            item.setData(Qt.ItemDataRole.UserRole, supplier.id)
-            if not supplier.active:
+        for entry in visible:
+            item = QListWidgetItem(f"{entry.name}\n{entry.summary}")
+            item.setData(Qt.ItemDataRole.UserRole, entry.name)
+            if entry.card is not None and not entry.card.active:
                 item.setForeground(QColor(Palette.TEXT_FAINT))
             self.list.addItem(item)
         self._loading = False
         if not visible:
+            self.chosen = None
             self._show(None)
             return
-        position = next((i for i, s in enumerate(visible) if s.id == select), 0)
+        position = next((i for i, e in enumerate(visible) if e.name == select), 0)
         self.list.setCurrentRow(position)
 
     def _on_selected(self, row: int) -> None:
         if self._loading:
             return
         visible = self._visible()
-        self._show(visible[row] if 0 <= row < len(visible) else None)
+        entry = visible[row] if 0 <= row < len(visible) else None
+        self.chosen = entry
+        self._show(entry.card if entry else None)
+        if entry is not None and entry.card is None:
+            # Карточки нет — показать нечего, но человек должен видеть, что
+            # выбрал, и понимать, чего именно не хватает.
+            self.detail_title.setText(entry.name)
+            self.field_name.setText(entry.name)
 
     def _show(self, supplier: Supplier | None) -> None:
         self.current = supplier
@@ -413,7 +557,13 @@ class SuppliersPage(QWidget):
     # --- действия -------------------------------------------------------------
 
     def add_supplier(self) -> None:
-        supplier = Supplier(name="Новый поставщик")
+        # Если в списке выбран поставщик из оплат без карточки, заводим её
+        # сразу на него: имя из 1С точнее набранного заново, и карточка
+        # свяжется с оплатами по нему же.
+        chosen = self.chosen
+        name = (chosen.name if chosen is not None and chosen.card is None
+                else "Новый поставщик")
+        supplier = Supplier(name=name)
         try:
             saved = suppliers.save_supplier(supplier)
         except Exception as error:  # noqa: BLE001

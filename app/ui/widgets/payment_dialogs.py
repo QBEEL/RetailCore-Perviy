@@ -41,7 +41,11 @@ from ...core.payments import (
     importer,
     planning,
     service,
+    vat,
 )
+
+# Подпись пункта, означающего «сумму налога проставил человек».
+MANUAL_VAT = "Вручную"
 # Общая база, если выполнен вход, иначе своя локальная — см. core/payments/data.
 from ...core.payments import data as store
 from .. import icons
@@ -138,12 +142,34 @@ class PaymentDialog(QDialog):
         self.amount.setSuffix(" ₽")
         form.addRow("Сумма", self.amount)
 
+        vat_row = QHBoxLayout()
+        vat_row.setSpacing(8)
+
+        self.vat_rate = SelectBox(self)
+        for rate in vat.RATES:
+            self.vat_rate.addItem(rate.title, rate.percent)
+        # «Вручную» — не ставка, а признак того, что сумму налога проставил
+        # человек. Без него любая правка поля НДС тут же затиралась бы
+        # пересчётом по выбранной ставке.
+        self.vat_rate.addItem(MANUAL_VAT, -1)
+        self.vat_rate.setFixedWidth(110)
+        vat_row.addWidget(self.vat_rate)
+
         self.vat = DecimalInput(self)
         self.vat.setRange(0.0, 1_000_000_000.0)
         self.vat.setDecimals(2)
         self.vat.setGroupSeparatorShown(True)
         self.vat.setSuffix(" ₽")
-        form.addRow("НДС", self.vat)
+        vat_row.addWidget(self.vat, 1)
+        form.addRow("НДС", vat_row)
+
+        self.net_hint = QLabel("", self)
+        self.net_hint.setObjectName("Hint")
+        form.addRow("", self.net_hint)
+
+        self.amount.valueChanged.connect(self._recalc_vat)
+        self.vat_rate.currentIndexChanged.connect(self._recalc_vat)
+        self.vat.valueChanged.connect(self._vat_edited)
 
         date_row = QHBoxLayout()
         date_row.setSpacing(8)
@@ -217,6 +243,72 @@ class PaymentDialog(QDialog):
         column.addWidget(buttons)
         return column
 
+    # --- НДС ------------------------------------------------------------------
+
+    def _chosen_rate(self) -> "vat.Rate | None":
+        percent = self.vat_rate.currentData()
+        return None if percent is None or percent < 0 else vat.of(percent)
+
+    def _recalc_vat(self) -> None:
+        """Пересчитывает налог по выбранной ставке. «Вручную» не трогает."""
+        rate = self._chosen_rate()
+        if rate is None:
+            self._show_net()
+            return
+        amount = float(self.amount.value())
+        # Сигнал глушится, иначе запись значения выглядит как правка руками и
+        # тут же переключает ставку на «Вручную».
+        self.vat.blockSignals(True)
+        self.vat.setValue(rate.vat_of(amount))
+        self.vat.blockSignals(False)
+        self._show_net()
+
+    def _vat_edited(self) -> None:
+        """Человек исправил налог сам — ставка уступает ему место."""
+        if self._chosen_rate() is not None:
+            self.vat_rate.blockSignals(True)
+            self.vat_rate.setCurrentIndex(self.vat_rate.count() - 1)
+            self.vat_rate.blockSignals(False)
+        self._show_net()
+
+    def _show_net(self) -> None:
+        """Подпись «сумма без НДС» — чтобы цифру можно было сверить глазами."""
+        amount = float(self.amount.value())
+        tax = float(self.vat.value())
+        if amount <= 0:
+            self.net_hint.setText("")
+            return
+        self.net_hint.setText(f"сумма без НДС: {money(amount - tax)} ₽")
+
+    def _adopt_vat(self) -> None:
+        """Ставка существующей оплаты — по её сумме и налогу.
+
+        Не опознали — значит, налог проставлен руками или запись старая.
+        Подставлять ближайшую ставку нельзя: она молча переписала бы сумму
+        налога при первом же сохранении.
+        """
+        rate = vat.detect(float(self.amount.value()), float(self.vat.value()))
+        index = (self.vat_rate.findData(rate.percent) if rate
+                 else self.vat_rate.count() - 1)
+        self.vat_rate.blockSignals(True)
+        self.vat_rate.setCurrentIndex(index)
+        self.vat_rate.blockSignals(False)
+        self._show_net()
+
+    def _suggest_rate(self) -> None:
+        """Ставка нового платежа — по прошлым оплатам этого получателя.
+
+        У поставщика ставка меняется редко, и своя полезнее общей: упрощенец
+        с пятипроцентной иначе требовал бы правки при каждом создании.
+        """
+        if self.payment.id or not self._history:
+            return
+        rate = vat.guess_by_history(
+            [(float(p.amount), float(p.vat)) for p in self._history])
+        if rate is None:
+            return
+        self.vat_rate.setCurrentIndex(self.vat_rate.findData(rate.percent))
+
     def _apply_rights(self) -> None:
         """Чужая оплата открывается только на просмотр.
 
@@ -225,9 +317,10 @@ class PaymentDialog(QDialog):
         """
         if store.may_edit(self.payment):
             return
-        for widget in (self.recipient, self.amount, self.vat, self.pay_date,
-                       self.status, self.responsible, self.operation,
-                       self.comment, self.attach_button, self.detach_button):
+        for widget in (self.recipient, self.amount, self.vat, self.vat_rate,
+                       self.pay_date, self.status, self.responsible,
+                       self.operation, self.comment,
+                       self.attach_button, self.detach_button):
             widget.setEnabled(False)
         self.save_button.setEnabled(False)
         self.save_button.setText("Только просмотр")
@@ -258,6 +351,7 @@ class PaymentDialog(QDialog):
         name = self.recipient.currentText().strip()
         self.stats: SupplierStats | None = None
         self.terms_days = 0.0
+        self._history: list[Payment] = []
         self.history.clear()
         if not name:
             self.history_summary.setText("выберите поставщика")
@@ -273,6 +367,8 @@ class PaymentDialog(QDialog):
         stats, terms, recent = payload
         self.stats = stats
         self.terms_days = terms
+        self._history = list(recent)
+        self._suggest_rate()
         if not stats.count:
             self.history_summary.setText("оплат этому поставщику ещё не было")
             self.suggest_button.setEnabled(False)
@@ -317,8 +413,19 @@ class PaymentDialog(QDialog):
         payment = self.payment
         if payment.recipient:
             self.recipient.setCurrentText(payment.recipient)
+        # Сигналы глушатся на время заполнения: иначе установка суммы успевает
+        # пересчитать налог по ставке из списка и на мгновение затирает
+        # сохранённое значение. Итог был бы тот же, но держаться на порядке
+        # двух соседних строк такая вещь не должна.
+        self.amount.blockSignals(True)
+        self.vat.blockSignals(True)
         self.amount.setValue(payment.amount)
         self.vat.setValue(payment.vat)
+        self.amount.blockSignals(False)
+        self.vat.blockSignals(False)
+        # Ставка выводится из уже записанных суммы и налога, а не наоборот:
+        # сохранённые цифры менять при простом открытии карточки нельзя.
+        self._adopt_vat()
         self.pay_date.set_value(payment.pay_date)
         self.status.setCurrentIndex(max(self.status.findData(payment.status.value), 0))
         self.responsible.setCurrentText(payment.responsible or store.current_user())

@@ -24,6 +24,7 @@ from ..schemas import (
     PaymentIn,
     PaymentOut,
     PaymentPatch,
+    SupplierRow,
 )
 from ..security import User
 
@@ -46,7 +47,7 @@ EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "priority"
 
 def _conditions(
     text: str, start: date | None, end: date | None,
-    statuses: list[str], supplier_id: int, recipient: str,
+    statuses: list[str], supplier_id: int, recipient_key: str,
     amount_from: float | None, amount_to: float | None,
     responsible: str, operation: str, over_limit: bool | None,
     dated_only: bool,
@@ -73,9 +74,12 @@ def _conditions(
     if supplier_id:
         parts.append("p.supplier_id = %s")
         values.append(supplier_id)
-    if recipient:
+    if recipient_key:
+        # Именно ключ, а не имя получателя: нормализацию делает клиент той же
+        # функцией, которой считает ключ при записи. Имя сюда передавать
+        # бесполезно — оно не совпадёт с ключом никогда.
         parts.append("p.recipient_key = %s")
-        values.append(recipient)
+        values.append(recipient_key)
     if amount_from is not None:
         parts.append("p.amount >= %s")
         values.append(amount_from)
@@ -110,7 +114,7 @@ def list_payments(
     end: date | None = None,
     statuses: list[str] = Query(default=[]),
     supplier_id: int = 0,
-    recipient: str = "",
+    recipient_key: str = "",
     amount_from: float | None = None,
     amount_to: float | None = None,
     responsible: str = "",
@@ -120,7 +124,7 @@ def list_payments(
     mine: bool = False,
 ) -> list[PaymentOut]:
     where, values = _conditions(
-        text, start, end, statuses, supplier_id, recipient,
+        text, start, end, statuses, supplier_id, recipient_key,
         amount_from, amount_to, responsible, operation, over_limit, dated_only)
     if mine and not user.is_admin:
         where += " AND p.responsible = ANY(%s)"
@@ -149,6 +153,62 @@ def known_values(user: User = Depends(security.current_user)) -> KnownValues:
         responsible=by_frequency("responsible", "responsible"),
         operations=by_frequency("operation", "operation"),
     )
+
+
+@router.get("/suppliers", response_model=list[SupplierRow],
+            summary="Поставщики по оплатам, с менеджерами")
+def suppliers(user: User = Depends(security.current_user),
+              responsible: str = "", months: int = 0) -> list[SupplierRow]:
+    """Получатели из оплат — то, что на деле является списком поставщиков.
+
+    Карточки заводятся руками и потому есть далеко не у всех; получатели же
+    приходят с каждой выгрузкой 1С и покрывают всё, с чем отдел работает.
+
+    Менеджер возвращается списком, а не одним значением: почти половина
+    получателей оплачивается несколькими людьми, и назначение единственного
+    владельца было бы выдумкой. Первым идёт тот, у кого оплат больше.
+    """
+    where, values = ["p.recipient <> ''"], []
+    if months > 0:
+        where.append(f"p.pay_date >= CURRENT_DATE - interval '{int(months)} months'")
+    if responsible:
+        # Отбор по менеджеру оставляет получателя целиком, а не только его
+        # оплаты: показатели должны быть по всей истории, иначе «всего оплат»
+        # у своего поставщика окажется меньше настоящего.
+        where.append(
+            "p.recipient_key IN (SELECT recipient_key FROM payment"
+            "                    WHERE responsible = %s AND recipient <> '')")
+        values.append(responsible)
+
+    rows = db.fetch_all(
+        "WITH chosen AS ("
+        f"  SELECT * FROM payment p WHERE {' AND '.join(where)}"
+        "), by_manager AS ("
+        "  SELECT recipient_key, responsible, COUNT(*) AS n"
+        "  FROM chosen WHERE responsible <> ''"
+        "  GROUP BY recipient_key, responsible"
+        ")"
+        " SELECT c.recipient_key,"
+        "        MAX(c.recipient) AS recipient,"
+        "        MAX(c.supplier_id) AS supplier_id,"
+        "        COUNT(*) AS payments,"
+        "        SUM(c.amount) AS amount,"
+        "        MAX(c.pay_date) AS last_pay,"
+        "        (SELECT array_agg(m.responsible ORDER BY m.n DESC, m.responsible)"
+        "           FROM by_manager m WHERE m.recipient_key = c.recipient_key)"
+        "          AS managers"
+        " FROM chosen c GROUP BY c.recipient_key"
+        " ORDER BY SUM(c.amount) DESC", values)
+
+    return [
+        SupplierRow(
+            recipient_key=row["recipient_key"], recipient=row["recipient"],
+            supplier_id=row["supplier_id"], payments=row["payments"],
+            amount=float(row["amount"] or 0), last_pay=row["last_pay"],
+            managers=list(row["managers"] or []),
+        )
+        for row in rows
+    ]
 
 
 @router.get("/count", response_model=dict, summary="Сколько всего оплат")
