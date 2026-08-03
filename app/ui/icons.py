@@ -18,6 +18,7 @@ NAMES = {
     "price": "mdi6.currency-rub",
     "suppliers": "mdi6.truck-outline",
     "payments": "mdi6.calendar-month-outline",
+    "report": "mdi6.file-chart-outline",
     "budget": "mdi6.wallet-outline",
     "chart": "mdi6.chart-bar",
     "settings": "mdi6.tune-variant",

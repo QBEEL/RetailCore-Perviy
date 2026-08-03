@@ -26,6 +26,7 @@ from .match_page import MatchPage
 from .order_page import OrderPage
 from .payments_page import PaymentsPage
 from .price_page import PricePage
+from .reports_page import ReportsPage
 from .settings_page import SettingsPage
 from ..core.payments import transport
 from .admin_page import AdminPage
@@ -42,16 +43,20 @@ PAGES = (
     ("Быстрая смена цен", "price", "Ctrl+3"),
     ("Оплаты", "payments", "Ctrl+4"),
     ("Поставщики", "suppliers", "Ctrl+5"),
-    ("Каталог", "catalog", "Ctrl+6"),
-    ("История данных", "history", "Ctrl+7"),
-    ("Настройки", "settings", "Ctrl+8"),
-    ("Администрирование", "admin", "Ctrl+9"),
+    ("Отчётность", "report", "Ctrl+6"),
+    ("Каталог", "catalog", "Ctrl+7"),
+    ("История данных", "history", "Ctrl+8"),
+    ("Настройки", "settings", "Ctrl+9"),
+    # Десятая страница, поэтому Ctrl+0: Ctrl+10 не существует, а разрывать
+    # ряд ради неё пришлось бы во всех остальных сочетаниях.
+    ("Администрирование", "admin", "Ctrl+0"),
 )
 
 # Номера страниц в стопке — по порядку PAGES.
 PAGE_PAYMENTS = 3
 PAGE_SUPPLIERS = 4
-PAGE_ADMIN = 8
+PAGE_REPORTS = 5
+PAGE_ADMIN = 9
 
 
 def _scrollable(page: QWidget) -> QScrollArea:
@@ -97,13 +102,14 @@ class MainWindow(QMainWindow):
             settings, self.notify, self.pages, self.show_supplier, self.plan_payment)
         self.payments_page = PaymentsPage(settings, self.notify, self.pages, self.show_supplier)
         self.suppliers_page = SuppliersPage(settings, self.notify, self.pages)
+        self.reports_page = ReportsPage(settings, self.notify, self.pages)
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
         self.settings_page = SettingsPage(settings, self.notify, self.pages, self._check_updates_now)
         self.admin_page = AdminPage(settings, self.notify, self.pages)
         for page in (self.match_page, self.order_page, self.price_page, self.payments_page,
-                     self.suppliers_page, self.catalog_page, self.history_page,
-                     self.settings_page, self.admin_page):
+                     self.suppliers_page, self.reports_page, self.catalog_page,
+                     self.history_page, self.settings_page, self.admin_page):
             self.pages.addWidget(_scrollable(page))
 
         layout.addWidget(self._sidebar(root))
@@ -234,6 +240,11 @@ class MainWindow(QMainWindow):
             # Список читается при каждом открытии: поставщик мог появиться,
             # пока пользователь сравнивал цены на соседней вкладке.
             self.suppliers_page.reload()
+        if page is self.reports_page:
+            # Профили и правила общие: коллега мог завести правило объединения,
+            # пока вкладка была закрыта, и собирать отчёт по устаревшему набору
+            # нельзя — расхождение всплывёт уже у поставщика.
+            self.reports_page.restore()
         if page is self.history_page:
             # Список читается при каждом открытии: снимок мог появиться,
             # пока пользователь работал на другой странице.
@@ -296,6 +307,8 @@ class MainWindow(QMainWindow):
             self.order_page.run_transfer()
         elif page is self.payments_page:
             self.payments_page.reload()
+        elif page is self.reports_page:
+            self.reports_page.run_build()
         else:
             self.show_page(0)
             self.match_page.run_matching()
@@ -306,6 +319,8 @@ class MainWindow(QMainWindow):
             self.price_page.export()
         elif page is self.order_page:
             self.order_page.save()
+        elif page is self.reports_page:
+            self.reports_page.save()
         else:
             self.match_page.save_results()
 

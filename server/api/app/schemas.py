@@ -186,3 +186,49 @@ class KnownValues(BaseModel):
     recipients: list[str]
     responsible: list[str]
     operations: list[str]
+
+
+# --- отчётность для поставщиков ---------------------------------------------------
+
+class ReportProfileIn(BaseModel):
+    """Формат отчёта, пришедший от клиента.
+
+    Всё, кроме имени и поставщика, лежит в `payload` нетипизированным: состав
+    полей, метрик и фильтров задаётся приложением и будет меняться чаще, чем
+    выкатывается сервер. Проверять его здесь заново — значит выпускать новую
+    версию API на каждую новую метрику.
+    """
+
+    name: str
+    supplier: str = ""
+    supplier_id: int = 0
+    payload: dict = Field(default_factory=dict)
+
+
+class ReportProfileOut(BaseModel):
+    id: int
+    name: str
+    supplier: str
+    supplier_id: int
+    payload: dict
+    updated_at: datetime
+    updated_by: str = ""
+
+
+class StoreRuleIn(BaseModel):
+    """Правило «продажи источника учитывать за приёмником»."""
+
+    source: str
+    target: str
+    enabled: bool = True
+    comment: str = ""
+
+
+class StoreRuleOut(BaseModel):
+    id: int
+    source: str
+    target: str
+    enabled: bool
+    comment: str
+    updated_at: datetime
+    updated_by: str = ""
