@@ -28,6 +28,20 @@ _OPEN_READ_ONLY = 0
 _CADES_BES = 1
 _BASE64_TO_BINARY = 1
 
+# CAPICOM_CERTIFICATE_INCLUDE_OPTION: 0 — цепочка без корневого сертификата,
+# 1 — цепочка целиком, 2 — только свой сертификат.
+_INCLUDE_CHAIN_EXCEPT_ROOT = 0
+
+# Присоединённая подпись: подписанное содержимое вкладывается внутрь.
+#
+# Это выяснено опытом на боевом контуре, а не взято из описания. Отсоединённая
+# подпись, которая кажется естественной (сервер сам прислал строку и знает её),
+# отвергается с ответом «Подпись невалидна. Код ошибки: 2» — и в песочнице, и в
+# бою, при любом наборе остальных параметров. Присоединённая проходит проверку:
+# в песочнице ответ меняется на «Пользователь не найден» (сертификат там не
+# зарегистрирован), а на боевом контуре выдаётся токен.
+_ATTACHED = False
+
 
 class CryptoUnavailable(RuntimeError):
     """КриптоПро не установлен или недоступен. Текст пригоден для показа."""
@@ -152,11 +166,14 @@ def find(thumbprint: str) -> Certificate | None:
 
 
 def sign(data: str, thumbprint: str) -> str:
-    """Отсоединённая подпись CAdES-BES над строкой. Возвращает base64.
+    """Присоединённая подпись CAdES-BES над строкой. Возвращает base64.
 
     `data` — то, что прислал сервер: строка, которую он ждёт подписанной.
     Подписывается её содержимое, а не base64-представление, поэтому перед
     подписью оно кодируется, а COM-объекту сообщается, что вход — base64.
+
+    Почему подпись присоединённая, объяснено у `_ATTACHED`: отсоединённую
+    система маркировки не принимает.
     """
     certificate = find(thumbprint)
     if certificate is None:
@@ -180,16 +197,16 @@ def sign(data: str, thumbprint: str) -> str:
             raise SigningFailed("Сертификат исчез из хранилища во время работы.")
         signer = _dispatch("CAdESCOM.CPSigner")
         signer.Certificate = found.Item(1)
-        # Ноль означает «не вкладывать цепочку сертификатов». ГИС МТ ждёт
-        # минимальную подпись; лишние вложения она отвергает.
-        signer.Options = 0
+        # Цепочка сертификатов без корневого — значение CAPICOM по умолчанию.
+        # Проверено на боевом контуре: подпись с цепочкой принимается.
+        signer.Options = _INCLUDE_CHAIN_EXCEPT_ROOT
 
         signed = _dispatch("CAdESCOM.CadesSignedData")
         signed.ContentEncoding = _BASE64_TO_BINARY
         signed.Content = base64.b64encode(data.encode("utf-8")).decode()
 
         try:
-            signature = signed.SignCades(signer, _CADES_BES, True)
+            signature = signed.SignCades(signer, _CADES_BES, _ATTACHED)
         except Exception as error:  # noqa: BLE001 — COM бросает что угодно
             raise SigningFailed(_explain(error)) from error
     finally:
