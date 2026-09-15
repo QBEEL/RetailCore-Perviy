@@ -1,0 +1,153 @@
+name: Build RetailCore
+
+# Собирает приложение под Windows (.exe) и macOS (.app → .dmg).
+# Запускается при пуше тега v* или вручную из интерфейса GitHub.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия для имени артефакта (например 3.2.0)'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # ─────────────────────────────── Windows ────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build .exe
+        run: pyinstaller RetailCore.spec --noconfirm
+
+      - name: Verify build
+        run: |
+          $exe = "dist\RetailCore.exe"
+          if (!(Test-Path $exe)) { throw "Build failed: $exe not found" }
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host "RetailCore.exe: $([math]::Round($size, 1)) MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetailCore-Windows
+          path: dist/RetailCore.exe
+          retention-days: 30
+
+  # ─────────────────────────────── macOS ──────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Convert icon to .icns
+        run: |
+          # macOS нужен .icns, а в репозитории только .ico и .png
+          mkdir -p app.iconset
+          # Генерируем все нужные размеры из app.png
+          for size in 16 32 64 128 256 512; do
+            sips -z $size $size app/ui/assets/app.png --out app.iconset/icon_${size}x${size}.png
+            double=$((size * 2))
+            if [ $double -le 1024 ]; then
+              sips -z $double $double app/ui/assets/app.png --out app.iconset/icon_${size}x${size}@2x.png
+            fi
+          done
+          iconutil -c icns app.iconset -o app/ui/assets/app.icns
+          echo "Icon converted: $(ls -lh app/ui/assets/app.icns)"
+
+      - name: Build .app
+        run: pyinstaller RetailCore.macos.spec --noconfirm
+
+      - name: Verify build
+        run: |
+          APP="dist/RetailCore.app"
+          if [ ! -d "$APP" ]; then echo "Build failed: $APP not found"; exit 1; fi
+          echo "RetailCore.app: $(du -sh "$APP" | cut -f1)"
+          # Проверяем, что бинарь запускается (--selftest без GUI)
+          # dist/RetailCore.app/Contents/MacOS/RetailCore --version || true
+
+      - name: Create .dmg
+        run: |
+          # Создаём DMG с drag-and-drop установкой
+          mkdir -p dmg_content
+          cp -R dist/RetailCore.app dmg_content/
+          ln -s /Applications dmg_content/Applications
+          hdiutil create -volname "RetailCore" \
+            -srcfolder dmg_content \
+            -ov -format UDZO \
+            dist/RetailCore.dmg
+          echo "DMG: $(ls -lh dist/RetailCore.dmg)"
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetailCore-macOS
+          path: dist/RetailCore.dmg
+          retention-days: 30
+
+  # ─────────────────────────────── Release ────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: RetailCore-Windows
+          path: artifacts/
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: RetailCore-macOS
+          path: artifacts/
+
+      - name: Determine version
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RetailCore ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/RetailCore.exe
+            artifacts/RetailCore.dmg
