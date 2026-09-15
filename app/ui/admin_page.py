@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from ..core.payments import admin, data, transport
 from ..core.payments.admin import Account, Entry
+from ..core.suppliers import directory
 from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
@@ -49,6 +50,8 @@ class AdminPage(QWidget):
         self.accounts: list[Account] = []
         self.entries: list[Entry] = []
         self._known: list[str] = []
+        self._directions: list[tuple[str, str]] = []
+        self._claims: list[directory.Entry] = []
         self._loaded = False
 
         root = QVBoxLayout(self)
@@ -85,6 +88,7 @@ class AdminPage(QWidget):
 
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._accounts_tab(), "Учётные записи")
+        self.tabs.addTab(self._claims_tab(), "Закрепление поставщиков")
         self.tabs.addTab(self._journal_tab(), "Журнал изменений")
         root.addWidget(self.tabs, 1)
 
@@ -99,8 +103,9 @@ class AdminPage(QWidget):
         self.accounts_table = DataTable([
             Column("ФИО", lambda a: a.title, 220),
             Column("Логин", lambda a: a.login, 140),
-            Column("Роль", lambda a: a.role, 130,
+            Column("Роль", lambda a: a.role, 170,
                    color=lambda a: None if a.is_active else QColor(Palette.TEXT_FAINT)),
+            Column("Направления", lambda a: ", ".join(a.directions), 140),
             Column("Имён в 1С", lambda a: len(a.responsible), 90,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             Column("Кто в 1С", lambda a: ", ".join(a.responsible), 320),
@@ -126,6 +131,56 @@ class AdminPage(QWidget):
         self.hint = QLabel("", page)
         self.hint.setObjectName("Hint")
         actions.addWidget(self.hint)
+        layout.addLayout(actions)
+        return page
+
+    def _claims_tab(self) -> QWidget:
+        """Очередь заявок: что менеджеры отметили своим и ждёт подтверждения."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+
+        layout.addWidget(Hint(
+            "Менеджер отмечает своих поставщиков сам — до подтверждения они уже "
+            "считаются его. Фиксация закрывает закрепление: снять его сможете "
+            "только вы. Отклонённая заявка просто исчезает, менеджер может "
+            "подать её снова."))
+
+        self.claims_table = DataTable([
+            Column("Поставщик", lambda e: e.recipient, 300, highlight=True),
+            Column("Заявили", lambda e: ", ".join(
+                p.full_name for p in e.assigned if not p.fixed), 260),
+            Column("Направление", lambda e: ", ".join(e.directions), 130),
+            Column("Оплат", lambda e: e.payments, 70,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            Column("Сумма", lambda e: f"{e.amount:,.0f}".replace(",", " "), 120,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda e: e.amount),
+            Column("Уже закреплены", lambda e: ", ".join(
+                p.full_name for p in e.assigned if p.fixed), 220),
+        ], page)
+        layout.addWidget(self.claims_table, 1)
+
+        actions = QHBoxLayout()
+        self.fix_button = QPushButton("Зафиксировать", page)
+        self.fix_button.setObjectName("Primary")
+        self.fix_button.setIcon(icons.icon("check", Palette.TEXT_ON_PRIMARY))
+        self.fix_button.clicked.connect(self.fix_claims)
+        actions.addWidget(self.fix_button)
+
+        self.reject_button = QPushButton("Отклонить", page)
+        self.reject_button.setObjectName("Danger")
+        self.reject_button.setIcon(icons.icon("trash", Palette.DANGER))
+        self.reject_button.setToolTip(
+            "Снять заявку. Менеджер сможет подать её снова")
+        self.reject_button.clicked.connect(self.reject_claims)
+        actions.addWidget(self.reject_button)
+
+        actions.addStretch(1)
+        self.claims_hint = QLabel("", page)
+        self.claims_hint.setObjectName("Hint")
+        actions.addWidget(self.claims_hint)
         layout.addLayout(actions)
         return page
 
@@ -164,7 +219,8 @@ class AdminPage(QWidget):
         self.offline.setVisible(not available)
         self.tabs.setVisible(available)
         for button in (self.new_button, self.refresh_button,
-                       self.edit_button, self.reset_button):
+                       self.edit_button, self.reset_button,
+                       self.fix_button, self.reject_button):
             button.setEnabled(available)
         if not available:
             self.subtitle.setText("Требуется вход администратором")
@@ -172,11 +228,21 @@ class AdminPage(QWidget):
 
         run_task(_load_all, on_result=self._apply, on_error=self._failed)
 
-    def _apply(self, payload: tuple[list[Account], list[Entry], list[str]]) -> None:
-        self.accounts, self.entries, self._known = payload
+    def _apply(self, payload: tuple) -> None:
+        (self.accounts, self.entries, self._known,
+         self._directions, self._claims) = payload
         self._loaded = True
         self.accounts_table.set_items(self.accounts)
         self.journal_table.set_items(self.entries)
+        self.claims_table.set_items(self._claims)
+
+        people = {p.full_name for entry in self._claims
+                  for p in entry.assigned if not p.fixed}
+        self.claims_hint.setText(
+            f"заявок: {len(self._claims)} от {len(people)} менеджеров"
+            if self._claims else "заявок на подтверждение нет")
+        self.tabs.setTabText(1, f"Закрепление поставщиков ({len(self._claims)})"
+                             if self._claims else "Закрепление поставщиков")
         active = sum(1 for a in self.accounts if a.is_active)
         admins = sum(1 for a in self.accounts if a.is_admin and a.is_active)
         self.subtitle.setText(
@@ -197,7 +263,8 @@ class AdminPage(QWidget):
         return rows[0] if rows else None
 
     def create_account(self) -> None:
-        dialog = AccountDialog(Account(), self._known, parent=self)
+        dialog = AccountDialog(Account(), self._known,
+                               directions=self._directions, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         account = dialog.result_account()
@@ -216,7 +283,7 @@ class AdminPage(QWidget):
             return
         dialog = AccountDialog(account, self._known,
                                is_self=account.login == transport.session.login,
-                               parent=self)
+                               directions=self._directions, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         changed = dialog.result_account()
@@ -248,8 +315,80 @@ class AdminPage(QWidget):
         PasswordShown(account.login, password, self).exec()
         self.reload()
 
+    # --- закрепление поставщиков ----------------------------------------------
 
-def _load_all() -> tuple[list[Account], list[Entry], list[str]]:
-    """Учётки, журнал и список имён из 1С — одним походом на сервер."""
+    def _chosen_claims(self) -> list[directory.Entry]:
+        return [row for row in self.claims_table.selected_items()
+                if isinstance(row, directory.Entry)]
+
+    def fix_claims(self) -> None:
+        rows = self._chosen_claims()
+        if not rows:
+            self.notify("Выберите заявки в таблице", ToastKind.INFO)
+            return
+        answer = QMessageBox.question(
+            self, "Зафиксировать закрепление",
+            f"Подтвердить заявки по {len(rows)} поставщикам?\n\n"
+            "После фиксации менеджер не сможет снять закрепление сам.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        keys = [row.recipient_key for row in rows]
+        run_task(lambda: directory.fix(keys),
+                 on_result=lambda result: self._claims_done(
+                     f"Зафиксировано закреплений: {result.changed}"),
+                 on_error=self._failed)
+
+    def reject_claims(self) -> None:
+        rows = self._chosen_claims()
+        if not rows:
+            self.notify("Выберите заявки в таблице", ToastKind.INFO)
+            return
+        # Снимаются только незафиксированные: отклонение заявки и снятие
+        # действующего закрепления — разные решения, и путать их в одной
+        # кнопке нельзя.
+        drafts = [(row.recipient_key, [p.user_id for p in row.assigned
+                                       if not p.fixed]) for row in rows]
+        answer = QMessageBox.question(
+            self, "Отклонить заявки",
+            f"Снять заявки по {len(drafts)} поставщикам?\n\n"
+            "Менеджер сможет подать их снова.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        run_task(lambda: _reject(drafts),
+                 on_result=lambda removed: self._claims_done(
+                     f"Заявок отклонено: {removed}"),
+                 on_error=self._failed)
+
+    def _claims_done(self, message: str) -> None:
+        self.notify(message, ToastKind.SUCCESS)
+        self.reload()
+
+
+def _load_all() -> tuple:
+    """Учётки, журнал, имена из 1С, справочник направлений и очередь заявок.
+
+    Одним походом: страница показывает всё сразу, а пять последовательных
+    запросов из интерфейса — это пять поводов подождать.
+    """
     known = data.known_values().get("responsible", [])
-    return admin.accounts(), admin.journal(), known
+    directions = [(item.code, item.title) for item in directory.directions()]
+    claims = directory.pending_claims().items
+    return admin.accounts(), admin.journal(), known, directions, claims
+
+
+def _reject(drafts: list[tuple[str, list[int]]]) -> int:
+    """Снимает незафиксированные заявки, каждую у своих менеджеров.
+
+    По одному поставщику за раз, а не общим списком: у разных поставщиков
+    заявители разные, и снять «всех сразу» значило бы задеть чужие заявки на
+    соседних строках.
+    """
+    removed = 0
+    for key, user_ids in drafts:
+        if user_ids:
+            removed += directory.unassign([key], user_ids).changed
+    return removed

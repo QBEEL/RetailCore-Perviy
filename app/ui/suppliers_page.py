@@ -1,4 +1,4 @@
-"""Вкладка «Поставщики»: карточки, структуры прайсов и сохранённые привязки.
+"""Вкладка «Поставщики»: список с направлениями, закреплением и карточкой.
 
 У каждого поставщика свой файл переоценки и своя структура данных. База помнит
 разбор каждого — как читать его прайс и какие позиции пришлось свести вручную, —
@@ -9,19 +9,26 @@
 выгрузкой 1С, и таких — почти шестьсот. Список из карточек показывал бы пустую
 вкладку при полутора тысячах реальных поставщиков.
 
-Отбор по менеджеру сделан фильтром, а не разделением на «своих» и «чужих».
-Половина получателей оплачивается несколькими людьми, и назначение каждому
-единственного владельца было бы выдумкой: поставщик виден у всех, кто с ним
-работал, а первым в подписи стоит тот, у кого оплат больше.
+Кто ведёт поставщика и кто ему платил — разные вопросы, и здесь они разведены.
+Раньше менеджер вычислялся по оплатам, и разовый платёж за коллегу навсегда
+записывал человека в ведущие. Теперь закрепление заявляет сам менеджер, а
+подтверждает администратор; заявленное считается своим сразу, не дожидаясь
+подтверждения, — иначе между заявкой и фиксацией работать было бы нечем.
+
+Направление отбирает список, но ничего не прячет: чаще всего вкладку открывают
+с вопросом «не помню, чей это поставщик», и жёсткое ограничение выдачи убило бы
+главный сценарий. Отбор и сортировку считает сервер — на полутора тысячах строк
+пересобирать список на клиенте при каждой смене фильтра уже нельзя.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -38,110 +45,121 @@ from PySide6.QtWidgets import (
 )
 
 from ..core import suppliers
-from ..core.payments import SupplierRow, transport
-from ..core.payments import data as payments
-from ..core.suppliers import Supplier, SupplierLayout, SupplierLink
+from ..core.payments import transport
+from ..core.suppliers import Supplier, SupplierLayout, SupplierLink, directory
 from ..core.normalize import normalize_text
 from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
-from .widgets.common import Card, Divider, Hint, MetricTile, SectionTitle, Subtitle, Title, fade_in
+from .widgets.common import (
+    Badge,
+    Card,
+    Divider,
+    Hint,
+    MetricTile,
+    SectionTitle,
+    Subtitle,
+    Title,
+    fade_in,
+)
 from .widgets.inputs import SelectBox
 from .widgets.supplier_dialogs import SupplierLayoutDialog
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 
+PAGE_SIZE = 100
+
+# Колонки, которые при первом клике сортируются по возрастанию.
+_TEXT_SORTS = frozenset({"name", "manager", "direction"})
+
+# Отбор по состоянию закрепления. «Без закрепления» — рабочий список на время
+# разметки, а не изъян: пока поставщика никто не заявил, он именно такой.
+_STATES = (
+    ("", "Любое закрепление"),
+    ("fixed", "Зафиксированы"),
+    ("draft", "На подтверждении"),
+    ("none", "Без закрепления"),
+)
+
 
 @dataclass(slots=True)
-class Entry:
-    """Строка списка: поставщик из оплат и его карточка, если она заведена."""
+class Row:
+    """Строка таблицы: поставщик из общей базы и его карточка, если заведена."""
 
-    name: str = ""
-    row: SupplierRow | None = None
+    entry: directory.Entry
     card: Supplier | None = None
-    # Менеджер, по которому отобран список. Он должен стоять в подписи первым:
-    # иначе при фильтре «мои» у поставщика значится чужое имя — то, у кого
-    # оплат больше, — и строка выглядит попавшей в список по ошибке.
-    focus: str = ""
 
     @property
-    def id(self) -> int:
-        return self.card.id if self.card else 0
+    def name(self) -> str:
+        return self.entry.recipient
 
     @property
-    def managers(self) -> list[str]:
-        return self.row.managers if self.row else []
+    def key(self) -> str:
+        return self.entry.recipient_key
 
     @property
-    def manager_title(self) -> str:
-        names = self.managers
-        if not names:
+    def directions(self) -> str:
+        """Направление. Второе — плюсом: поставщик в обоих случай редкий."""
+        titles = self.entry.directions
+        if not titles:
             return ""
-        if self.focus and self.focus in names:
-            others = len(names) - 1
-            return f"{self.focus} + ещё {others}" if others else self.focus
-        return self.row.manager_title if self.row else ""
+        first = _DIRECTION_TITLES.get(titles[0], titles[0])
+        return first if len(titles) == 1 else f"{first} +{len(titles) - 1}"
 
     @property
-    def summary(self) -> str:
-        parts: list[str] = []
-        if self.row and self.row.payments:
-            parts.append(f"оплат: {self.row.payments}")
-            parts.append(f"{self.row.amount:,.0f} ₽".replace(",", " "))
-            if self.row.last_pay:
-                parts.append(f"последняя {self.row.last_pay:%d.%m.%Y}")
-            if self.managers:
-                parts.append(self.manager_title)
-        if self.card:
-            parts.append(f"структур: {self.card.layouts}")
-        else:
+    def assigned(self) -> str:
+        return self.entry.assigned_title or "—"
+
+    @property
+    def card_state(self) -> str:
+        if self.card is None:
             # Отсутствие карточки — не изъян: она нужна только для разбора
             # прайса. Но знать об этом, глядя на список, полезно.
-            parts.append("без карточки")
-        return " · ".join(parts)
+            return ""
+        return f"структур: {self.card.layouts}" if self.card.layouts else "заведена"
 
     @property
-    def haystack(self) -> str:
-        card = self.card
-        extra = f"{card.brands} {card.categories} {card.note}" if card else ""
-        return f"{self.name} {extra} {' '.join(self.managers)}"
+    def amount_title(self) -> str:
+        return f"{self.entry.amount:,.0f}".replace(",", " ") if self.entry.amount else ""
+
+    @property
+    def last_pay_title(self) -> str:
+        return f"{self.entry.last_pay:%d.%m.%Y}" if self.entry.last_pay else ""
 
 
-def _load_all(responsible: str) -> tuple[list[Supplier], list[SupplierRow]]:
-    """Карточки и поставщики из оплат — одним походом, в фоновой задаче."""
+# Заголовки направлений по коду. Заполняется при первой загрузке справочника:
+# в таблице нужен «Beauty», а не «beauty», и тянуть справочник в каждую строку
+# ради одного слова незачем.
+_DIRECTION_TITLES: dict[str, str] = {}
+
+
+def _load_page(search: str, direction: str, manager: int, state: str,
+               sort: str, order: str, page: int) -> tuple[directory.Page,
+                                                          list[Supplier]]:
+    """Страница списка и карточки — одним походом, в фоновой задаче."""
     cards = suppliers.list_suppliers()
+    if not directory.online():
+        # Без входа в общую базу закреплений нет вовсе. Показываем карточки:
+        # разбор прайсов лежит в них и работает офлайн.
+        return _from_cards(cards, search), cards
     try:
-        rows = payments.suppliers(responsible)
-    except Exception:  # noqa: BLE001 — оплаты не должны ронять вкладку
-        # Нет входа в общую базу или сервер недоступен: карточки показать
-        # всё равно можно, и это лучше пустого экрана с ошибкой.
-        rows = []
-    return cards, rows
+        page_data = directory.suppliers(
+            search=search, direction=direction, manager=manager, state=state,
+            sort=sort, order=order, page=page, page_size=PAGE_SIZE)
+    except Exception:  # noqa: BLE001 — сервер не должен ронять вкладку
+        return _from_cards(cards, search), cards
+    return page_data, cards
 
 
-def _merge(cards: list[Supplier], rows: list[SupplierRow],
-           focus: str = "") -> list[Entry]:
-    """Сводит поставщиков из оплат с карточками по нормализованному имени."""
-    by_key = {card.key: card for card in cards}
-    entries: list[Entry] = []
-    used: set[str] = set()
-    for row in rows:
-        key = normalize_text(row.recipient)
-        card = by_key.get(key)
-        if card is not None:
-            used.add(key)
-        entries.append(Entry(name=row.recipient, row=row, card=card,
-                             focus=focus))
-    if focus:
-        # При отборе по менеджеру чужие карточки не показываются: человек
-        # просил своих поставщиков, а карточка без оплат под его именем к ним
-        # не относится. Без отбора они видны — в них лежит разбор прайса.
-        return entries
-    for card in cards:
-        if card.key not in used:
-            entries.append(Entry(name=card.name, row=None, card=card))
-    return entries
+def _from_cards(cards: list[Supplier], search: str) -> directory.Page:
+    """Список из одних карточек — то, что можно показать без общей базы."""
+    query = search.casefold().replace("ё", "е").strip()
+    items = [directory.Entry(recipient_key=card.key, recipient=card.name)
+             for card in cards
+             if not query or query in card.name.casefold().replace("ё", "е")]
+    return directory.Page(items=items, total=len(items), page=1,
+                          page_size=max(len(items), 1))
 
 
 class SuppliersPage(QWidget):
@@ -157,12 +175,36 @@ class SuppliersPage(QWidget):
         self.settings = settings
         self.notify = notify
         self.items: list[Supplier] = []
-        self.entries: list[Entry] = []
+        self.rows: list[Row] = []
         self.current: Supplier | None = None
-        self.chosen: Entry | None = None
+        self.chosen: Row | None = None
         self._layouts: list[SupplierLayout] = []
         self._links: list[SupplierLink] = []
         self._loading = False
+        self._page = directory.Page()
+        # Состояние отбора. Держится здесь, а не считывается с виджетов:
+        # запрос уходит на сервер, и собирать его из полудюжины полей на каждом
+        # обращении — верный способ разойтись с тем, что видит человек.
+        self._direction = ""
+        self._manager = 0
+        # Чьи справочники сейчас в фильтрах. Страница строится при запуске
+        # приложения, а вход в общую базу человек выполняет позже, открыв
+        # «Оплаты», — на момент сборки направлений и менеджеров ещё не
+        # существует. Сравнение с учётной записью заодно переставляет фильтры,
+        # если вошли под другой.
+        self._filters_for = -1
+        self._state = ""
+        self._sort = "amount"
+        self._order = "desc"
+        self._page_no = 1
+
+        # Поиск не дёргает сервер на каждую букву: запрос уходит, когда человек
+        # остановился. Полторы тысячи строк искать посимвольно незачем.
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self._search_changed)
+
         self._build()
         self.reload()
 
@@ -175,9 +217,10 @@ class SuppliersPage(QWidget):
 
         root.addWidget(Title("Поставщики", self))
         root.addWidget(Subtitle(
-            "База помнит структуру прайса каждого поставщика и позиции, которые "
-            "пришлось свести вручную. Поставщик узнаётся по имени файла и по "
-            "набору заголовков, поэтому следующий прайс разбирается сам.", self))
+            "Поставщик закрепляется за менеджером, а не вычисляется по оплатам. "
+            "Отметьте своих и отправьте на подтверждение — до него они уже "
+            "считаются вашими. База помнит структуру прайса каждого поставщика "
+            "и позиции, которые пришлось свести вручную.", self))
 
         root.addWidget(self._metrics_row())
         root.addWidget(self._workspace(), 1)
@@ -188,10 +231,11 @@ class SuppliersPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Metrics.GAP)
         self.tile_suppliers = MetricTile("Поставщиков", Palette.PRIMARY, row)
+        self.tile_mine = MetricTile("Закреплено за мной", Palette.SUCCESS, row)
         self.tile_layouts = MetricTile("Структур прайсов", Palette.INFO, row)
-        self.tile_links = MetricTile("Ручных привязок", Palette.SUCCESS, row)
-        self.tile_size = MetricTile("Размер базы", Palette.TEXT_MUTED, row)
-        for tile in (self.tile_suppliers, self.tile_layouts, self.tile_links, self.tile_size):
+        self.tile_links = MetricTile("Ручных привязок", Palette.TEXT_MUTED, row)
+        for tile in (self.tile_suppliers, self.tile_mine,
+                     self.tile_layouts, self.tile_links):
             layout.addWidget(tile)
         return row
 
@@ -200,9 +244,9 @@ class SuppliersPage(QWidget):
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._list_card())
         splitter.addWidget(self._detail_card())
-        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([360, 820])
+        splitter.setSizes([760, 520])
         return splitter
 
     def _list_card(self) -> Card:
@@ -210,42 +254,145 @@ class SuppliersPage(QWidget):
         body = card.body()
         body.setSpacing(Metrics.GAP - 4)
         body.addWidget(SectionTitle("Список", card))
+        body.addLayout(self._filter_row(card))
+        body.addWidget(self._table(card), 1)
+        body.addLayout(self._pager(card))
+        body.addLayout(self._actions(card))
+        return card
+
+    def _filter_row(self, card: Card) -> QVBoxLayout:
+        box = QVBoxLayout()
+        box.setSpacing(6)
+
+        # Направление — переключателем, а не списком: его меняют чаще всего
+        # остального, и лишний клик по выпадающему списку тут заметен.
+        self.direction_row = QHBoxLayout()
+        self.direction_row.setSpacing(4)
+        self.direction_group = QButtonGroup(card)
+        self.direction_group.setExclusive(True)
+        self.direction_group.idClicked.connect(self._direction_chosen)
+        self._add_direction_button(card, "Все", "", 0)
+        self.direction_row.addStretch(1)
+        box.addLayout(self.direction_row)
+
+        line = QHBoxLayout()
+        line.setSpacing(7)
+
+        self.search = QLineEdit(card)
+        self.search.setPlaceholderText("Поиск по названию…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda _: self._search_timer.start())
+        self.search.returnPressed.connect(self._search_changed)
+        line.addWidget(self.search, 2)
 
         self.manager = SelectBox(card)
         self.manager.setToolTip(
-            "Поставщик виден у каждого, кто ему платил: половина получателей "
-            "оплачивается несколькими менеджерами")
-        self.manager.currentIndexChanged.connect(lambda _: self.reload())
-        body.addWidget(self.manager)
+            "«Мои» — и зафиксированные, и заявленные: поставщик считается вашим "
+            "сразу после заявки")
+        self.manager.currentIndexChanged.connect(lambda _: self._manager_chosen())
+        line.addWidget(self.manager, 1)
 
-        self.search = QLineEdit(card)
-        self.search.setPlaceholderText("Поиск по названию, бренду, менеджеру…")
-        self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(lambda _: self._fill_list())
-        body.addWidget(self.search)
+        self.state = SelectBox(card)
+        for value, title in _STATES:
+            self.state.addItem(title, value)
+        self.state.currentIndexChanged.connect(lambda _: self._state_chosen())
+        line.addWidget(self.state, 1)
+        box.addLayout(line)
+        return box
 
-        self.list = QListWidget(card)
-        self.list.setMinimumHeight(140)
-        self.list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
-        self.list.currentRowChanged.connect(self._on_selected)
-        body.addWidget(self.list, 1)
+    def _add_direction_button(self, parent: QWidget, title: str, code: str,
+                              index: int) -> None:
+        button = QPushButton(title, parent)
+        button.setCheckable(True)
+        button.setChecked(not code)
+        button.setProperty("code", code)
+        self.direction_group.addButton(button, index)
+        self.direction_row.insertWidget(index, button)
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(7)
-        add = QPushButton("Добавить", card)
-        add.setIcon(icons.icon("open"))
-        add.setToolTip("Завести карточку поставщика вручную")
+    def _table(self, card: Card) -> DataTable:
+        self.table = DataTable([
+            Column("Поставщик", lambda r: r.name, 260, highlight=True),
+            Column("Направление", lambda r: r.directions, 130,
+                   color=lambda r: None if r.entry.directions
+                   else QColor(Palette.TEXT_FAINT)),
+            Column("Ведёт", lambda r: r.assigned, 200,
+                   color=lambda r: QColor(Palette.WARNING) if r.entry.has_draft
+                   else None),
+            Column("Оплат", lambda r: r.entry.payments or "", 70,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            Column("Сумма", lambda r: r.amount_title, 110,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            Column("Последняя оплата", lambda r: r.last_pay_title, 130),
+            Column("Карточка", lambda r: r.card_state, 110),
+        ], card)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        # Сортировку считает сервер: страница показывает сотню строк из полутора
+        # тысяч, и сортировка внутри неё переставляла бы видимое, оставляя
+        # остальное на месте — то есть врала бы.
+        self.table.setSortingEnabled(False)
+        self.table.horizontalHeader().sectionClicked.connect(self._sort_by)
+        selection = self.table.selectionModel()
+        selection.currentRowChanged.connect(lambda *_: self._on_selected())
+        # Отдельно от смены текущей строки: при `selectRow` Qt сдвигает курсор
+        # раньше, чем помечает строки выделенными, и состояние кнопок,
+        # посчитанное по первому сигналу, отстаёт от того, что видно на экране.
+        selection.selectionChanged.connect(lambda *_: self._update_actions())
+        self.table.item_activated.connect(lambda _: self.tabs.setCurrentIndex(0))
+        return self.table
+
+    def _pager(self, card: Card) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(7)
+        self.page_hint = Hint("", card)
+        row.addWidget(self.page_hint)
+        row.addStretch(1)
+        self.prev_button = QPushButton("‹ Назад", card)
+        self.prev_button.clicked.connect(lambda: self._turn(-1))
+        row.addWidget(self.prev_button)
+        self.next_button = QPushButton("Вперёд ›", card)
+        self.next_button.clicked.connect(lambda: self._turn(1))
+        row.addWidget(self.next_button)
+        return row
+
+    def _actions(self, card: Card) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(7)
+
+        self.claim_button = QPushButton("Это мои", card)
+        self.claim_button.setObjectName("Primary")
+        self.claim_button.setIcon(icons.icon("check", Palette.TEXT_ON_PRIMARY))
+        self.claim_button.setToolTip(
+            "Заявить выделенных поставщиков своими.\n"
+            "Они сразу попадут в отбор «мои» — с пометкой «на подтверждении».")
+        self.claim_button.clicked.connect(self.claim_selected)
+        row.addWidget(self.claim_button)
+
+        self.withdraw_button = QPushButton("Отозвать", card)
+        self.withdraw_button.setToolTip(
+            "Снять свою заявку. Зафиксированное так не снимается — это к админу")
+        self.withdraw_button.clicked.connect(self.withdraw_selected)
+        row.addWidget(self.withdraw_button)
+
+        self.fix_button = QPushButton("Зафиксировать", card)
+        self.fix_button.setIcon(icons.icon("admin"))
+        self.fix_button.setToolTip("Подтвердить заявки выделенных поставщиков")
+        self.fix_button.clicked.connect(self.fix_selected)
+        row.addWidget(self.fix_button)
+        row.addStretch(1)
+
+        add = QPushButton("Карточка", card)
+        add.setIcon(icons.icon("card"))
+        add.setToolTip("Завести карточку выбранного поставщика — для разбора прайса")
         add.clicked.connect(self.add_supplier)
-        buttons.addWidget(add)
+        row.addWidget(add)
 
         remove = QPushButton("Удалить", card)
         remove.setObjectName("Danger")
         remove.setIcon(icons.icon("trash", Palette.DANGER))
         remove.setToolTip("Удалить карточку вместе со структурами и привязками")
         remove.clicked.connect(self.delete_supplier)
-        buttons.addWidget(remove)
-        body.addLayout(buttons)
-        return card
+        row.addWidget(remove)
+        return row
 
     def _detail_card(self) -> Card:
         card = Card(self, padding=Metrics.PAD - 4)
@@ -264,6 +411,20 @@ class SuppliersPage(QWidget):
         self.save_button.clicked.connect(self.save_current)
         header.addWidget(self.save_button)
         body.addLayout(header)
+
+        badges = QHBoxLayout()
+        badges.setSpacing(6)
+        self.direction_badge = Badge("", Palette.PRIMARY, Palette.PRIMARY_SOFT, card)
+        self.direction_badge.hide()
+        badges.addWidget(self.direction_badge)
+        self.assigned_label = Hint("", card)
+        badges.addWidget(self.assigned_label, 1)
+        body.addLayout(badges)
+
+        self.warning_label = Hint("", card)
+        self.warning_label.setStyleSheet(f"color: {Palette.WARNING}; font-size: 12px;")
+        self.warning_label.hide()
+        body.addWidget(self.warning_label)
 
         self.tabs = QTabWidget(card)
         self.tabs.addTab(self._card_tab(), "Карточка")
@@ -426,89 +587,236 @@ class SuppliersPage(QWidget):
         layout.addLayout(buttons)
         return page
 
+    # --- отбор ----------------------------------------------------------------
+
+    def _load_directions(self) -> None:
+        """Справочник направлений и менеджеры — после входа в общую базу."""
+        run_task(
+            lambda: (directory.directions(), directory.managers()),
+            on_result=self._fill_filters,
+            on_error=self._filters_failed)
+
+    def _filters_failed(self, message: str) -> None:
+        """Справочники не пришли — список всё равно нужно показать.
+
+        Отметка о загрузке ставится и здесь: иначе `reload` уходил бы за
+        справочниками снова и снова, и список не прочитался бы ни разу.
+        """
+        self._filters_for = transport.session.user_id
+        self.notify(f"Направления недоступны: {message}", ToastKind.WARNING)
+        self.reload()
+
+    def _fill_filters(self, payload: tuple[list[directory.Direction],
+                                           list[tuple[int, str]]]) -> None:
+        directions, managers = payload
+        self._filters_for = transport.session.user_id
+        _DIRECTION_TITLES.update({d.code: d.title for d in directions})
+
+        # Кнопки пересобираются целиком: вход мог смениться, а вместе с ним и
+        # справочник. Оставленные от прошлого раза дали бы два «Beauty» подряд.
+        for button in self.direction_group.buttons():
+            if button.property("code"):
+                self.direction_group.removeButton(button)
+                button.setParent(None)
+                button.deleteLater()
+        for index, item in enumerate(directions, start=1):
+            self._add_direction_button(self, item.title, item.code, index)
+
+        self.manager.blockSignals(True)
+        self.manager.clear()
+        mine = transport.session.user_id
+        if mine:
+            self.manager.addItem("Мои поставщики", mine)
+        self.manager.addItem("Все менеджеры", 0)
+        for user_id, name in managers:
+            if user_id != mine:
+                self.manager.addItem(name, user_id)
+        self.manager.blockSignals(False)
+
+        # Свои поставщики нужнее чужих, а своё направление — чужого. И то, и
+        # другое лишь умолчание отбора: переключатель рядом, и чужое доступно.
+        self._manager = mine
+        if own := _own_direction(directions):
+            self._select_direction(own)
+        self.reload()
+
+    def _select_direction(self, code: str) -> None:
+        for button in self.direction_group.buttons():
+            if button.property("code") == code:
+                button.setChecked(True)
+                self._direction = code
+                return
+
+    def _direction_chosen(self, index: int) -> None:
+        button = self.direction_group.button(index)
+        self._direction = button.property("code") if button else ""
+        self._page_no = 1
+        self.reload()
+
+    def _manager_chosen(self) -> None:
+        self._manager = int(self.manager.currentData() or 0)
+        self._page_no = 1
+        self.reload()
+
+    def _state_chosen(self) -> None:
+        self._state = self.state.currentData() or ""
+        self._page_no = 1
+        self.reload()
+
+    def _search_changed(self) -> None:
+        self._search_timer.stop()
+        self._page_no = 1
+        self.reload()
+
+    def _sort_by(self, column: int) -> None:
+        """Клик по заголовку. Повторный по той же колонке меняет направление.
+
+        Сортировка по менеджеру и направлению идёт по первому значению: у
+        поставщика их бывает несколько, и незакреплённые всегда уходят в
+        конец — список открывают ради того, кто ведёт.
+        """
+        keys = {0: "name", 1: "direction", 2: "manager",
+                3: "payments", 4: "amount", 5: "last_pay"}
+        key = keys.get(column)
+        if key is None:
+            return
+        if key == self._sort:
+            self._order = "asc" if self._order == "desc" else "desc"
+        else:
+            # Имена — от «А», деньги и даты — от большего: так их и читают.
+            self._sort = key
+            self._order = "asc" if key in _TEXT_SORTS else "desc"
+        self._page_no = 1
+        self.reload()
+
+    def _turn(self, step: int) -> None:
+        self._page_no = max(1, min(self._page.pages, self._page_no + step))
+        self.reload()
+
     # --- данные ---------------------------------------------------------------
 
     def reload(self) -> None:
-        """Читает список. Вызывается при каждом открытии вкладки."""
-        chosen = self.manager.currentData() or ""
+        """Читает страницу списка. Вызывается при каждой смене отбора.
+
+        Справочники подтягиваются здесь же, когда появляется вход: собрать их
+        в конструкторе нельзя — окно строится до того, как человек вошёл в
+        общую базу, и направлений с менеджерами тогда ещё не существует.
+        """
+        if directory.online() and self._filters_for != transport.session.user_id:
+            # Загрузка справочников закончится вызовом reload — список
+            # прочитается следом, уже с правильным отбором по умолчанию.
+            self._load_directions()
+            return
+
         run_task(
-            lambda: _load_all(chosen),
+            lambda: _load_page(self.search.text(), self._direction, self._manager,
+                               self._state, self._sort, self._order, self._page_no),
             on_result=self._on_loaded,
             on_error=lambda message: self.notify(
                 f"Список поставщиков недоступен: {message}", ToastKind.ERROR),
         )
 
-    def _on_loaded(self, payload: tuple[list[Supplier], list[SupplierRow]]) -> None:
-        cards, rows = payload
+    def _on_loaded(self, payload: tuple[directory.Page, list[Supplier]]) -> None:
+        page, cards = payload
         self.items = cards
-        self.entries = _merge(cards, rows, self.manager.currentData() or "")
-        self._fill_managers(rows)
+        self._page = page
+        by_key = {card.key: card for card in cards}
+        self.rows = [Row(entry=entry, card=by_key.get(normalize_text(entry.recipient)))
+                     for entry in page.items]
 
-        previous = self.chosen.name if self.chosen else ""
-        self._fill_list(select=previous)
-        self.tile_suppliers.set_value(len(self.entries))
+        previous = self.chosen.key if self.chosen else ""
+        self._fill_table(select=previous)
+        self._fill_metrics(page, cards)
+        self._fill_pager(page)
+        self._update_actions()
+        fade_in(self.table)
+
+    def _fill_metrics(self, page: directory.Page, cards: list[Supplier]) -> None:
+        self.tile_suppliers.set_value(page.total)
+        mine = transport.session.user_id
+        self.tile_mine.set_value(
+            sum(1 for row in self.rows if mine and row.entry.mine(mine)))
         self.tile_layouts.set_value(sum(s.layouts for s in cards))
         self.tile_links.set_value(sum(s.links for s in cards))
-        self.tile_size.set_value(f"{suppliers.database_size() / 1024:.0f} КБ")
-        fade_in(self.list)
 
-    def _fill_managers(self, rows: list[SupplierRow]) -> None:
-        """Список менеджеров. Свой — первым после «всех»."""
-        if self.manager.count():
-            return
-        names = sorted({name for row in rows for name in row.managers})
-        mine = transport.session.full_name
-        self.manager.blockSignals(True)
-        self.manager.addItem("Все менеджеры", "")
-        if mine in names:
-            self.manager.addItem(f"Мои — {mine}", mine)
-            names.remove(mine)
-        for name in names:
-            self.manager.addItem(name, name)
-        # Свои поставщики нужнее чужих: если вошли под учёткой, начинаем с них.
-        if mine and self.manager.count() > 1 and self.manager.itemData(1) == mine:
-            self.manager.setCurrentIndex(1)
-        self.manager.blockSignals(False)
-        if self.manager.currentIndex() == 1:
-            self.reload()
+    def _fill_pager(self, page: directory.Page) -> None:
+        if not page.total:
+            self.page_hint.setText("ничего не найдено")
+        else:
+            first = (page.page - 1) * page.page_size + 1
+            last = min(page.total, first + len(page.items) - 1)
+            self.page_hint.setText(f"{first}–{last} из {page.total}")
+        self.prev_button.setEnabled(page.page > 1)
+        self.next_button.setEnabled(page.page < page.pages)
 
-    def _visible(self) -> list[Entry]:
-        query = self.search.text().casefold().replace("ё", "е").strip()
-        if not query:
-            return self.entries
-        return [entry for entry in self.entries
-                if query in entry.haystack.casefold().replace("ё", "е")]
-
-    def _fill_list(self, select: str = "") -> None:
+    def _fill_table(self, select: str = "") -> None:
         self._loading = True
-        self.list.clear()
-        visible = self._visible()
-        for entry in visible:
-            item = QListWidgetItem(f"{entry.name}\n{entry.summary}")
-            item.setData(Qt.ItemDataRole.UserRole, entry.name)
-            if entry.card is not None and not entry.card.active:
-                item.setForeground(QColor(Palette.TEXT_FAINT))
-            self.list.addItem(item)
+        self.table.set_items(self.rows)
+        self.table.proxy.set_text("")
+        self.table.model_.set_terms([self.search.text().strip()])
         self._loading = False
-        if not visible:
+        if not self.rows:
             self.chosen = None
             self._show(None)
+            self._show_directory(None)
             return
-        position = next((i for i, e in enumerate(visible) if e.name == select), 0)
-        self.list.setCurrentRow(position)
+        position = next((i for i, row in enumerate(self.rows) if row.key == select), 0)
+        self.table.selectRow(position)
 
-    def _on_selected(self, row: int) -> None:
+    def _on_selected(self) -> None:
         if self._loading:
             return
-        visible = self._visible()
-        entry = visible[row] if 0 <= row < len(visible) else None
-        self.chosen = entry
-        self._show(entry.card if entry else None)
-        if entry is not None and entry.card is None:
+        row = self.table.current_item()
+        self.chosen = row if isinstance(row, Row) else None
+        self._show(self.chosen.card if self.chosen else None)
+        self._show_directory(self.chosen)
+        self._update_actions()
+        if self.chosen is not None and self.chosen.card is None:
             # Карточки нет — показать нечего, но человек должен видеть, что
             # выбрал, и понимать, чего именно не хватает.
-            self.detail_title.setText(entry.name)
-            self.field_name.setText(entry.name)
+            self.detail_title.setText(self.chosen.name)
+            self.field_name.setText(self.chosen.name)
+
+    def _show_directory(self, row: Row | None) -> None:
+        """Направление, закрепление и предупреждение об оплатах со стороны."""
+        if row is None:
+            self.direction_badge.hide()
+            self.assigned_label.setText("")
+            self.warning_label.hide()
+            return
+
+        titles = [_DIRECTION_TITLES.get(code, code) for code in row.entry.directions]
+        self.direction_badge.setText(" · ".join(titles))
+        self.direction_badge.setVisible(bool(titles))
+
+        if row.entry.assigned:
+            self.assigned_label.setText(f"ведёт: {row.entry.assigned_title}")
+        else:
+            self.assigned_label.setText("не закреплён ни за кем")
+
+        payers = row.entry.unassigned_payers
+        # Оплата за коллегу ничего не нарушает и ничего не блокирует. Но знать
+        # о ней полезно: чаще всего это признак незаявленного закрепления.
+        self.warning_label.setText(
+            f"платили, но не закреплены: {', '.join(payers)}" if payers else "")
+        self.warning_label.setVisible(bool(payers))
+
+    def _update_actions(self) -> None:
+        """Что сейчас можно нажать. Офлайн закрепление недоступно вовсе."""
+        online = directory.online()
+        rows = self._selected_rows()
+        mine = transport.session.user_id
+        self.claim_button.setEnabled(bool(online and rows and mine))
+        self.withdraw_button.setEnabled(bool(
+            online and mine and any(
+                any(p.user_id == mine and not p.fixed for p in row.entry.assigned)
+                for row in rows)))
+        self.fix_button.setVisible(transport.session.is_admin)
+        self.fix_button.setEnabled(bool(
+            online and any(row.entry.has_draft for row in rows)))
+
+    def _selected_rows(self) -> list[Row]:
+        return [row for row in self.table.selected_items() if isinstance(row, Row)]
 
     def _show(self, supplier: Supplier | None) -> None:
         self.current = supplier
@@ -554,12 +862,65 @@ class SuppliersPage(QWidget):
         if not self._loading and self.current is not None:
             self.save_button.setEnabled(True)
 
-    # --- действия -------------------------------------------------------------
+    # --- закрепление ----------------------------------------------------------
+
+    def claim_selected(self) -> None:
+        """Заявить выделенных поставщиков своими."""
+        keys = [row.key for row in self._selected_rows()]
+        if not keys:
+            self.notify("Выделите поставщиков в списке", ToastKind.WARNING)
+            return
+        self._run_directory(
+            lambda: directory.claim(keys),
+            lambda result: f"Заявлено поставщиков: {result.changed}"
+            if result.changed else "Все выделенные уже заявлены")
+
+    def withdraw_selected(self) -> None:
+        keys = [row.key for row in self._selected_rows()]
+        if not keys:
+            return
+        self._run_directory(
+            lambda: directory.withdraw(keys),
+            lambda result: f"Заявка отозвана: {result.changed}"
+            if result.changed else "Отзывать нечего: закрепление зафиксировано")
+
+    def fix_selected(self) -> None:
+        rows = [row for row in self._selected_rows() if row.entry.has_draft]
+        if not rows:
+            self.notify("Среди выделенных нет заявок на подтверждение",
+                        ToastKind.WARNING)
+            return
+        answer = QMessageBox.question(
+            self, "Зафиксировать закрепление",
+            f"Подтвердить заявки по {len(rows)} поставщикам?\n\n"
+            "После фиксации менеджер не сможет снять закрепление сам.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        keys = [row.key for row in rows]
+        self._run_directory(
+            lambda: directory.fix(keys),
+            lambda result: f"Зафиксировано закреплений: {result.changed}")
+
+    def _run_directory(self, action: Callable[[], directory.Result],
+                       message: Callable[[directory.Result], str]) -> None:
+        """Массовое действие с закреплением: выполнить и перечитать список."""
+        def done(result: directory.Result) -> None:
+            self.notify(message(result), ToastKind.SUCCESS if result.changed
+                        else ToastKind.INFO)
+            self.reload()
+
+        run_task(action, on_result=done,
+                 on_error=lambda error: self.notify(
+                     f"Не удалось изменить закрепление: {error}", ToastKind.ERROR))
+
+    # --- карточка -------------------------------------------------------------
 
     def add_supplier(self) -> None:
-        # Если в списке выбран поставщик из оплат без карточки, заводим её
-        # сразу на него: имя из 1С точнее набранного заново, и карточка
-        # свяжется с оплатами по нему же.
+        # Если в списке выбран поставщик без карточки, заводим её сразу на
+        # него: имя из 1С точнее набранного заново, и карточка свяжется с
+        # оплатами по нему же.
         chosen = self.chosen
         name = (chosen.name if chosen is not None and chosen.card is None
                 else "Новый поставщик")
@@ -690,8 +1051,28 @@ class SuppliersPage(QWidget):
 
     def show_supplier(self, supplier_id: int) -> None:
         """Открывает карточку конкретного поставщика — переход со страницы цен."""
-        self.current = Supplier(id=supplier_id)
+        self.current = suppliers.get_supplier(supplier_id)
+        if self.current is not None:
+            # Поиском, а не выделением строки: поставщик мог не попасть на
+            # текущую страницу отбора, и выделять было бы нечего. Сигналы
+            # заглушены, иначе поле само запустит отложенный запрос вдогонку.
+            self.search.blockSignals(True)
+            self.search.setText(self.current.name)
+            self.search.blockSignals(False)
+        self._page_no = 1
         self.reload()
+
+
+def _own_direction(directions: list[directory.Direction]) -> str:
+    """Направление вошедшего — умолчание отбора, а не ограничение доступа.
+
+    Приходит вместе с токеном. Ведёт человек оба отдела или ни одного — отбор
+    остаётся на «Все»: гадать, какой из двух ему сейчас нужен, не следует, а
+    новичку без направления правильнее показать всё.
+    """
+    own = [code for code in transport.session.directions
+           if any(item.code == code for item in directions)]
+    return own[0] if len(own) == 1 else ""
 
 
 def _terms_value(box: SelectBox) -> int:

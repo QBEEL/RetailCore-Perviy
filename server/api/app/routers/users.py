@@ -13,9 +13,30 @@ _SELECT = (
     "SELECT u.id, u.login, u.full_name, u.is_admin, u.is_active, u.created_at,"
     "       COALESCE(array_agg(r.responsible)"
     "                FILTER (WHERE r.responsible IS NOT NULL), '{}')"
-    "         AS responsible"
+    "         AS responsible,"
+    # Направления — признак категорийного менеджера. Отдельного поля
+    # «должность» нет: поставщиков ведут ровно те, у кого задано направление,
+    # и второй признак того же самого рано или поздно разошёлся бы с первым.
+    "       COALESCE((SELECT array_agg(d.code ORDER BY d.sort_order)"
+    "                   FROM user_direction ud"
+    "                   JOIN direction d ON d.id = ud.direction_id"
+    "                  WHERE ud.user_id = u.id), '{}') AS directions"
     " FROM app_user u LEFT JOIN user_responsible r ON r.user_id = u.id"
 )
+
+
+def _save_directions(user_id: int, codes: list[str]) -> None:
+    """Переписывает направления учётки.
+
+    Целиком, а не по одному: список короткий, приходит из диалога сразу
+    готовым, и разбирать, что добавилось, а что убралось, здесь не за чем.
+    """
+    db.execute("DELETE FROM user_direction WHERE user_id = %s", (user_id,))
+    for code in codes:
+        db.execute(
+            "INSERT INTO user_direction (user_id, direction_id)"
+            " SELECT %s, id FROM direction WHERE code = %s"
+            " ON CONFLICT DO NOTHING", (user_id, code))
 
 
 @router.get("/me", response_model=UserOut, summary="Кто я")
@@ -49,6 +70,7 @@ def create_user(form: UserIn,
     for name in form.responsible:
         db.execute("INSERT INTO user_responsible (user_id, responsible)"
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], name))
+    _save_directions(row["id"], form.directions)
     db.execute(
         "INSERT INTO audit_log (user_id, entity, entity_id, action)"
         " VALUES (%s, 'app_user', %s, 'create')", (user.id, row["id"]))
@@ -77,6 +99,7 @@ def update_user(user_id: int, form: UserIn,
     for name in form.responsible:
         db.execute("INSERT INTO user_responsible (user_id, responsible)"
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, name))
+    _save_directions(user_id, form.directions)
     db.execute(
         "INSERT INTO audit_log (user_id, entity, entity_id, action)"
         " VALUES (%s, 'app_user', %s, 'update')", (user.id, user_id))

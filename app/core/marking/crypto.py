@@ -42,6 +42,12 @@ _INCLUDE_CHAIN_EXCEPT_ROOT = 0
 # зарегистрирован), а на боевом контуре выдаётся токен.
 _ATTACHED = False
 
+# Открепленная подпись — то, чего требует СУЗ при заказе кодов. Ровно
+# противоположное входу, и это не наша путаница: без неё СУЗ отвечает «Не
+# указано значение параметра "Открепленная подпись в формате Base64"». Проверено
+# обращением к боевому контуру.
+_DETACHED = True
+
 
 class CryptoUnavailable(RuntimeError):
     """КриптоПро не установлен или недоступен. Текст пригоден для показа."""
@@ -98,11 +104,20 @@ def _field(subject: str, name: str) -> str:
 
 def _dispatch(name: str) -> Any:
     try:
+        import pythoncom
         import win32com.client
     except ImportError as error:
         raise CryptoUnavailable(
             "Не установлен пакет pywin32 — без него подпись недоступна."
         ) from error
+    try:
+        # COM инициализируется на каждый поток отдельно. Интерфейс уводит вход
+        # и подпись в фоновую задачу — без этой строки первый же `Dispatch`
+        # оттуда отвечает «CoInitialize has not been called», и выглядит это
+        # как поломка КриптоПро, а не как забытая инициализация.
+        pythoncom.CoInitialize()
+    except Exception:  # noqa: BLE001 — поток уже в другой модели COM, это не помеха
+        pass
     try:
         return win32com.client.Dispatch(name)
     except Exception as error:  # noqa: BLE001 — COM бросает что угодно
@@ -165,15 +180,22 @@ def find(thumbprint: str) -> Certificate | None:
     return None
 
 
-def sign(data: str, thumbprint: str) -> str:
-    """Присоединённая подпись CAdES-BES над строкой. Возвращает base64.
+def sign(data: str, thumbprint: str, detached: bool = False) -> str:
+    """Подпись CAdES-BES над строкой. Возвращает base64.
 
-    `data` — то, что прислал сервер: строка, которую он ждёт подписанной.
-    Подписывается её содержимое, а не base64-представление, поэтому перед
-    подписью оно кодируется, а COM-объекту сообщается, что вход — base64.
+    `data` — то, что нужно подписать: строка сервера при входе или тело запроса
+    при заказе. Подписывается её содержимое, а не base64-представление, поэтому
+    перед подписью оно кодируется, а COM-объекту сообщается, что вход — base64.
 
-    Почему подпись присоединённая, объяснено у `_ATTACHED`: отсоединённую
-    система маркировки не принимает.
+    Вид подписи зависит от того, кто её проверяет, и «правильного» одного нет:
+
+    - **вход** в ГИС МТ и True API требует присоединённой; отсоединённая
+      отвергается — почему, объяснено у `_ATTACHED`;
+    - **заказ кодов** в СУЗ, наоборот, требует открепленной: без неё ответ
+      прямой — «Не указано значение параметра "Открепленная подпись в формате
+      Base64"».
+
+    Оба утверждения — из ответов живых систем, а не из описаний.
     """
     certificate = find(thumbprint)
     if certificate is None:
@@ -206,7 +228,8 @@ def sign(data: str, thumbprint: str) -> str:
         signed.Content = base64.b64encode(data.encode("utf-8")).decode()
 
         try:
-            signature = signed.SignCades(signer, _CADES_BES, _ATTACHED)
+            signature = signed.SignCades(signer, _CADES_BES,
+                                         _DETACHED if detached else _ATTACHED)
         except Exception as error:  # noqa: BLE001 — COM бросает что угодно
             raise SigningFailed(_explain(error)) from error
     finally:

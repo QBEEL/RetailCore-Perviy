@@ -13,12 +13,16 @@ from __future__ import annotations
 import calendar
 from datetime import date, timedelta
 
-from PySide6.QtCore import QMimeData, Qt, Signal
-from PySide6.QtGui import QDrag, QMouseEvent
+from PySide6.QtCore import QMimeData, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
     QFrame,
     QGridLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -39,6 +43,64 @@ LEVEL_COLORS: dict[DayLevel, tuple[str, str]] = {
 
 MIME_PAYMENT = "application/x-retailcore-payment"
 
+# Роли элемента списка дня: что переносим и можно ли это переносить вообще.
+ROLE_PAYMENT_ID = Qt.ItemDataRole.UserRole
+ROLE_MOVABLE = Qt.ItemDataRole.UserRole + 1
+
+
+def payments_count(count: int) -> str:
+    """«1 оплата», «2 оплаты», «5 оплат» — число со словом в нужном падеже."""
+    tail, hundred = count % 10, count % 100
+    if tail == 1 and hundred != 11:
+        word = "оплата"
+    elif 2 <= tail <= 4 and not 12 <= hundred <= 14:
+        word = "оплаты"
+    else:
+        word = "оплат"
+    return f"{count} {word}"
+
+
+def payment_mime(ids: list[int]) -> QMimeData:
+    """Пакует переносимые оплаты. Их всегда список: тянуть можно и несколько."""
+    payload = QMimeData()
+    payload.setData(MIME_PAYMENT, ",".join(str(value) for value in ids).encode())
+    return payload
+
+
+def payment_ids(payload: QMimeData) -> list[int]:
+    """Разбирает список оплат из переноса. Чужой формат даёт пустой список."""
+    if not payload.hasFormat(MIME_PAYMENT):
+        return []
+    raw = bytes(payload.data(MIME_PAYMENT)).decode(errors="ignore")
+    return [int(part) for part in raw.split(",") if part.strip().lstrip("-").isdigit()]
+
+
+def drag_badge(count: int, widget: QWidget) -> QPixmap:
+    """Ярлык под курсором: сколько оплат тянем.
+
+    Без подписи перенос одной оплаты и перенос всего дня выглядят одинаково, а
+    отменить перенос нечем — только тащить обратно.
+    """
+    text = payments_count(count)
+    metrics = QFontMetrics(widget.font())
+    width = metrics.horizontalAdvance(text) + 22
+    height = metrics.height() + 12
+    ratio = widget.devicePixelRatioF()
+    pixmap = QPixmap(int(width * ratio), int(height * ratio))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(Palette.PRIMARY))
+    box = QRectF(0, 0, width, height)
+    painter.drawRoundedRect(box, Metrics.RADIUS_SM, Metrics.RADIUS_SM)
+    painter.setPen(QColor("#ffffff"))
+    painter.setFont(widget.font())
+    painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+    painter.end()
+    return pixmap
+
 
 def money(value: float, *, short: bool = False) -> str:
     """Сумма для показа. Короткая форма — для тесных ячеек календаря."""
@@ -57,12 +119,13 @@ class DayCell(QFrame):
     """Одна клетка месяца."""
 
     clicked = Signal(object)
-    payment_dropped = Signal(object, object)
+    payments_dropped = Signal(object, object, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.day: date | None = None
         self.data: Day | None = None
+        self._style = ""
         self.setMinimumHeight(84)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAcceptDrops(True)
@@ -102,7 +165,8 @@ class DayCell(QFrame):
             self.number.setText("")
             self.total.setText("")
             self.detail.setText("")
-            self.setStyleSheet("background: transparent; border: none;")
+            self._style = "background: transparent; border: none;"
+            self.setStyleSheet(self._style)
             self.setToolTip("")
             return
 
@@ -123,9 +187,10 @@ class DayCell(QFrame):
         elif today is not None and day == today:
             border, width = Palette.PRIMARY, 2
 
-        self.setStyleSheet(
+        self._style = (
             f"QFrame {{ background: {background}; border: {width}px solid {border};"
             f" border-radius: {Metrics.RADIUS_SM}px; }}")
+        self.setStyleSheet(self._style)
 
         colour = Palette.TEXT_FAINT if muted else (
             Palette.TEXT_MUTED if weekend else Palette.TEXT)
@@ -174,38 +239,55 @@ class DayCell(QFrame):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Перенос платежа на другой день — только запланированного."""
+        """Перетаскивание клетки переносит весь день — неоплаченное из него.
+
+        Отдельные оплаты выбираются в списке дня: в клетку помещаются два
+        названия из десяти, и указать мышью на нужную строку в ней не на что.
+        """
         if not (event.buttons() & Qt.MouseButton.LeftButton) or self.data is None:
             return
-        movable = [p for p in self.data.payments if p.status.open]
+        movable = [p.id for p in self.data.payments if p.status.open]
         if not movable:
             return
-        if (event.position().toPoint() - getattr(self, "_press", event.position().toPoint())).manhattanLength() < 12:
+        start = getattr(self, "_press", event.position().toPoint())
+        moved = (event.position().toPoint() - start).manhattanLength()
+        if moved < QApplication.startDragDistance():
             return
         drag = QDrag(self)
-        payload = QMimeData()
-        payload.setData(MIME_PAYMENT, str(movable[0].id).encode())
-        drag.setMimeData(payload)
-        self._dragged = movable[0]
+        drag.setMimeData(payment_mime(movable))
+        drag.setPixmap(drag_badge(len(movable), self))
         drag.exec(Qt.DropAction.MoveAction)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self.day is not None and event.mimeData().hasFormat(MIME_PAYMENT):
-            event.acceptProposedAction()
+        if self.day is None or not event.mimeData().hasFormat(MIME_PAYMENT):
+            return
+        event.acceptProposedAction()
+        # Клетка под курсором подсвечивается: без неё в сетке 7×6 не понять,
+        # на какое число попадёт перенос.
+        self.setStyleSheet(
+            f"QFrame {{ background: {Palette.SURFACE_ALT};"
+            f" border: 2px dashed {Palette.PRIMARY};"
+            f" border-radius: {Metrics.RADIUS_SM}px; }}")
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.setStyleSheet(self._style)
 
     def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        source = event.source()
-        payment = getattr(source, "_dragged", None)
-        if self.day is not None and payment is not None and self.day != payment.pay_date:
-            self.payment_dropped.emit(payment, self.day)
-            event.acceptProposedAction()
+        self.setStyleSheet(self._style)
+        ids = payment_ids(event.mimeData())
+        if self.day is None or not ids:
+            return
+        # День целиком тянут за клетку, выбранные оплаты — из списка дня.
+        # Разница важна: перенос всего дня стоит подтвердить, выбранное — нет.
+        self.payments_dropped.emit(ids, self.day, isinstance(event.source(), DayCell))
+        event.acceptProposedAction()
 
 
 class MonthGrid(QWidget):
     """Сетка 7×6 с днями месяца."""
 
     day_clicked = Signal(object)
-    payment_moved = Signal(object, object)
+    payments_moved = Signal(object, object, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -225,7 +307,7 @@ class MonthGrid(QWidget):
         for index in range(42):
             cell = DayCell(self)
             cell.clicked.connect(self.day_clicked.emit)
-            cell.payment_dropped.connect(self.payment_moved.emit)
+            cell.payments_dropped.connect(self.payments_moved.emit)
             layout.addWidget(cell, 1 + index // 7, index % 7)
             self.cells.append(cell)
         for column in range(7):
@@ -263,6 +345,46 @@ class MonthGrid(QWidget):
     def month_range(year: int, month: int) -> tuple[date, date]:
         last = calendar.monthrange(year, month)[1]
         return date(year, month, 1), date(year, month, last)
+
+
+class DayPaymentList(QListWidget):
+    """Оплаты выбранного дня. Отсюда их переносят на другую дату.
+
+    Выделение множественное: на один день приходится и десять оплат, а
+    переносят обычно часть из них — например, всё по одному поставщику.
+    Неоплаченные строки не тянутся вовсе, статус «Оплачено» датой не двигают.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    @staticmethod
+    def mark(item: QListWidgetItem, payment: Payment) -> QListWidgetItem:
+        """Привязывает оплату к строке списка."""
+        item.setData(ROLE_PAYMENT_ID, payment.id)
+        item.setData(ROLE_MOVABLE, payment.status.open)
+        return item
+
+    def selected_ids(self, *, movable_only: bool = True) -> list[int]:
+        return [
+            int(item.data(ROLE_PAYMENT_ID) or 0)
+            for item in self.selectedItems()
+            if item.data(ROLE_PAYMENT_ID) and (not movable_only or item.data(ROLE_MOVABLE))
+        ]
+
+    def startDrag(self, actions) -> None:  # type: ignore[no-untyped-def]
+        """Тянем выделенное. Строки списка не трогаем — дату меняет страница."""
+        ids = self.selected_ids()
+        if not ids:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(payment_mime(ids))
+        drag.setPixmap(drag_badge(len(ids), self))
+        drag.exec(Qt.DropAction.MoveAction)
 
 
 class LevelLegend(QWidget):

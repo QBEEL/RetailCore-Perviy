@@ -42,7 +42,7 @@ COLUMNS = (
 
 # Правки, разрешённые обычному пользователю. Поля из выгрузки 1С сюда не входят:
 # их перезапишет следующий импорт, и правка всё равно пропадёт.
-EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "priority")
+EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "vat", "priority")
 
 
 def _conditions(
@@ -264,12 +264,13 @@ def create_payment(form: PaymentIn,
     created = db.fetch_one(
         "INSERT INTO payment (pay_date, amount, vat, currency, supplier_id,"
         "  recipient, recipient_key, status, operation, priority, comment,"
-        "  responsible, author, origin, updated_by)"
+        "  responsible, author, origin, origin_ref, updated_by)"
         " VALUES (%s, %s, %s, %s, %s, %s, lower(btrim(%s)), %s, %s, %s, %s,"
-        "         %s, %s, 'manual', %s) RETURNING id",
+        "         %s, %s, %s, %s, %s) RETURNING id",
         (form.pay_date, form.amount, form.vat, form.currency, form.supplier_id,
          form.recipient, form.recipient, form.status, form.operation,
-         form.priority, form.comment, responsible, user.full_name, user.id))
+         form.priority, form.comment, responsible, user.full_name,
+         form.origin, form.origin_ref, user.id))
     _record(user, "payment", created["id"], "create",
             {"recipient": form.recipient})
     return get_payment(created["id"], user)

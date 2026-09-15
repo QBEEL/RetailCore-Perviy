@@ -1,4 +1,4 @@
-"""Сценарии маркировки: вход, проверка кодов, журнал операций.
+"""Сценарии маркировки: вход, проверка кодов, журнал операций, реквизиты СУЗ.
 
 Интерфейс вызывает только эти функции — они рассчитаны на работу из фоновой
 задачи и сообщают о ходе через `progress`. Проверка кодов ничего не меняет в
@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from . import codes as codes_module
-from . import crypto, session, store, transport
+from . import crypto, orders as orders_module, session, store, suz, transport
 from .models import (
     BATCH_SIZE,
     CodeInfo,
@@ -22,6 +22,7 @@ from .models import (
     Contour,
     Operation,
     OperationKind,
+    OperationStatus,
     ProductGroup,
     parse_state,
 )
@@ -66,6 +67,15 @@ def sign_in(thumbprint: str, inn: str = "",
     return session.sign_in(thumbprint, inn, contour, organisation)
 
 
+def needs_organisation(error: object) -> bool:
+    """Отказ ли это из-за невыбранной организации.
+
+    Нужно интерфейсу: на такой отказ он открывает выбор, а не показывает
+    пользователю сообщение, из которого непонятно, что делать дальше.
+    """
+    return session.needs_organisation(error)
+
+
 def sign_out() -> None:
     session.sign_out()
 
@@ -76,6 +86,120 @@ def signed_in() -> bool:
 
 def current() -> session.Session:
     return session.session
+
+
+# --- станция управления заказами -----------------------------------------------
+
+def suz_credentials(contour: Contour = Contour.SANDBOX) -> suz.Credentials:
+    """Сохранённые реквизиты СУЗ этого контура."""
+    return suz.load(contour)
+
+
+def save_suz(credentials: suz.Credentials,
+             contour: Contour = Contour.SANDBOX) -> suz.Credentials:
+    return suz.save(credentials, contour)
+
+
+def forget_suz(contour: Contour = Contour.SANDBOX) -> None:
+    suz.forget(contour)
+
+
+def suz_ready(contour: Contour = Contour.SANDBOX) -> bool:
+    """Заполнены ли реквизиты. О том, приняты ли они, говорит только проверка."""
+    return suz.known(contour)
+
+
+def suz_sign_in(credentials: suz.Credentials, thumbprint: str, inn: str = "",
+                contour: Contour = Contour.SANDBOX) -> suz.Credentials:
+    """Получает токен СУЗ по сертификату и возвращает реквизиты с ним.
+
+    Обращается к закрытому ключу — КриптоПро может спросить пароль к
+    контейнеру, поэтому вызывается из фоновой задачи. Сохранение остаётся за
+    интерфейсом: он же решает, что делать с полученным токеном.
+    """
+    return suz.renewed(credentials, suz.sign_in(thumbprint, inn, contour,
+                                                credentials.connection_id))
+
+
+def with_fresh_token(
+    credentials: suz.Credentials,
+    contour: Contour,
+    thumbprint: str,
+    inn: str,
+    call: Callable[[suz.Credentials], Any],
+) -> tuple[Any, suz.Credentials]:
+    """Выполняет обращение к СУЗ, переживая протухший токен.
+
+    Токен СУЗ живёт десять часов, и до сих пор его продление означало сходить в
+    другую программу и нажать там «Тест». Это не работа человека: сертификат у
+    нас есть, вход по нему устроен, и добыть новый токен приложение может само.
+
+    Обновление одно: если и со свежим токеном отказ, дело не в сроке, а в
+    правах или реквизитах, и крутить цикл незачем. На отказ по учётным данным
+    сервер запроса не исполнил, поэтому повтор не создаёт второй операции.
+
+    Возвращается пара «результат и реквизиты, с которыми получилось»: токен мог
+    смениться, и интерфейс обязан показать тот, что теперь настоящий.
+    """
+    try:
+        return call(credentials), credentials
+    except transport.MarkingError as error:
+        if not thumbprint or not suz.stale(error):
+            raise
+    fresh = suz.save(
+        suz.renewed(credentials, suz.sign_in(thumbprint, inn, contour,
+                                             credentials.connection_id)),
+        contour)
+    return call(fresh), fresh
+
+
+def check_suz(credentials: suz.Credentials,
+              contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+              inn: str = "") -> tuple[str, suz.Credentials]:
+    """Проверяет связь с СУЗ. Ничего не заказывает и не меняет.
+
+    Обращается к сети, поэтому вызывается из фоновой задачи — как и вход по
+    сертификату. С сертификатом заодно обновляет протухший токен.
+    """
+    return with_fresh_token(credentials, contour, thumbprint, inn,
+                            lambda ready: suz.check(ready, contour))
+
+
+def restore_suz() -> None:
+    """Применяет сохранённые адреса СУЗ до первого обращения к ней."""
+    suz.restore()
+
+
+def suz_orders(credentials: suz.Credentials,
+               contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+               inn: str = "") -> tuple[list[orders_module.Order], suz.Credentials]:
+    """Заказы кодов и остаток в буферах. Ничего не создаёт и кодов не тратит."""
+    return with_fresh_token(credentials, contour, thumbprint, inn,
+                            lambda ready: orders_module.orders(ready, contour))
+
+
+def create_suz_order(request: orders_module.Request, credentials: suz.Credentials,
+                     contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+                     inn: str = "") -> tuple[str, suz.Credentials]:
+    """Заводит заказ кодов. Единственная здесь операция, которая тратит деньги.
+
+    Заказ подписывается сертификатом — СУЗ без подписи его не принимает, —
+    поэтому `thumbprint` здесь не необязательный довесок, как в чтении, а
+    условие работы.
+
+    Повтора внутри нет ни одного — ни на уровне транспорта, ни здесь. Токен при
+    этом обновиться может: отказ по учётным данным приходит до того, как заказ
+    заведён, и повтор после него — это первая попытка, а не вторая.
+    """
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: orders_module.create(ready, request, thumbprint, contour))
+
+
+# Заказы читаются и заводятся. Признак остаётся: по нему вкладка отличает
+# «пока нельзя» от «можно», и следующие методы СУЗ — получение кодов и отчёт о
+# нанесении — будут добавляться так же.
+ORDERING_READY = True
 
 
 # --- проверка кодов ------------------------------------------------------------------
@@ -134,13 +258,18 @@ def check(
 def _prepare(raw_codes: Iterable[str]) -> list[str]:
     """Приводит коды к виду, в котором их ждёт ГИС МТ, и убирает повторы.
 
+    Криптохвост здесь и отрезается: система ждёт код идентификации, а на код с
+    ключом и значением проверки отвечает отказом. Заодно исчезают повторы,
+    неразличимые в исходном виде: один и тот же экземпляр, снятый сканером
+    дважды, приходит с одинаковым хвостом, а вставленный из таблицы — без него.
+
     Порядок сохраняется: пользователь сканировал в своём порядке и в таком же
     ожидает увидеть результат.
     """
     seen: set[str] = set()
     prepared: list[str] = []
     for raw in raw_codes:
-        code = codes_module.normalize(str(raw or ""))
+        code = codes_module.for_request(str(raw or ""))
         if code and code not in seen:
             seen.add(code)
             prepared.append(code)
@@ -281,6 +410,27 @@ def start(
 def warn_duplicates(operation: Operation, db_path: str | None = None) -> list[Operation]:
     """Не запускалась ли уже такая операция с тем же набором кодов."""
     return store.duplicates(operation.codes, operation.kind, db_path)
+
+
+def record_check(
+    raw_codes: Sequence[str],
+    *,
+    contour: Contour | None = None,
+    comment: str = "",
+    db_path: str | None = None,
+) -> Operation:
+    """Отмечает выполненную проверку в журнале.
+
+    Проверка ничего не меняет в ГИС МТ, поэтому ждать по ней ответа нечего:
+    запись заводится и тут же закрывается. Журнал нужен ей ради другого — по
+    нему видно, что и когда спрашивали, а следующая такая же пачка узнаётся
+    `warn_duplicates` как повтор.
+    """
+    operation = start(OperationKind.CHECK, raw_codes, contour=contour,
+                      comment=comment, db_path=db_path)
+    operation.status = OperationStatus.DONE
+    operation.checked_at = datetime.now()
+    return store.update(operation, db_path)
 
 
 # Опрос статуса документов пока не подключён: метод и состав ответа

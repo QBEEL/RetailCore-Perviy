@@ -1,8 +1,12 @@
-"""Связь с ГИС МТ и True API: адреса, лимиты, повторы, ошибки.
+"""Связь с ГИС МТ, True API и СУЗ: адреса, лимиты, повторы, ошибки.
 
-Систем две, и это не деталь, а устройство: документами оборота заведует ГИС МТ,
-а кодами — заказом, эмиссией, проверкой — True API. Адреса у них разные, и
+Систем три, и это не деталь, а устройство: документами оборота заведует ГИС МТ,
+проверкой кодов — True API, а выдачей кодов — СУЗ. Адреса у них разные, и
 токены тоже разные, поэтому хост выбирается явно на каждом запросе.
+
+Различается и способ предъявить токен: ГИС МТ с True API ждут его заголовком
+`Authorization: Bearer`, а СУЗ — собственным заголовком `clientToken`. Отсюда
+два параметра вместо одного: `token` для первых двух, `headers` для третьей.
 
 Лимиты здесь — не оптимизация, а основа: тысяча кодов на запрос и полсотни
 запросов в секунду от одного участника. Держать темп обязан сам транспорт —
@@ -34,19 +38,21 @@ from .models import Contour, REQUESTS_PER_SECOND
 
 TIMEOUT = 60
 
-# Адреса. Все четыре проверены обращением: `/auth/key` и `/auth/cert/key`
-# отвечают на каждом.
+# Адреса. Все шесть проверены обращением: `/auth/key` и `/auth/cert/key`
+# отвечают на первых четырёх, `/api/v3/ping` — на обоих адресах СУЗ.
 HOSTS: dict[tuple[str, Contour], str] = {
     ("ismp", Contour.PRODUCTION): "https://ismp.crpt.ru",
     ("ismp", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
     ("trueapi", Contour.PRODUCTION): "https://markirovka.crpt.ru",
     ("trueapi", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
+    ("suz", Contour.PRODUCTION): "https://suzgrid.crpt.ru",
+    ("suz", Contour.SANDBOX): "https://suz.sandbox.crptech.ru",
 }
 
 
 # Префикс пути у каждой системы свой. True API живёт под третьей версией, а не
 # под четвёртой: по `/api/v4` оба хоста отвечают 403.
-PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api"}
+PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api", "suz": "/api/v3"}
 
 
 def configure(system: str, contour: Contour, host: str) -> None:
@@ -164,7 +170,9 @@ def request(
     contour: Contour = Contour.SANDBOX,
     params: dict[str, Any] | None = None,
     body: Any = None,
+    text_body: str | None = None,
     token: str = "",
+    headers: dict[str, str] | None = None,
     retries: int = len(RETRY_DELAYS),
     tolerate: tuple[int, ...] = (),
     sleep: Callable[[float], None] = time.sleep,
@@ -178,13 +186,25 @@ def request(
 
     `tolerate` перечисляет коды ответа, при которых тело возвращается как
     обычный результат, а не превращается в исключение.
+
+    `headers` добавляет свои заголовки — этим пользуется СУЗ, которая ждёт
+    токен в `clientToken`, а не в `Authorization`.
+
+    `text_body` отправляет готовую строку вместо того, чтобы собирать её здесь.
+    Нужен там, где тело подписано: подпись считается по конкретным байтам, и
+    собрать их второй раз — значит однажды собрать иначе и получить «подпись
+    невалидна» без единой подсказки, почему.
     """
-    data, headers = None, {"Accept": "application/json"}
-    if body is not None:
+    data, sending = None, {"Accept": "application/json"}
+    if text_body is not None:
+        data = text_body.encode("utf-8")
+        sending["Content-Type"] = "application/json"
+    elif body is not None:
         data = json.dumps(body, ensure_ascii=False, default=_encode).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        sending["Content-Type"] = "application/json"
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        sending["Authorization"] = f"Bearer {token}"
+    sending.update(headers or {})
 
     address = url(system, path, contour, params)
     attempt = 0
@@ -192,7 +212,7 @@ def request(
         limiter.take()
         try:
             return _send(urllib.request.Request(
-                address, data=data, headers=headers, method=method), tolerate)
+                address, data=data, headers=sending, method=method), tolerate)
         except (Offline, RateLimited):
             if attempt >= retries:
                 raise
@@ -224,6 +244,14 @@ def _send(prepared: urllib.request.Request,
             except json.JSONDecodeError:
                 pass
         raise _failure(error.code, payload) from None
+    except UnicodeEncodeError:
+        # Заголовки уходят latin-1, и русская буква в токене роняет `urllib`
+        # ещё до отправки. Само по себе это исключение говорит только про
+        # «position 0-1» — толку от него человеку никакого.
+        raise MarkingError(
+            "В заголовке запроса оказались русские буквы. Так бывает, когда "
+            "токен набран в русской раскладке или вставлен вместе с лишним "
+            "текстом: в нём только латиница, цифры и знаки.") from None
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as error:
         raise Offline(
             "Система маркировки недоступна. Проверьте подключение к сети."
@@ -249,6 +277,18 @@ def _failure(code: int, payload: bytes = b"") -> MarkingError:
             if value := answer.get(name):
                 detail = str(value)
                 break
+        # У СУЗ он лежит списком, а не строкой, и списка два. `globalErrors` —
+        # про запрос целиком: {"errorCode":1110,"error":"…"}. `fieldErrors` —
+        # про отдельное поле, и устроен иначе:
+        # {"errorCode":6010,"fieldError":"…","fieldName":"reportId"}.
+        #
+        # Читать только первый — значит на разборе по полям показать человеку
+        # «Система маркировки отвергла запрос» вместо готового ответа, какого
+        # именно поля не хватает. Сервер сказал, а мы потеряли.
+        if not detail:
+            detail = _listed(answer.get("globalErrors"))
+        if not detail:
+            detail = _listed(answer.get("fieldErrors"))
     if code == 401:
         return AuthRequired(
             detail or "Требуется вход по сертификату — токен истёк или отозван.",
@@ -261,6 +301,30 @@ def _failure(code: int, payload: bytes = b"") -> MarkingError:
     return MarkingError(detail or f"Система маркировки ответила кодом {code}", code)
 
 
+def _listed(errors: Any) -> str:
+    """Список ошибок СУЗ → одна строка.
+
+    Код ошибки сохраняется — по нему ищут в поддержке; имя поля тоже, иначе
+    «Не указано значение параметра» не говорит, какого именно.
+    """
+    if not isinstance(errors, list):
+        return ""
+    texts = []
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("error") or item.get("fieldError")
+                   or item.get("errorMessage") or "").strip()
+        if not text:
+            continue
+        if name := item.get("fieldName"):
+            text = f"{text} [{name}]"
+        if code := item.get("errorCode"):
+            text = f"{text} (код {code})"
+        texts.append(text)
+    return " ".join(texts)
+
+
 def _encode(value: Any) -> str:
     """Даты и время в JSON — строкой ISO."""
     if hasattr(value, "isoformat"):
@@ -270,13 +334,24 @@ def _encode(value: Any) -> str:
 
 def get(system: str, path: str, *, contour: Contour = Contour.SANDBOX,
         params: dict | None = None, token: str = "",
+        headers: dict[str, str] | None = None,
         tolerate: tuple[int, ...] = ()) -> Any:
     return request("GET", system, path, contour=contour, params=params,
-                   token=token, tolerate=tolerate)
+                   token=token, headers=headers, tolerate=tolerate)
 
 
 def post(system: str, path: str, *, contour: Contour = Contour.SANDBOX,
-         params: dict | None = None, body: Any = None, token: str = "",
+         params: dict | None = None, body: Any = None,
+         text_body: str | None = None, token: str = "",
+         headers: dict[str, str] | None = None,
+         retries: int = len(RETRY_DELAYS),
          tolerate: tuple[int, ...] = ()) -> Any:
+    """Отправка. `retries=0` — для того, что нельзя повторять вслепую.
+
+    Повтор безопасен, пока запрос ничего не создаёт. Заказ кодов создаёт, и
+    оборванный ответ на него не означает «не дошло»: второй такой запрос — это
+    второй заказ и вторые деньги.
+    """
     return request("POST", system, path, contour=contour, params=params,
-                   body=body, token=token, tolerate=tolerate)
+                   body=body, text_body=text_body, token=token, headers=headers,
+                   retries=retries, tolerate=tolerate)

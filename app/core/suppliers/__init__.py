@@ -7,6 +7,8 @@
 * `models`   — карточка поставщика, структура прайса, привязка и её ключ;
 * `schema`   — таблицы `suppliers.db` и миграции;
 * `store`    — чтение и запись;
+* `directory` — направления и закрепление за менеджерами: живут на сервере,
+  потому что одни на весь отдел, а карточка — на одной машине;
 * `identify` — чей это файл: имя, дополнительные имена, структура заголовков;
 * `links`    — применение сохранённых привязок к строкам переоценки.
 
@@ -15,6 +17,8 @@
 """
 from __future__ import annotations
 
+from . import directory
+from .directory import AssignedManager, Direction
 from .identify import identify, similarity, suggest_aliases
 from .links import (
     NAME_DRIFT_THRESHOLD,
@@ -62,6 +66,8 @@ from .store import (
 )
 
 __all__ = [
+    "AssignedManager",
+    "Direction",
     "Guess",
     "LinkBook",
     "LinkKey",
@@ -86,6 +92,7 @@ __all__ = [
     "delete_link",
     "delete_supplier",
     "describe_database",
+    "directory",
     "find_supplier",
     "forget_link",
     "get_supplier",

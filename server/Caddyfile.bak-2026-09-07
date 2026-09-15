@@ -1,0 +1,31 @@
+# Единственная точка входа снаружи. Сертификат Let's Encrypt Caddy получает и
+# продлевает сам — отдельного certbot и задания в cron не требуется.
+
+retail.qbeely.ru {
+	encode zstd gzip
+
+	# Отбор оплат возвращает всю историю одним ответом — несколько мегабайт
+	# JSON. Без увеличенных таймаутов медленный канал в офисе рвал бы запрос.
+	reverse_proxy api:8000 {
+		transport http {
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+
+	# Заголовки, которые ничего не стоят и закрывают целый класс мелких проблем.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

@@ -43,7 +43,17 @@ def main() -> int:
 
     settings = AppSettings.load()
     _adopt_profiles(settings)
-    window = MainWindow(settings)
+
+    # Вход до главного окна: программа знает, кто правит общие оплаты и за кем
+    # закреплены поставщики, и «неизвестный пользователь» ей не подходит.
+    # Отказ от входа означает выход — окно даже не создаётся.
+    from .ui.widgets.login_dialog import Start, start_session
+
+    outcome = start_session(settings)
+    if outcome == Start.QUIT:
+        return 0
+
+    window = MainWindow(settings, offline=outcome == Start.OFFLINE)
     window.show()
     return app.exec()
 

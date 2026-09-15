@@ -102,6 +102,26 @@ QWidget#Sidebar {{
 QLabel#Brand {{ font-size: 16px; font-weight: 700; }}
 QLabel#BrandSub {{ font-size: 11px; color: {Palette.TEXT_FAINT}; }}
 
+/* Какая база в работе. В общей — спокойная подпись; в локальной — жёлтая,
+   потому что это временное состояние, из которого надо выйти выгрузкой. */
+QPushButton#BaseChip {{
+    background: {Palette.SURFACE_ALT};
+    border: 1px solid {Palette.BORDER};
+    border-radius: {Metrics.RADIUS_SM}px;
+    padding: 6px 10px;
+    margin: 0 0 12px 0;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    color: {Palette.TEXT_MUTED};
+}}
+QPushButton#BaseChip:hover {{ border-color: {Palette.TEXT_FAINT}; color: {Palette.TEXT}; }}
+QPushButton#BaseChip[local="true"] {{
+    background: {Palette.WARNING_SOFT};
+    border-color: {Palette.WARNING};
+    color: {Palette.WARNING};
+}}
+
 QPushButton#NavButton {{
     background: transparent;
     border: none;
@@ -126,6 +146,9 @@ QPushButton {{
     padding: 7px 14px;
     font-weight: 500;
 }}
+/* Указатель меню не рисуем: тема не задаёт ему картинку, и системная стрелка
+   наезжает на подпись. Кнопки с меню помечают себя знаком в тексте. */
+QPushButton::menu-indicator {{ image: none; width: 0; }}
 QPushButton:hover {{ background: {Palette.SURFACE_ALT}; border-color: {Palette.TEXT_FAINT}; }}
 QPushButton:pressed {{ background: {Palette.BORDER}; }}
 QPushButton:disabled {{ color: {Palette.TEXT_FAINT}; background: {Palette.SURFACE_ALT}; }}

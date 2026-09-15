@@ -67,6 +67,22 @@ class AppSettings:
     # работать у того, кому общий доступ не нужен.
     payment_server: str = "https://retail.qbeely.ru"
     payment_login: str = ""
+    # Работа на своей базе при действующем входе — режим администратора.
+    # Запоминается между запусками: молча вернуть человека в общую базу опаснее,
+    # чем оставить его в своей, — во втором случае он это видит в шапке.
+    payment_local_base: bool = False
+    # Маркировка. Сертификат и организация запоминаются, чтобы вход не начинался
+    # каждый раз с выбора; контур — по умолчанию песочница, и попасть в бой
+    # можно только выбрав его самому. Токен здесь не хранится: он живёт полчаса
+    # и всё равно требует обращения к ключу.
+    marking_thumbprint: str = ""
+    marking_contour: str = "sandbox"
+    marking_inn: str = ""
+    marking_organisation: str = ""
+    # За кого действует сертификат: список для окна выбора. Хранится потому,
+    # что узнаётся он только обращением к закрытому ключу — спрашивать систему
+    # заново на каждый вход значит требовать лишний пароль к контейнеру.
+    marking_organisations: list[dict[str, str]] = field(default_factory=list)
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -232,6 +248,24 @@ class AppSettings:
         self.payment_import_reminder = bool(
             data.get("payment_import_reminder", self.payment_import_reminder))
         self.payment_import_seen = str(data.get("payment_import_seen", ""))
+        self.payment_local_base = bool(data.get("payment_local_base", False))
+        # Отсутствие ключа и пустая строка — разные вещи: ключа нет у того, кто
+        # ещё не входил, и ему подставляется общий адрес; пустую строку
+        # записывает тот, кто сознательно ушёл на локальную базу.
+        self.payment_server = str(data.get("payment_server", self.payment_server))
+        self.payment_login = str(data.get("payment_login", ""))
+        self.marking_thumbprint = str(data.get("marking_thumbprint", ""))
+        # Неизвестное значение читается как песочница: в бою цена ошибки не
+        # нулевая, и подставлять его по испорченному файлу настроек нельзя.
+        contour = str(data.get("marking_contour", self.marking_contour))
+        self.marking_contour = contour if contour == "production" else "sandbox"
+        self.marking_inn = str(data.get("marking_inn", ""))
+        self.marking_organisation = str(data.get("marking_organisation", ""))
+        self.marking_organisations = [
+            {"inn": inn, "name": str(item.get("name") or "")}
+            for item in (data.get("marking_organisations") or [])
+            if isinstance(item, dict) and (inn := str(item.get("inn") or "").strip())
+        ]
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -293,6 +327,14 @@ class AppSettings:
             "payment_budget_warn": self.payment_budget_warn,
             "payment_import_reminder": self.payment_import_reminder,
             "payment_import_seen": self.payment_import_seen,
+            "payment_local_base": self.payment_local_base,
+            "payment_server": self.payment_server,
+            "payment_login": self.payment_login,
+            "marking_thumbprint": self.marking_thumbprint,
+            "marking_contour": self.marking_contour,
+            "marking_inn": self.marking_inn,
+            "marking_organisation": self.marking_organisation,
+            "marking_organisations": self.marking_organisations,
         }
 
     def remember_payment_import(self, path: str) -> None:

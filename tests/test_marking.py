@@ -4,11 +4,17 @@ from __future__ import annotations
 import pytest
 
 from app.core.marking import codes
-from app.core.marking.codes import GS, parse, parse_many, split_lines
+from app.core.marking.codes import GS, for_request, parse, parse_many, split_lines
 
 # Настоящий по строению код парфюмерии: товар, серийный номер, ключ и значение
 # проверки. GTIN подобран с верной контрольной цифрой.
 PERFUME = f"010460123456789321Abc123XyZ{GS}91EE10{GS}92signature=="
+
+# Настоящий код с пачки духов, снятый сканером: разделителей GS в нём нет
+# вовсе — сканер их не выдал.
+SCANNED = ("0103770014214423215Xtj9=4WZnWPI91EE1192"
+           "9xCxykVs/R8ooelKq+ZgCjs63ysRsnNs2MEKJDa98zs=")
+SCANNED_KI = "0103770014214423215Xtj9=4WZnWPI"
 
 
 def test_разбирает_поля_кода():
@@ -101,6 +107,55 @@ def test_длинный_идентификатор_читается():
     code = parse(f"010460123456789321AB{GS}800512345{GS}91XXXX")
     assert code.fields["8005"] == "12345"
     assert code.fields["91"] == "XXXX"
+
+
+# --- криптохвост без разделителей -------------------------------------------------
+
+def test_код_со_сканера_разбирается_без_разделителей():
+    """Сканер не выдал ни одного GS — конец серийного номера ищется по хвосту.
+
+    Без этого серийный номер получался длиной в полсотни знаков: он «съедал»
+    и ключ проверки, и подпись.
+    """
+    code = parse(SCANNED)
+
+    assert code.valid, code.problems
+    assert code.gtin == "03770014214423"
+    assert code.serial == "5Xtj9=4WZnWPI"
+    assert code.fields["91"] == "EE11"
+    assert code.fields["92"] == "9xCxykVs/R8ooelKq+ZgCjs63ysRsnNs2MEKJDa98zs="
+
+
+def test_в_запрос_уходит_код_идентификации():
+    """С ключом и значением проверки система отвечает отказом, без них — сведениями."""
+    assert for_request(SCANNED) == SCANNED_KI
+    assert parse(SCANNED).ki == SCANNED_KI
+
+
+def test_разделители_ничего_не_меняют():
+    """Тот же код от правильно настроенного сканера даёт то же самое."""
+    with_separators = f"{SCANNED_KI}{GS}91EE11{GS}929xCxykVs/R8ooelKq+ZgCjs63ysRsnNs2MEKJDa98zs="
+
+    assert for_request(with_separators) == SCANNED_KI
+    assert parse(with_separators).serial == parse(SCANNED).serial
+
+
+def test_код_идентификации_остаётся_собой():
+    """Усечённый руками код уже готов к запросу — трогать его незачем."""
+    assert for_request(SCANNED_KI) == SCANNED_KI
+
+
+def test_девяносто_один_внутри_серийного_номера_не_режет_код():
+    """Сочетание «91» встречается и в серийном номере — резать по нему нельзя."""
+    code = parse(f"010460123456789321AB91CD91EE1192{'x' * 44}")
+
+    assert code.serial == "AB91CD"
+    assert code.fields["91"] == "EE11"
+
+
+def test_неразобранный_код_уходит_как_есть():
+    """Решать за систему, что она его не поймёт, нельзя: ответ и есть результат."""
+    assert for_request("совсем не код") == "совсем не код"
 
 
 # --- пачка кодов ----------------------------------------------------------------

@@ -16,13 +16,18 @@ def _token_for(row: dict) -> Token:
     names = db.fetch_all(
         "SELECT responsible FROM user_responsible WHERE user_id = %s ORDER BY 1",
         (row["id"],))
+    own = db.fetch_all(
+        "SELECT d.code FROM user_direction ud JOIN direction d ON d.id = ud.direction_id"
+        " WHERE ud.user_id = %s ORDER BY d.sort_order", (row["id"],))
     return Token(
         access_token=security.create_token(row["id"], row["login"]),
         expires_in=settings.token_hours * 3600,
         login=row["login"],
+        user_id=row["id"],
         full_name=row["full_name"],
         is_admin=row["is_admin"],
         responsible=[n["responsible"] for n in names],
+        directions=[d["code"] for d in own],
         must_change_password=bool(row.get("must_change_password", False)),
     )
 

@@ -38,6 +38,25 @@ DEFAULT_LIFETIME = timedelta(minutes=30)
 RENEW_MARGIN = timedelta(minutes=2)
 
 
+# Как система сообщает, что не может выбрать организацию за нас. Тексты
+# приведены дословно, вместе с опечаткой сервера: боевой контур отвечает
+# «Невозможно однозначно определить под какой организацией выполняется
+# авторизация. Укажите запросе INN». Различать такой отказ приходится по
+# сообщению: код ответа у него обычный четырёхсотый, как у всех прочих.
+ORGANISATION_MARKS: tuple[str, ...] = (
+    "несколько организаций",
+    "однозначно определить",
+    "запросе inn",
+    "укажите инн",
+)
+
+
+def needs_organisation(error: object) -> bool:
+    """Отказ ли это из-за того, что не выбрана организация."""
+    text = str(error).lower()
+    return any(mark in text for mark in ORGANISATION_MARKS)
+
+
 @dataclass(frozen=True, slots=True)
 class Organisation:
     """Участник оборота, за которого действует сертификат."""
@@ -106,7 +125,7 @@ def organisations(thumbprint: str,
     узнать его полномочия.
     """
     challenge = transport.get("ismp", "/auth/cert/key", contour=contour)
-    uuid_value, data = _challenge(challenge)
+    uuid_value, data = parse_challenge(challenge)
     signature = crypto.sign(data, thumbprint)
     answer = transport.post("ismp", "/auth/cert/", contour=contour,
                             body={"uuid": uuid_value, "data": signature})
@@ -135,7 +154,7 @@ def sign_in(thumbprint: str, inn: str = "",
             "Сертификат не найден. Возможно, подключён другой носитель ключа.")
 
     challenge = transport.get("trueapi", "/auth/key", contour=contour)
-    uuid_value, data = _challenge(challenge)
+    uuid_value, data = parse_challenge(challenge)
     signature = crypto.sign(data, thumbprint)
 
     body: dict[str, Any] = {"uuid": uuid_value, "data": signature}
@@ -157,8 +176,13 @@ def sign_in(thumbprint: str, inn: str = "",
     return session
 
 
-def _challenge(answer: Any) -> tuple[str, str]:
-    """Разбирает ответ на запрос строки для подписи."""
+def parse_challenge(answer: Any) -> tuple[str, str]:
+    """Разбирает ответ на запрос строки для подписи.
+
+    Общий для всех трёх систем: строку для подписи одинаково выдают и ГИС МТ,
+    и True API, и СУЗ, — а разбирать её в трёх местах значит трижды написать
+    одну и ту же проверку и один раз ошибиться.
+    """
     if not isinstance(answer, dict):
         raise transport.MarkingError(
             "Система маркировки вернула неожиданный ответ на запрос строки "

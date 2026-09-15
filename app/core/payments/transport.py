@@ -53,9 +53,15 @@ class Session:
     base_url: str = ""
     token: str = ""
     login: str = ""
+    # Идентификатор учётной записи. Закрепление поставщиков хранится по нему, а
+    # не по имени: в выгрузке 1С один человек записан десятком написаний.
+    user_id: int = 0
     full_name: str = ""
     is_admin: bool = False
     responsible: tuple[str, ...] = ()
+    # Направления вошедшего: Beauty, Fashion. По ним вкладка поставщиков
+    # ставит первый отбор — это умолчание, а не ограничение доступа.
+    directions: tuple[str, ...] = ()
     expires_at: datetime | None = None
     # Пароль выдан администратором: работать можно, но приложение потребует
     # заменить его прежде, чем показать данные.
@@ -78,9 +84,11 @@ class Session:
     def clear(self) -> None:
         self.token = ""
         self.login = ""
+        self.user_id = 0
         self.full_name = ""
         self.is_admin = False
         self.responsible = ()
+        self.directions = ()
         self.expires_at = None
         self.must_change_password = False
 
@@ -263,12 +271,40 @@ def refresh() -> Session:
     return session
 
 
+def restore(saved: object) -> Session:
+    """Поднимает сессию из сохранённого токена, не спрашивая пароль.
+
+    Сервер здесь не опрашивается: проверка отложена до первого запроса, а
+    он всё равно случится сразу — интерфейс тянет данные при открытии. Ходить
+    за подтверждением отдельно значило бы задерживать запуск ради ответа,
+    который придёт через секунду сам.
+    """
+    session.base_url = getattr(saved, "base_url", "")
+    session.token = getattr(saved, "token", "")
+    session.login = getattr(saved, "login", "")
+    session.user_id = int(getattr(saved, "user_id", 0) or 0)
+    session.full_name = getattr(saved, "full_name", "")
+    session.is_admin = bool(getattr(saved, "is_admin", False))
+    session.responsible = tuple(getattr(saved, "responsible", ()))
+    session.directions = tuple(getattr(saved, "directions", ()))
+    session.expires_at = getattr(saved, "expires_at", None)
+    # Требование сменить пароль снимается только заменой и переживает
+    # перезапуск на сервере: восстановленная сессия о нём не помнит, а первый
+    # же вход по паролю его вернёт.
+    session.must_change_password = False
+    return session
+
+
 def _adopt(answer: dict) -> None:
     session.token = answer["access_token"]
     session.login = answer["login"]
+    # Сервер прежней версии идентификатор не присылает: закрепление поставщиков
+    # там ещё не заведено, и отбор «мои» просто не предлагается.
+    session.user_id = int(answer.get("user_id", 0))
     session.full_name = answer["full_name"]
     session.is_admin = bool(answer["is_admin"])
     session.responsible = tuple(answer.get("responsible", ()))
+    session.directions = tuple(answer.get("directions", ()))
     session.must_change_password = bool(answer.get("must_change_password", False))
     session.expires_at = datetime.now() + timedelta(
         seconds=int(answer.get("expires_in", 0)))

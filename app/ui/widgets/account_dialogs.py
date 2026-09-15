@@ -65,10 +65,14 @@ class AccountDialog(QDialog):
     """Логин, имя, права и список имён из 1С."""
 
     def __init__(self, account: Account, known_responsible: list[str],
-                 *, is_self: bool = False, parent: QWidget | None = None) -> None:
+                 *, is_self: bool = False, directions: list[tuple[str, str]] | None = None,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.account = account
         self.is_self = is_self
+        # Справочник направлений приходит снаружи, с сервера: прошивать
+        # «Beauty и Fashion» в окно нельзя, направления будут добавляться.
+        self._known_directions = directions or []
         self.setWindowTitle("Учётная запись" if account.id else "Новая учётная запись")
         self.setMinimumWidth(560)
         self._build(known_responsible)
@@ -111,6 +115,10 @@ class AccountDialog(QDialog):
             root.addWidget(Hint("Это ваша учётная запись — снять с себя права "
                                 "или закрыть себе вход нельзя."))
 
+        self.directions: list[tuple[str, QCheckBox]] = []
+        if self._known_directions:
+            self._build_directions(root)
+
         root.addWidget(SectionTitle("Чьи оплаты считаются своими"))
         root.addWidget(Hint(
             "Отмеченные имена — так человек записан в выгрузке 1С. Оплаты с "
@@ -146,6 +154,31 @@ class AccountDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+    def _build_directions(self, root: QVBoxLayout) -> None:
+        """Направления — признак категорийного менеджера.
+
+        Отдельного поля «должность» в базе нет: поставщиков ведут ровно те, у
+        кого задано направление, и второй признак того же самого рано или
+        поздно разошёлся бы с первым.
+        """
+        root.addWidget(SectionTitle("Направления"))
+        root.addWidget(Hint(
+            "Отметьте, если человек ведёт поставщиков. Только таким "
+            "предлагается закрепление во вкладке «Поставщики». Бухгалтерия, "
+            "маркетинг и логистика оплаты проводят, но поставщиков не ведут — "
+            "им направление не нужно."))
+
+        row = QHBoxLayout()
+        row.setSpacing(Metrics.GAP)
+        chosen = set(self.account.directions)
+        for code, title in self._known_directions:
+            box = QCheckBox(title, self)
+            box.setChecked(code in chosen)
+            row.addWidget(box)
+            self.directions.append((code, box))
+        row.addStretch(1)
+        root.addLayout(row)
+
     def _accept(self) -> None:
         login = self.login.text().strip().lower()
         if not login:
@@ -170,6 +203,8 @@ class AccountDialog(QDialog):
         self.account.login = self.login.text().strip().lower()
         self.account.full_name = self.full_name.text().strip()
         self.account.responsible = chosen
+        self.account.directions = [code for code, box in self.directions
+                                   if box.isChecked()]
         self.account.is_admin = self.is_admin.isChecked()
         self.account.is_active = self.is_active.isChecked()
         return self.account

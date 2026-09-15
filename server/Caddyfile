@@ -4,12 +4,23 @@
 retail.qbeely.ru {
 	encode zstd gzip
 
+	# Схема API наружу не отдаётся. Клиент адреса методов знает из своего кода,
+	# а в открытом виде она нужна только тому, кто ищет, за что зацепиться:
+	# в логах за первые же минуты работы видны переборы `/.env` и подобного.
+	# Ответ 404, а не 403: он не подтверждает, что тут вообще что-то есть.
+	@schema path /docs /docs/* /redoc /redoc/* /openapi.json
+	handle @schema {
+		respond 404
+	}
+
 	# Отбор оплат возвращает всю историю одним ответом — несколько мегабайт
 	# JSON. Без увеличенных таймаутов медленный канал в офисе рвал бы запрос.
-	reverse_proxy api:8000 {
-		transport http {
-			read_timeout 120s
-			write_timeout 120s
+	handle {
+		reverse_proxy api:8000 {
+			transport http {
+				read_timeout 120s
+				write_timeout 120s
+			}
 		}
 	}
 

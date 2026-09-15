@@ -92,3 +92,43 @@ def test_пустой_файл_настроек_не_мешает_запуску
     assert loaded.recent_source == []
     loaded.save()
     assert json.loads(path.read_text(encoding="utf-8"))
+
+
+# --- вход в общую базу --------------------------------------------------------
+
+def test_логин_переживает_перезапуск(settings):
+    """«Запомнить логин» ставит поле, а толк от него появляется только после
+    того, как настройки записались и прочитались заново."""
+    settings.payment_login = "e.ivanov"
+    settings.save()
+    assert AppSettings.load(settings._path).payment_login == "e.ivanov"
+
+
+def test_снятая_галочка_забывает_логин(settings):
+    settings.payment_login = "e.ivanov"
+    settings.save()
+    settings.payment_login = ""
+    settings.save()
+    assert AppSettings.load(settings._path).payment_login == ""
+
+
+def test_адрес_сервера_переживает_перезапуск(settings):
+    settings.payment_server = "https://retail.qbeely.ru"
+    settings.save()
+    assert AppSettings.load(settings._path).payment_server == "https://retail.qbeely.ru"
+
+
+def test_пустой_адрес_не_подменяется_общим(settings):
+    """Пустая строка — сознательный выбор локальной базы, а не «ключа нет»."""
+    settings.payment_server = ""
+    settings.save()
+    assert AppSettings.load(settings._path).payment_server == ""
+
+
+def test_настройки_без_ключей_входа_читаются_с_умолчаниями(tmp_path):
+    """Файл, записанный прежней версией: полей входа в нём нет вовсе."""
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"overwrite_filled": True}), encoding="utf-8")
+    loaded = AppSettings.load(str(path))
+    assert loaded.payment_login == ""
+    assert loaded.payment_server == "https://retail.qbeely.ru"

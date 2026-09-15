@@ -219,6 +219,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "comment": payment.comment,
             "supplier_id": payment.supplier_id,
             "amount": payment.amount,
+            "vat": payment.vat,
             "priority": payment.priority,
         })
     else:
@@ -234,6 +235,11 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "responsible": payment.responsible,
             "operation": payment.operation,
             "priority": payment.priority,
+            # Происхождение передаётся серверу: иначе загруженный план
+            # неотличим от созданного вручную, и при следующей загрузке
+            # заменять было бы нечего.
+            "origin": payment.origin.value,
+            "origin_ref": payment.origin_ref,
         })
     return _payment(row)
 
@@ -385,6 +391,24 @@ def apply_import(created: Any, changed: Any,
     answer = transport.post("/api/imports/apply",
                             {"created": new_rows, "changed": updates})
     return int(answer["new"]), int(answer["updated"])
+
+
+def upload(created: Any, changed: Any, budgets: Any = ()) -> dict[str, int]:
+    """Отправляет часть локальной базы в общую. Сервер пишет её транзакцией.
+
+    Разбором на части занимается вызывающий: полная история — около семи тысяч
+    строк, и одним запросом её лучше не отправлять.
+    """
+    answer = transport.post("/api/sync/upload", {
+        "created": list(created),
+        "changed": list(changed),
+        "budgets": list(budgets),
+    })
+    return {
+        "new": int(answer.get("new", 0)),
+        "updated": int(answer.get("updated", 0)),
+        "budgets": int(answer.get("budgets", 0)),
+    }
 
 
 def log_import(path_to_file: str, file_hash: str, rows: int, created: int,

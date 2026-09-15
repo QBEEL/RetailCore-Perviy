@@ -1,8 +1,13 @@
-"""Вход в общую базу оплат.
+"""Вход в приложение.
 
-Модальный диалог: пока вход не выполнен, показывать экран оплат нечего. Отказ
-от входа не закрывает приложение — остальные разделы (заказы, переоценка,
-поставщики) работают со своими данными и сервер им не нужен.
+Работать без входа нельзя: программа знает, кто вносит правки в общие оплаты и
+за кем закреплены поставщики, и «неизвестный пользователь» ей не подходит.
+Окно показывается до главного, и отказ от входа означает выход из программы.
+
+Исключение одно — сервер недоступен. Сопоставление, заказ и переоценка читают
+Excel и локальные базы, и останавливать их из-за чужой аварии незачем. Кто
+входил на этой машине недавно, продолжит работать без сети: разделы, которым
+сервер нужен, закроются, остальные останутся.
 
 Вход выполняется в фоновом потоке: проверка пароля на сервере занимает около
 сотой доли секунды, но канал до него может оказаться и медленным, а замерший
@@ -22,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.payments import transport
+from ...core.payments import session_store, transport
 from ...core.settings import AppSettings
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
@@ -53,13 +58,21 @@ class _SignIn(QThread):
 class LoginDialog(QDialog):
     """Логин, пароль и адрес сервера."""
 
-    def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
+    # Отдельный код возврата: «продолжить без сервера» — это не согласие и не
+    # отказ, а третий исход, и отличать его от закрытия окна обязательно.
+    OFFLINE = QDialog.DialogCode.Accepted + 100
+
+    def __init__(self, settings: AppSettings, parent: QWidget | None = None,
+                 *, offline_days: int = 0) -> None:
         super().__init__(parent)
         self.settings = settings
         self._worker: _SignIn | None = None
-        self.setWindowTitle("Вход в общую базу оплат")
+        # Сколько дней осталось работать без сервера. Ноль — нисколько, и
+        # кнопка «продолжить без сервера» не появится вовсе.
+        self._offline_days = offline_days
+        self.setWindowTitle("Вход — RetailCore")
         self.setModal(True)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self._build()
 
     def _build(self) -> None:
@@ -67,9 +80,11 @@ class LoginDialog(QDialog):
         root.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
         root.setSpacing(Metrics.GAP)
 
-        root.addWidget(SectionTitle("Оплаты поставщикам"))
-        root.addWidget(Hint("Общая база: оплаты видят все категорийные "
-                            "менеджеры, править можно только свои."))
+        root.addWidget(SectionTitle("RetailCore"))
+        root.addWidget(Hint(
+            "Общая база отдела: оплаты, поставщики и отчётность. Программа "
+            "должна знать, кто вносит правки и за кем закреплены поставщики, "
+            "поэтому вход обязателен."))
 
         form = QFormLayout()
         form.setSpacing(Metrics.GAP)
@@ -103,10 +118,22 @@ class LoginDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(
             QDialogButtonBox.StandardButton.Ok).setText("Войти")
+        # Не «отмена», а «выйти»: отказ от входа закрывает программу, и кнопка
+        # обязана говорить об этом прямо.
         self.buttons.button(
-            QDialogButtonBox.StandardButton.Cancel).setText("Работать без входа")
+            QDialogButtonBox.StandardButton.Cancel).setText("Выйти из программы")
         self.buttons.accepted.connect(self._submit)
         self.buttons.rejected.connect(self.reject)
+
+        if self._offline_days:
+            offline = self.buttons.addButton(
+                "Продолжить без сервера",
+                QDialogButtonBox.ButtonRole.DestructiveRole)
+            offline.setToolTip(
+                f"Оплаты, поставщики и отчётность будут закрыты.\n"
+                f"Сопоставление, заказ и переоценка работают как обычно.\n"
+                f"Осталось дней без входа: {self._offline_days}")
+            offline.clicked.connect(lambda: self.done(self.OFFLINE))
         root.addWidget(self.buttons)
 
         # Enter в любом поле означает «войти», это привычнее, чем искать кнопку.
@@ -150,6 +177,10 @@ class LoginDialog(QDialog):
         self.settings.payment_server = session.base_url
         self.settings.payment_login = session.login if self.remember.isChecked() else ""
         self.settings.save()
+        # Токен запоминается всегда, независимо от «запомнить логин»: тот
+        # флажок про подстановку имени в поле, а не про повторный ввод пароля
+        # при каждом перезапуске. Пароль не сохраняется ни при каком выборе.
+        session_store.save(session)
         self._busy(False)
         self.accept()
 
@@ -160,13 +191,60 @@ class LoginDialog(QDialog):
         self._show_error(message)
 
 
+class Start:
+    """Чем закончился запуск: работаем, работаем без сервера или выходим."""
+
+    ONLINE = "online"
+    OFFLINE = "offline"
+    QUIT = "quit"
+
+
+def start_session(settings: AppSettings, parent: QWidget | None = None) -> str:
+    """Вход при запуске программы. Вызывается до создания главного окна.
+
+    Сохранённый токен поднимается молча: пароль спрашивается раз в двенадцать
+    часов, а не при каждом запуске — программу закрывают и открывают вместе с
+    очередным файлом, и десять паролей в день никто вводить не станет.
+    """
+    saved = session_store.load()
+    if saved.valid:
+        transport.restore(saved)
+        return Start.ONLINE
+
+    outcome = LoginDialog(settings, parent,
+                          offline_days=saved.grace_left()).exec()
+    if outcome == LoginDialog.OFFLINE:
+        return Start.OFFLINE
+    if outcome != QDialog.DialogCode.Accepted:
+        return Start.QUIT
+    return Start.ONLINE if _password_settled(parent) else Start.QUIT
+
+
+def sign_out() -> None:
+    """Выход из учётной записи: и в этом запуске, и в сохранённом профиле."""
+    transport.sign_out()
+    session_store.forget()
+
+
 def ensure_session(settings: AppSettings, parent: QWidget | None = None) -> bool:
-    """Возвращает True, если вход выполнен. Спрашивает, только если нужно."""
+    """Возвращает True, если вход выполнен. Спрашивает, только если нужно.
+
+    Остаётся для случаев, когда сессия отвалилась посреди работы: токен истёк
+    или программу запустили без сервера, а он появился.
+    """
     if transport.session.active:
+        return True
+    saved = session_store.load()
+    if saved.valid:
+        transport.restore(saved)
         return True
     if LoginDialog(settings, parent).exec() != QDialog.DialogCode.Accepted:
         return False
+    return _password_settled(parent)
 
+
+def _password_settled(parent: QWidget | None) -> bool:
+    """Выданный администратором пароль обязан быть заменён при первом входе."""
     if transport.session.must_change_password:
         # Пароль выдан администратором. Отказ от замены — это отказ от входа:
         # иначе требование стало бы предложением, которое закрывают крестиком.
@@ -174,7 +252,10 @@ def ensure_session(settings: AppSettings, parent: QWidget | None = None) -> bool
 
         if PasswordDialog(required=True, parent=parent).exec() != \
                 QDialog.DialogCode.Accepted:
-            transport.sign_out()
+            sign_out()
             return False
         transport.session.must_change_password = False
+        # Смена пароля выдаёт новый токен: сохранённый рядом устарел бы и
+        # первый же запуск потребовал бы пароль заново.
+        session_store.save(transport.session)
     return True

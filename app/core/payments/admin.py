@@ -24,6 +24,10 @@ class Account:
     full_name: str = ""
     # Значения `responsible` из выгрузки 1С, которые считаются «своими».
     responsible: list[str] = field(default_factory=list)
+    # Коды направлений: beauty, fashion. Заполнены у категорийных менеджеров и
+    # пусты у всех остальных — бухгалтерия и маркетинг оплаты проводят, но
+    # поставщиков не ведут, и закрепление им предлагать не за чем.
+    directions: list[str] = field(default_factory=list)
     is_admin: bool = False
     is_active: bool = True
     created_at: datetime | None = None
@@ -36,7 +40,9 @@ class Account:
     def role(self) -> str:
         if not self.is_active:
             return "отключена"
-        return "администратор" if self.is_admin else "менеджер"
+        if self.is_admin:
+            return "администратор"
+        return "категорийный менеджер" if self.directions else "менеджер"
 
 
 @dataclass(slots=True)
@@ -89,6 +95,7 @@ def _account(row: dict) -> Account:
     return Account(
         id=int(row["id"]), login=row["login"], full_name=row["full_name"],
         responsible=list(row.get("responsible", [])),
+        directions=list(row.get("directions", []) or []),
         is_admin=bool(row["is_admin"]), is_active=bool(row["is_active"]),
         created_at=_moment(row.get("created_at")))
 
@@ -103,8 +110,8 @@ def create(account: Account) -> tuple[Account, str]:
     """Заводит учётку. Возвращает её и пароль — он показывается один раз."""
     answer = transport.post("/api/users", {
         "login": account.login, "full_name": account.full_name,
-        "responsible": account.responsible, "is_admin": account.is_admin,
-        "is_active": account.is_active})
+        "responsible": account.responsible, "directions": account.directions,
+        "is_admin": account.is_admin, "is_active": account.is_active})
     account.id = int(answer["id"])
     account.login = answer["login"]
     return account, answer["password"]
@@ -113,8 +120,8 @@ def create(account: Account) -> tuple[Account, str]:
 def save(account: Account) -> Account:
     return _account(transport.put(f"/api/users/{account.id}", {
         "login": account.login, "full_name": account.full_name,
-        "responsible": account.responsible, "is_admin": account.is_admin,
-        "is_active": account.is_active}))
+        "responsible": account.responsible, "directions": account.directions,
+        "is_admin": account.is_admin, "is_active": account.is_active}))
 
 
 def reset_password(account_id: int) -> str:

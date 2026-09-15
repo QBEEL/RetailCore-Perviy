@@ -54,6 +54,18 @@ TITLES = {
 # Четырёхзначные идентификаторы, встречающиеся в маркировке.
 LONG_CODES = ("8005", "8006", "3103", "3202")
 
+# Криптохвост: поля проверки, которые «Честный ЗНАК» дописывает в конец кода, и
+# длина их значений. Ноль означает «до конца строки» — значение проверки всегда
+# последнее.
+#
+# Нужны они здесь вот зачем. Поле переменной длины кончается разделителем GS, но
+# сканеры сплошь и рядом его не выдают, а при вставке из письма или таблицы он
+# теряется и вовсе. Тогда серийный номер «съедает» весь хвост: из
+# `...215Xtj9=4WZnWPI91EE1192...` получается серийный номер длиной в полсотни
+# знаков, и система такой код не опознаёт. Хвост состоит только из этих полей и
+# стоит последним — по этому его начало и находится.
+TAIL_FIELDS: dict[str, int] = {"91": 4, "92": 0, "93": 4, "8005": 6}
+
 
 class CodeProblem(Exception):
     """Код не разбирается. Текст пригоден для показа пользователю."""
@@ -85,6 +97,18 @@ class Code:
         return (self.gtin, self.serial)
 
     @property
+    def ki(self) -> str:
+        """Код идентификации: товар и серийный номер, без криптохвоста.
+
+        Именно его ждёт система: с ключом и значением проверки (91, 92) запрос
+        сведений отвечает отказом, а тот же код без них — сведениями. Проверено
+        на живой системе кодом парфюмерии, снятым сканером.
+        """
+        if not self.gtin or not self.serial:
+            return ""
+        return f"01{self.gtin}21{self.serial}"
+
+    @property
     def ean13(self) -> str:
         """GTIN-14 → EAN-13, каким он лежит в каталоге и в прайсах.
 
@@ -110,6 +134,19 @@ def normalize(text: str) -> str:
             value = value[len(marker):]
             break
     return value
+
+
+def for_request(text: str) -> str:
+    """Код в том виде, в каком его ждёт система маркировки.
+
+    Отдаётся код идентификации — без ключа и значения проверки. Неразобранный
+    код уходит как есть: решать за систему, что она его не поймёт, нельзя, а
+    ответ по нему и есть результат проверки.
+    """
+    value = normalize(text)
+    if not value:
+        return ""
+    return parse(value).ki or value
 
 
 def gtin_valid(gtin: str) -> bool:
@@ -177,9 +214,48 @@ def _content(value: str, position: int, identifier: str) -> tuple[str, int]:
         length = FIXED_LENGTH[identifier]
         return value[position:position + length], position + length
     end = value.find(GS, position)
-    if end == -1:
-        return value[position:], len(value)
-    return value[position:end], end + 1
+    if end != -1:
+        return value[position:end], end + 1
+    # Разделителя нет — ищем начало криптохвоста. Значение проверки (92) при
+    # этом не трогаем: оно и есть последнее поле, а искать хвост внутри хвоста
+    # значит разрезать подпись пополам на первом же похожем сочетании знаков.
+    if identifier != "92" and (tail := _tail_start(value, position)) > position:
+        return value[position:tail], tail
+    return value[position:], len(value)
+
+
+def _tail_start(value: str, position: int) -> int:
+    """С какого места начинается криптохвост. -1, если его не видно."""
+    for index in range(position, len(value)):
+        if _is_tail(value, index):
+            return index
+    return -1
+
+
+def _is_tail(value: str, index: int) -> bool:
+    """Разбирается ли остаток строки как криптохвост целиком.
+
+    Проверяется весь остаток, а не одно совпадение: сочетание «91» встречается
+    и внутри серийного номера, но за ним там не окажется полей нужной длины,
+    доходящих ровно до конца строки.
+    """
+    position = index
+    found = 0
+    while position < len(value):
+        identifier = ("8005" if value.startswith("8005", position)
+                      else value[position:position + 2])
+        if identifier not in TAIL_FIELDS:
+            return False
+        position += len(identifier)
+        length = TAIL_FIELDS[identifier]
+        if not length:
+            # Значение проверки идёт до конца строки и пустым не бывает.
+            return position < len(value)
+        if len(value) - position < length:
+            return False
+        position += length
+        found += 1
+    return found > 0
 
 
 # --- пачка кодов ----------------------------------------------------------------

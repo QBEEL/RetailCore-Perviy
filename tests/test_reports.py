@@ -252,6 +252,19 @@ def test_promo_columns_sorted_naturally():
     assert [group.label for group in table.groups] == ["Список_20%", "Список_100%"]
 
 
+def test_subscript_digit_in_item_does_not_break_the_build():
+    """«BlanX O₃X»: подстрочная цифра — не число, и сборка не должна падать."""
+    rows = [
+        SaleRow(item="Зубная паста BlanX O₃X, 75 мл", promo="Список_20%",
+                qty=1, auto_discount=10.0, month=6, year=2026),
+        SaleRow(item="Паста A", promo="Список_20%",
+                qty=1, auto_discount=10.0, month=6, year=2026),
+    ]
+    table, _ = pivot.build(rows, default_profile("П"), [])
+
+    assert len(table.rows) == 2
+
+
 def test_all_sales_kept_when_filter_switched_off():
     profile = default_profile("П")
     profile.filters.promo_only = False

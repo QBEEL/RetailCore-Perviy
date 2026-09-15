@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import calendar
+import os
 from datetime import date, timedelta
 from typing import Callable
 
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -57,11 +59,19 @@ from ..core.payments import (
 # полтора десятка, и переименование ничего бы не дало.
 from ..core.payments import data as store
 from ..core.settings import AppSettings
+from ..core.suppliers import directory
 from ..core.workbook import write_sheet
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
-from .widgets.calendar_grid import LevelLegend, MonthGrid, money
+from .widgets.calendar_grid import (
+    DayPaymentList,
+    LevelLegend,
+    MonthGrid,
+    ROLE_PAYMENT_ID,
+    money,
+    payments_count,
+)
 from .widgets.charts import ChartBox
 from .widgets.common import Card, Divider, Hint, SectionTitle, Subtitle, Title
 from .widgets.inputs import DecimalInput, SelectBox
@@ -75,6 +85,7 @@ from .widgets.payment_dialogs import (
     RecipientLinkDialog,
 )
 from .widgets.login_dialog import ensure_session
+from .widgets.plan_dialogs import PlanImportDialog, PlanTemplateDialog
 from .widgets.table import ROLE_PAYLOAD, Column, DataTable
 from .widgets.toast import ToastKind
 
@@ -126,6 +137,20 @@ class PaymentsPage(QWidget):
         self.link_button.clicked.connect(self.link_recipients)
         head.addWidget(self.link_button)
 
+        # Две команды одного сценария под одной кнопкой: план из Excel
+        # начинается с выдачи шаблона и заканчивается его загрузкой, и держать
+        # их порознь в шапке означало бы пять кнопок в ряд.
+        # Обычная кнопка с меню, а не QToolButton: тема оформляет QPushButton,
+        # и панель инструментов посреди ряда кнопок выделялась бы чужим видом.
+        # Стрелка — знаком в подписи: системный указатель меню тема не рисует.
+        self.plan_button = QPushButton("План из Excel  ⌄", self)
+        self.plan_button.setIcon(icons.icon("file"))
+        plan_menu = QMenu(self.plan_button)
+        plan_menu.addAction("Шаблон для менеджера…", self.plan_template)
+        plan_menu.addAction("Загрузить заполненный план…", self.load_plan)
+        self.plan_button.setMenu(plan_menu)
+        head.addWidget(self.plan_button)
+
         self.new_button = QPushButton("Новая оплата", self)
         self.new_button.setObjectName("Primary")
         self.new_button.setIcon(icons.icon("card"))
@@ -137,6 +162,16 @@ class PaymentsPage(QWidget):
         self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         root.addWidget(self.progress)
+
+        # Оплаты в пользу поставщиков, за которыми человек не закреплён.
+        # Подменить коллегу в отпуске — обычное дело, поэтому не запрет и не
+        # ошибка; но чаще это признак незаявленного закрепления, и увидеть
+        # такое лучше самому, чем услышать от коллеги.
+        self.conflicts_hint = Hint("", self)
+        self.conflicts_hint.setStyleSheet(
+            f"color: {Palette.WARNING}; font-size: 12px;")
+        self.conflicts_hint.hide()
+        root.addWidget(self.conflicts_hint)
 
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
@@ -199,7 +234,7 @@ class PaymentsPage(QWidget):
         split = QSplitter(Qt.Orientation.Horizontal, page)
         self.grid = MonthGrid(split)
         self.grid.day_clicked.connect(self.show_day)
-        self.grid.payment_moved.connect(self.move_payment)
+        self.grid.payments_moved.connect(self.move_payments)
         split.addWidget(self.grid)
 
         side = Card(split)
@@ -209,9 +244,12 @@ class PaymentsPage(QWidget):
         self.day_summary = Hint("", side)
         body.addWidget(self.day_summary)
         body.addWidget(Divider(side))
-        self.day_list = QListWidget(side)
+        self.day_list = DayPaymentList(side)
         self.day_list.itemDoubleClicked.connect(self._open_from_day)
         body.addWidget(self.day_list, 1)
+        body.addWidget(Hint(
+            "Выделите оплаты (Ctrl или Shift) и перетащите их на другой день "
+            "календаря; клетка целиком переносит весь день.", side))
         self.day_add = QPushButton("Оплата на этот день", side)
         self.day_add.setIcon(icons.icon("card"))
         self.day_add.setEnabled(False)
@@ -287,37 +325,69 @@ class PaymentsPage(QWidget):
             item = QListWidgetItem(
                 f"{money(payment.amount)} ₽   {payment.title}\n{payment.status.title}"
                 + (f" · {payment.responsible}" if payment.responsible else ""))
-            item.setData(Qt.ItemDataRole.UserRole, payment.id)
             item.setForeground(QColor(STATUS_COLORS[payment.status]))
-            self.day_list.addItem(item)
+            self.day_list.addItem(self.day_list.mark(item, payment))
 
     def _open_from_day(self, item: QListWidgetItem) -> None:
-        payment_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        payment_id = int(item.data(ROLE_PAYMENT_ID) or 0)
         if payment := next((p for p in self.rows if p.id == payment_id), None):
             self.open_payment(payment)
 
     def _create_on_day(self) -> None:
         self.create_payment(pay_date=self.selected_day or date.today())
 
-    def move_payment(self, payment: Payment, day: date) -> None:
-        """Перенос платежа на другой день перетаскиванием."""
-        if not payment.status.open:
-            self.notify("Перенести можно только неоплаченный платёж", ToastKind.WARNING)
+    def move_payments(self, ids: list[int], day: date, whole_day: bool = False) -> None:
+        """Перенос перетаскиванием: одна оплата, несколько выбранных или день.
+
+        Переносится только неоплаченное. Оплаченное и отменённое из выделения
+        молча пропускается: человек тянет строки пачкой и не обязан помнить
+        статус каждой, а останавливать перенос всей пачки из-за одной такой
+        строки — заставлять его разбирать выделение вручную.
+        """
+        chosen = {payment.id: payment for payment in self.rows if payment.id in set(ids)}
+        movable = [p for p in chosen.values() if p.status.open and p.pay_date != day]
+        if not movable:
+            if chosen:
+                self.notify(
+                    "Переносить нечего: оплачено, отменено или уже на этом дне",
+                    ToastKind.WARNING)
             return
-        was = payment.pay_date
-        payment.pay_date = day
-        # Перенос — осознанное решение человека, и статус это фиксирует: иначе
-        # платёж, сдвинутый в прошлое, тут же стал бы просрочкой.
-        payment.status = PaymentStatus.MOVED
+        if whole_day and len(movable) > 1 and not self._confirm_day_move(movable, day):
+            return
         try:
-            store.save_payment(payment)
+            # Пачкой, а не по одной: десять сохранений подряд — это десять
+            # запросов к общей базе и десять шансов остановиться на середине.
+            # Перенос фиксируется статусом, иначе сдвинутое в прошлое тут же
+            # стало бы просрочкой.
+            changed = store.update_many(
+                [p.id for p in movable], status=PaymentStatus.MOVED, pay_date=day)
         except ValueError as failure:
-            payment.pay_date = was
             self.notify(str(failure), ToastKind.ERROR)
             return
-        self.notify(
-            f"{payment.title}: перенесено на {day:%d.%m.%Y}", ToastKind.SUCCESS)
+        if not changed:
+            self.notify("Перенести не удалось: оплаты не изменились", ToastKind.WARNING)
+            return
+        moved = (movable[0].title if changed == 1 and len(movable) == 1
+                 else payments_count(changed))
+        skipped = len(movable) - changed
+        text = f"{moved}: перенесено на {day:%d.%m.%Y}"
+        if skipped > 0:
+            # Общая база отклоняет чужие оплаты молча — иначе разница между
+            # «перенесли пять» и «перенесли три» осталась бы незамеченной.
+            text += f" · пропущено чужих: {skipped}"
+        self.notify(text, ToastKind.SUCCESS if not skipped else ToastKind.WARNING)
         self.reload()
+
+    def _confirm_day_move(self, movable: list[Payment], day: date) -> bool:
+        """Перенос дня целиком спрашивают: клетку задевают мышью и случайно."""
+        total = money(sum(payment.amount for payment in movable))
+        answer = QMessageBox.question(
+            self, "Перенести день",
+            f"Перенести {payments_count(len(movable))} на сумму {total} ₽"
+            f" с {movable[0].pay_date:%d.%m.%Y} на {day:%d.%m.%Y}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     # =========================================================================
     # Таблица
@@ -1051,6 +1121,29 @@ class PaymentsPage(QWidget):
         self.link_button.setEnabled(unlinked > 0)
         if overdue:
             self.notify(f"Просроченными стали {overdue} оплат", ToastKind.WARNING)
+        self._check_conflicts()
+
+    def _check_conflicts(self) -> None:
+        """Спрашивает сервер, каким чужим поставщикам я платил.
+
+        Отдельной задачей, а не вместе с оплатами: подсказка необязательная, и
+        задерживать из-за неё таблицу незачем. Ошибка молча гасит строку —
+        закрепления могло не быть вовсе, если сервер старой версии.
+        """
+        def show(items: list) -> None:
+            if not items:
+                self.conflicts_hint.hide()
+                return
+            names = ", ".join(item.recipient for item in items[:3])
+            more = f" и ещё {len(items) - 3}" if len(items) > 3 else ""
+            self.conflicts_hint.setText(
+                f"Вы платили поставщикам, за которыми не закреплены: {names}"
+                f"{more}. Если ведёте их — отметьте своими во вкладке "
+                f"«Поставщики».")
+            self.conflicts_hint.show()
+
+        run_task(directory.conflicts, on_result=show,
+                 on_error=lambda _: self.conflicts_hint.hide())
 
     def _fill_filter_lists(self, known: dict[str, list[str]]) -> None:
         for box, key, label in (
@@ -1122,6 +1215,42 @@ class PaymentsPage(QWidget):
         dialog = ImportDialog(recent=self.settings.recent_payment_import, parent=self)
         dialog.imported.connect(self._after_import)
         dialog.exec()
+
+    def plan_template(self) -> None:
+        """Отдаёт менеджеру пустой шаблон плана."""
+        dialog = PlanTemplateDialog(
+            service.manager_names(self._known.get("responsible", [])),
+            manager=self._current_manager(),
+            year=self.year,
+            month=self.month,
+            parent=self)
+        dialog.saved.connect(lambda path: self.notify(
+            f"Шаблон сохранён: {os.path.basename(path)}", ToastKind.SUCCESS))
+        dialog.exec()
+
+    def load_plan(self) -> None:
+        """Загружает присланный менеджером план оплат."""
+        dialog = PlanImportDialog(
+            service.manager_names(self._known.get("responsible", [])), parent=self)
+        dialog.loaded.connect(self._after_plan)
+        dialog.exec()
+
+    def _after_plan(self, report) -> None:  # type: ignore[no-untyped-def]
+        plan = report.plan
+        self.notify(
+            f"План {plan.manager} за {plan.months_title}: {report.summary}",
+            ToastKind.SUCCESS if report.changes else ToastKind.INFO)
+        self.reload()
+
+    def _current_manager(self) -> str:
+        """Кого подставить в шаблон: вошедшего, если он не администратор.
+
+        Администратор раздаёт шаблоны всему отделу, и его собственное имя в
+        шапке было бы не подсказкой, а ошибкой в каждом втором файле.
+        """
+        if transport.session.active and not transport.session.is_admin:
+            return transport.session.full_name
+        return ""
 
     def _after_import(self, report) -> None:  # type: ignore[no-untyped-def]
         self.settings.remember_payment_import(report.path)

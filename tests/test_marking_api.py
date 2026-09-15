@@ -211,6 +211,22 @@ def test_several_organisations_ask_which_one():
             {"inn": "2", "fullName": "ИП Второй"}]})
 
 
+def test_missing_inn_is_told_apart_from_other_refusals():
+    """Текст боевого контура — дословно, вместе с его же опечаткой.
+
+    Отличить этот отказ можно только по сообщению: код ответа у него такой же
+    четырёхсотый, как у неверной подписи или у чужого сертификата.
+    """
+    assert session.needs_organisation(
+        "Невозможно однозначно определить под какой организацией выполняется "
+        "авторизация. Укажите запросе INN.")
+    assert session.needs_organisation(
+        "Сертификат действует за несколько организаций — укажите, под какой "
+        "входить: ИП Иванов")
+    assert not session.needs_organisation("Подпись невалидна. Код ошибки: 2")
+    assert not session.needs_organisation("Пользователь не найден")
+
+
 def test_organisations_come_from_gismt(monkeypatch):
     """Список, за кого действует сертификат, отдаёт ГИС МТ, а не True API."""
     _fake_certificate(monkeypatch)
@@ -343,6 +359,19 @@ def test_repeat_check_ignores_order_and_kind(tmp_path):
     assert not store.duplicates(["код-3"], OperationKind.WITHDRAWAL, path)
 
 
+def test_check_is_recorded_as_a_finished_operation(tmp_path):
+    """Проверка ничего не меняет в ГИС МТ — ждать по ней ответа нечего."""
+    path = str(tmp_path / "marking.db")
+
+    saved = service.record_check(["код-1", "код-2"], contour=Contour.SANDBOX,
+                                 db_path=path)
+
+    assert saved.status is OperationStatus.DONE
+    assert saved.checked_at is not None
+    assert store.get(saved.id, path).kind is OperationKind.CHECK
+    assert not store.pending(path), "закрытая проверка не должна ждать опроса"
+
+
 def test_fingerprint_ignores_order_and_duplicates():
     assert fingerprint(["b", "a"]) == fingerprint(["a", "b", "a"])
     assert fingerprint(["a"]) != fingerprint(["b"])
@@ -442,6 +471,40 @@ def test_cache_does_not_mix_contours(tmp_path):
     store.remember_checks([CodeInfo(code="к-1", found=True)], Contour.SANDBOX, path)
 
     assert store.known_checks(["к-1"], Contour.PRODUCTION, path) == {}
+
+
+def test_crypto_tail_is_stripped_before_asking(monkeypatch, tmp_path):
+    """Система ждёт код идентификации: с подписью тот же код получает отказ.
+
+    Проверено живым кодом с пачки духов: полный код отвечал ошибкой, он же без
+    ключа и значения проверки — сведениями.
+    """
+    sent: list[list[str]] = []
+    monkeypatch.setattr(service, "_ask", lambda batch, contour: (
+        sent.append(list(batch)) or [_fake_info(code) for code in batch]))
+    scanned = ("0103770014214423215Xtj9=4WZnWPI91EE1192"
+               "9xCxykVs/R8ooelKq+ZgCjs63ysRsnNs2MEKJDa98zs=")
+
+    service.check([scanned], contour=Contour.SANDBOX, use_cache=False,
+                  db_path=str(tmp_path / "m.db"))
+
+    assert sent == [["0103770014214423215Xtj9=4WZnWPI"]]
+
+
+def test_the_same_item_scanned_and_pasted_is_one_code(monkeypatch, tmp_path):
+    """Со сканера код приходит с хвостом, из таблицы — без: экземпляр один."""
+    sent: list[list[str]] = []
+    monkeypatch.setattr(service, "_ask", lambda batch, contour: (
+        sent.append(list(batch)) or [_fake_info(code) for code in batch]))
+    scanned = ("0103770014214423215Xtj9=4WZnWPI91EE1192"
+               "9xCxykVs/R8ooelKq+ZgCjs63ysRsnNs2MEKJDa98zs=")
+
+    result = service.check([scanned, "0103770014214423215Xtj9=4WZnWPI"],
+                           contour=Contour.SANDBOX, use_cache=False,
+                           db_path=str(tmp_path / "m.db"))
+
+    assert sent == [["0103770014214423215Xtj9=4WZnWPI"]]
+    assert len(result) == 1
 
 
 def test_scanner_noise_is_stripped_before_asking():
