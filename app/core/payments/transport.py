@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from .. import net
+
 TIMEOUT = 120
 # Сервер отдаёт всю историю одним ответом — несколько мегабайт JSON. На
 # офисном канале это секунды, поэтому таймаут заметно больше обычного.
@@ -116,7 +118,7 @@ def _url(path: str, params: dict[str, Any] | None = None) -> str:
 
 def _send(request: urllib.request.Request) -> Any:
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=TIMEOUT, context=net.context) as response:
             body = response.read()
             return json.loads(body) if body else None
     except urllib.error.HTTPError as error:
@@ -227,7 +229,7 @@ def download(path: str, target: str) -> str:
         _url(path), headers={"Authorization": f"Bearer {session.token}"})
     partial = target + ".part"
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=TIMEOUT, context=net.context) as response:
             with open(partial, "wb") as handle:
                 while chunk := response.read(1024 * 256):
                     handle.write(chunk)

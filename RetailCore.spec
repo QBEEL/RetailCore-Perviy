@@ -38,7 +38,8 @@ a = Analysis(
     datas=DATAS,
     # QtCharts рисует графики на вкладке оплат. Он входит в PySide6, но
     # PyInstaller не видит его через отложенный импорт в app/ui/widgets/charts.py.
-    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts"],
+    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts",
+                   "certifi"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

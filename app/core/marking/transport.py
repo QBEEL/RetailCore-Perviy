@@ -34,6 +34,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Callable
 
+from .. import net
 from .models import Contour, REQUESTS_PER_SECOND
 
 TIMEOUT = 60
@@ -228,7 +229,7 @@ def request(
 def _send(prepared: urllib.request.Request,
           tolerate: tuple[int, ...] = ()) -> Any:
     try:
-        with urllib.request.urlopen(prepared, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(prepared, timeout=TIMEOUT, context=net.context) as response:
             payload = response.read()
             return json.loads(payload) if payload else None
     except urllib.error.HTTPError as error:

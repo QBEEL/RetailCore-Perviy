@@ -45,7 +45,8 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=DATAS,
-    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts"],
+    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts",
+                   "certifi"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -84,7 +85,7 @@ app = BUNDLE(
     bundle_identifier="ru.qbeely.retailcore",
     info_plist={
         "CFBundleDisplayName": "RetailCore",
-        "CFBundleShortVersionString": "3.2.0",
+        "CFBundleShortVersionString": "3.2.1",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
     },
