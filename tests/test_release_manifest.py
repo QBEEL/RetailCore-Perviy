@@ -112,3 +112,30 @@ def test_сумма_считается_по_самому_файлу_сборки
     second = manifest.build(exe, _changelog(tmp_path), target, root=root)
 
     assert first["sha256"] != second["sha256"]
+
+
+# --- вывод в чужой кодировке --------------------------------------------------------
+
+def test_вывод_не_зависит_от_кодировки_консоли(tmp_path):
+    """Сборка под Windows падала здесь, уже записав верный манифест.
+
+    На windows-раннере GitHub Actions stdout — cp1252, и `print` с русским
+    словом обрывал шаг UnicodeEncodeError: файл на месте, шаг красный, релиз
+    не выходит. Проверяется подпроцессом — иначе кодировку вывода не подменить.
+    """
+    import os
+    import subprocess
+
+    exe = tmp_path / "RetailCore.exe"
+    exe.write_bytes(b"build")
+    target = tmp_path / "version.json"
+    root = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        [sys.executable, str(root / "tools" / "make_version_json.py"),
+         str(exe), str(_changelog(tmp_path)), str(target)],
+        capture_output=True, cwd=root,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert json.loads(target.read_text("utf-8"))["sha256"]

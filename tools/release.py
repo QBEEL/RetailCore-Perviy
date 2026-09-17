@@ -22,7 +22,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.make_version_json import app_version, changelog_for  # noqa: E402
+from tools.make_version_json import (  # noqa: E402
+    app_version,
+    changelog_for,
+    use_utf8_output,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = ROOT / "app" / "__init__.py"
@@ -77,6 +81,9 @@ def write_version(version: str) -> None:
 
 
 def main() -> int:
+    # Сообщения здесь русские, а cmd.exe печатает в cp866: без этого скрипт
+    # падал бы на выводе, успев поставить тег.
+    use_utf8_output()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="например 3.3.0")
     parser.add_argument("--note", default="", help="короткое описание для коммита")

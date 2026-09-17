@@ -70,7 +70,21 @@ def build(exe: Path, changelog: Path, target: Path, *, root: Path | None = None)
     return manifest
 
 
+def use_utf8_output() -> None:
+    """Печать не должна зависеть от кодировки консоли.
+
+    На windows-раннере GitHub Actions stdout — cp1252, и русская строка роняет
+    процесс UnicodeEncodeError уже после записи манифеста: файл на месте и
+    верен, а шаг сборки помечен упавшим, релиз не выходит. Та же беда ждёт
+    запуск руками из cmd.exe, где кодировка cp866.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    use_utf8_output()
     if len(sys.argv) != 4:
         print(__doc__)
         return 2
