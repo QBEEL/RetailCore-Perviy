@@ -202,6 +202,26 @@ def test_фильтр_по_периоду_и_статусу(db):
     assert [p.recipient for p in found] == ["А"]
 
 
+def test_фильтр_по_источнику_отделяет_план_от_выгрузки(db):
+    """В таблице план и выгрузка 1С лежат вперемешку и на глаз не различаются."""
+    store.save_payment(Payment(
+        amount=100.0, recipient="А", pay_date=date(2026, 9, 10),
+        origin=PaymentOrigin.PLAN), db)
+    store.save_payment(Payment(
+        amount=200.0, recipient="Б", pay_date=date(2026, 9, 11),
+        origin=PaymentOrigin.IMPORT), db)
+    found = store.list_payments(Filter(origins=(PaymentOrigin.PLAN,)), db)
+    assert [p.recipient for p in found] == ["А"]
+    both = Filter(origins=(PaymentOrigin.PLAN, PaymentOrigin.IMPORT))
+    assert len(store.list_payments(both, db)) == 2
+    assert len(store.list_payments(Filter(), db)) == 2
+
+
+def test_пустой_отбор_по_источнику_ничего_не_ограничивает():
+    assert Filter().active is False
+    assert Filter(origins=(PaymentOrigin.PLAN,)).active is True
+
+
 def test_поиск_по_тексту(db):
     store.save_payment(Payment(
         amount=100.0, recipient="НеваЛайн ООО", doc_number="IP00-000001",

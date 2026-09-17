@@ -64,6 +64,9 @@ class Session:
     # Направления вошедшего: Beauty, Fashion. По ним вкладка поставщиков
     # ставит первый отбор — это умолчание, а не ограничение доступа.
     directions: tuple[str, ...] = ()
+    # Разделы, закрытые администратором (коды из app/ui/pages.py). Список
+    # закрытых, а не открытых: новый раздел должен появляться у всех сам.
+    denied_pages: tuple[str, ...] = ()
     expires_at: datetime | None = None
     # Пароль выдан администратором: работать можно, но приложение потребует
     # заменить его прежде, чем показать данные.
@@ -83,6 +86,10 @@ class Session:
     def may_edit(self, responsible: str) -> bool:
         return self.is_admin or responsible in self.responsible
 
+    def may_open(self, code: str) -> bool:
+        """Показывать ли раздел. Незнакомый код — да: права хранят закрытые."""
+        return code not in self.denied_pages
+
     def clear(self) -> None:
         self.token = ""
         self.login = ""
@@ -91,6 +98,7 @@ class Session:
         self.is_admin = False
         self.responsible = ()
         self.directions = ()
+        self.denied_pages = ()
         self.expires_at = None
         self.must_change_password = False
 
@@ -289,6 +297,7 @@ def restore(saved: object) -> Session:
     session.is_admin = bool(getattr(saved, "is_admin", False))
     session.responsible = tuple(getattr(saved, "responsible", ()))
     session.directions = tuple(getattr(saved, "directions", ()))
+    session.denied_pages = tuple(getattr(saved, "denied_pages", ()))
     session.expires_at = getattr(saved, "expires_at", None)
     # Требование сменить пароль снимается только заменой и переживает
     # перезапуск на сервере: восстановленная сессия о нём не помнит, а первый
@@ -307,6 +316,8 @@ def _adopt(answer: dict) -> None:
     session.is_admin = bool(answer["is_admin"])
     session.responsible = tuple(answer.get("responsible", ()))
     session.directions = tuple(answer.get("directions", ()))
+    # Сервер прежней версии о правах на разделы не знает — тогда открыты все.
+    session.denied_pages = tuple(answer.get("denied_pages", ()))
     session.must_change_password = bool(answer.get("must_change_password", False))
     session.expires_at = datetime.now() + timedelta(
         seconds=int(answer.get("expires_in", 0)))

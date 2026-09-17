@@ -61,6 +61,10 @@ class AppSettings:
     payment_levels: list[float] = field(default_factory=lambda: [500_000.0, 1_500_000.0, 3_000_000.0])
     payment_budget_warn: float = 90.0
     payment_import_reminder: bool = True
+    # Панель отбора раскрыта. Свёрнутая освобождает высоту сетке
+    # календаря, а выбор запоминается: складывать её каждый запуск заново
+    # пришлось бы тому, кто один раз решил, что она мешает.
+    payment_filters_open: bool = True
     payment_import_seen: str = ""
     # Адрес общей базы оплат. Пустой означает работу со своей локальной базой —
     # так приложение вело себя до появления сервера, и так оно продолжает
@@ -247,6 +251,8 @@ class AppSettings:
         self.payment_budget_warn = float(data.get("payment_budget_warn", self.payment_budget_warn))
         self.payment_import_reminder = bool(
             data.get("payment_import_reminder", self.payment_import_reminder))
+        self.payment_filters_open = bool(
+            data.get("payment_filters_open", self.payment_filters_open))
         self.payment_import_seen = str(data.get("payment_import_seen", ""))
         self.payment_local_base = bool(data.get("payment_local_base", False))
         # Отсутствие ключа и пустая строка — разные вещи: ключа нет у того, кто
@@ -326,6 +332,7 @@ class AppSettings:
             "payment_levels": self.payment_levels,
             "payment_budget_warn": self.payment_budget_warn,
             "payment_import_reminder": self.payment_import_reminder,
+            "payment_filters_open": self.payment_filters_open,
             "payment_import_seen": self.payment_import_seen,
             "payment_local_base": self.payment_local_base,
             "payment_server": self.payment_server,

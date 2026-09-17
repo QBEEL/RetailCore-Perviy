@@ -19,8 +19,10 @@ from .models import (
     Day,
     MONTHS,
     Payment,
+    PaymentOrigin,
     PaymentStatus,
     Period,
+    PlanFact,
     Stats,
     SupplierStats,
     WEEKDAYS,
@@ -217,6 +219,69 @@ def by_supplier(
     ]
     result.sort(key=lambda item: item.total, reverse=True)
     return result[:limit] if limit else result
+
+
+def plan_vs_fact(
+    payments: Sequence[Payment],
+    year: int,
+    month: int,
+    *,
+    names: dict[int, str] | None = None,
+) -> list[PlanFact]:
+    """Исполнение плана месяца по поставщикам: намечено и оплачено.
+
+    Планом считается всё намеченное на месяц, независимо от источника: счёт,
+    набитый в 1С на конкретное число, запланирован так же, как строка из
+    присланного Excel.
+
+    План и факт живут в одних и тех же записях: оплата меняет строке статус, а
+    не заводит новую. Поэтому факт — всегда часть плана, и разница между ними
+    показывает недобор, а не перерасход.
+
+    Получатели сводятся по нормализованному ключу, как в рейтинге: «НеваЛайн
+    ООО» и «ООО "Невалайн"» — один поставщик, и разносить их по двум строкам
+    означало бы показать недобор там, где его нет.
+    """
+    groups: dict[str, list[Payment]] = defaultdict(list)
+    titles: dict[str, str] = {}
+    for payment in _dated(payments):
+        moment = payment.pay_date
+        if moment.year != year or moment.month != month:
+            continue
+        if not payment.counts_to_budget:
+            continue
+        key = recipient_key(payment.recipient) or f"#{payment.supplier_id}"
+        groups[key].append(payment)
+        titles.setdefault(key, payment.recipient)
+
+    result: list[PlanFact] = []
+    for key, group in groups.items():
+        supplier_id = next((p.supplier_id for p in group if p.supplier_id), 0)
+        actual = [p for p in group if p.status is PaymentStatus.PAID]
+        row = PlanFact(
+            recipient=(names or {}).get(supplier_id) or titles.get(key, ""),
+            supplier_id=supplier_id,
+            planned=sum(p.amount for p in group),
+            actual=sum(p.amount for p in actual),
+            planned_count=len(group),
+            actual_count=len(actual),
+        )
+        # Строка из одних прочерков ничего не сообщает и только удлиняет
+        # таблицу: такой получатель попадает сюда с нулевыми суммами.
+        if not row.empty:
+            result.append(row)
+    # Крупные планы наверх: недобор по ним стоит дороже всего.
+    result.sort(key=lambda item: item.planned, reverse=True)
+    return result
+
+
+def plan_totals(rows: Sequence[PlanFact]) -> tuple[float, float, int]:
+    """Итоги таблицы исполнения: план, факт и число выбившихся строк."""
+    return (
+        sum(row.planned for row in rows),
+        sum(row.actual for row in rows),
+        sum(1 for row in rows if row.off_plan),
+    )
 
 
 def supplier_history(

@@ -43,6 +43,10 @@ class Saved:
     is_admin: bool = False
     responsible: tuple[str, ...] = ()
     directions: tuple[str, ...] = ()
+    # Разделы, закрытые администратором. Хранятся вместе с остальным входом:
+    # иначе неделя работы без сервера возвращала бы человеку вкладки, которые
+    # ему закрыли, — а льготный срок для того и есть, чтобы всё было как обычно.
+    denied_pages: tuple[str, ...] = ()
     token: str = ""
     expires_at: datetime | None = None
     # Когда сервер в последний раз подтвердил, кто мы. Отсюда считается
@@ -90,6 +94,7 @@ def load() -> Saved:
         is_admin=bool(raw.get("is_admin", False)),
         responsible=tuple(raw.get("responsible", ())),
         directions=tuple(raw.get("directions", ())),
+        denied_pages=tuple(raw.get("denied_pages", ())),
         token=str(raw.get("token", "")),
         expires_at=_moment(raw.get("expires_at")),
         confirmed_at=_moment(raw.get("confirmed_at")),
@@ -106,6 +111,7 @@ def save(session: object) -> None:
         is_admin=bool(getattr(session, "is_admin", False)),
         responsible=tuple(getattr(session, "responsible", ())),
         directions=tuple(getattr(session, "directions", ())),
+        denied_pages=tuple(getattr(session, "denied_pages", ())),
         token=getattr(session, "token", ""),
         expires_at=getattr(session, "expires_at", None),
         confirmed_at=datetime.now(),
@@ -135,6 +141,7 @@ def _write(saved: Saved) -> None:
         "is_admin": saved.is_admin,
         "responsible": list(saved.responsible),
         "directions": list(saved.directions),
+        "denied_pages": list(saved.denied_pages),
         "token": saved.token,
         "expires_at": saved.expires_at.isoformat() if saved.expires_at else "",
         "confirmed_at": saved.confirmed_at.isoformat() if saved.confirmed_at else "",

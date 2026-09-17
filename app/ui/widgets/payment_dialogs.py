@@ -8,12 +8,15 @@ from __future__ import annotations
 import os
 from datetime import date
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QDate, QLocale, QPoint, Qt, Signal
+from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
+    QCalendarWidget,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -66,23 +70,91 @@ STATUS_COLORS: dict[PaymentStatus, str] = {
 
 
 class DateInput(QLineEdit):
-    """Дата в привычном виде «дд.мм.гггг».
+    """Дата в привычном виде «дд.мм.гггг», с выбором из календаря.
 
     Взято текстовое поле, а не QDateEdit: у последнего колесо мыши меняет дату
     молча, ровно та же беда, из-за которой в приложении появились свои поля
-    ввода чисел.
+    ввода чисел. Календарь висит кнопкой в самом поле — набрать дату руками
+    по-прежнему можно и быстрее, а вот границы периода обычно не помнят
+    числами и ищут глазами: «с прошлого вторника по конец месяца».
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setPlaceholderText("дд.мм.гггг")
         self.setMaximumWidth(140)
+        self._popup: QFrame | None = None
+        pick = self.addAction(icons.icon("calendar"),
+                              QLineEdit.ActionPosition.TrailingPosition)
+        pick.setToolTip("Выбрать дату в календаре")
+        pick.triggered.connect(self._show_calendar)
 
     def value(self) -> date | None:
         return importer.parse_date(self.text())
 
     def set_value(self, moment: date | None) -> None:
         self.setText(f"{moment:%d.%m.%Y}" if moment else "")
+
+    # --- календарь ----------------------------------------------------------------
+
+    def _show_calendar(self) -> None:
+        """Открывает календарь под полем. Одно окно на поле, а не по одному
+        на каждое нажатие: их открывают и закрывают десятки раз за отбор."""
+        if self._popup is None:
+            self._popup = self._build_popup()
+        chosen = self.value() or date.today()
+        self._calendar.setSelectedDate(QDate(chosen.year, chosen.month, chosen.day))
+        self._popup.adjustSize()
+        self._popup.move(self._popup_corner())
+        self._popup.show()
+
+    def _build_popup(self) -> QFrame:
+        popup = QFrame(self, Qt.WindowType.Popup)
+        popup.setObjectName("Card")
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(4, 4, 4, 4)
+        self._calendar = QCalendarWidget(popup)
+        self._calendar.setGridVisible(False)
+        self._calendar.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        # Локаль задаётся явно: на машине с английской системой месяцы иначе
+        # выедут по-английски посреди русского окна.
+        self._calendar.setLocale(QLocale(QLocale.Language.Russian))
+        self._calendar.clicked.connect(self._picked)
+        # Выходные Qt красит красным, а красный в приложении означает просрочку
+        # и превышение — в календаре отбора он читался бы как предупреждение.
+        weekend = QTextCharFormat()
+        weekend.setForeground(QColor(Palette.TEXT_MUTED))
+        for weekday in (Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday):
+            self._calendar.setWeekdayTextFormat(weekday, weekend)
+        # Стрелки месяцев Qt рисует своими: на светлой шапке они белые по
+        # белому. Берём те же, что и везде в приложении.
+        for name, icon in (("qt_calendar_prevmonth", "chevron-left"),
+                           ("qt_calendar_nextmonth", "chevron")):
+            if button := self._calendar.findChild(QToolButton, name):
+                button.setIcon(icons.icon(icon, Palette.TEXT_MUTED))
+        layout.addWidget(self._calendar)
+        return popup
+
+    def _popup_corner(self) -> QPoint:
+        """Под полем, а если там не хватает места — над ним."""
+        popup = self._popup
+        assert popup is not None
+        below = self.mapToGlobal(QPoint(0, self.height() + 2))
+        screen = self.screen().availableGeometry()
+        if below.y() + popup.height() > screen.bottom():
+            below.setY(self.mapToGlobal(QPoint(0, 0)).y() - popup.height() - 2)
+        if below.x() + popup.width() > screen.right():
+            below.setX(screen.right() - popup.width())
+        return below
+
+    def _picked(self, moment: QDate) -> None:
+        self.set_value(date(moment.year(), moment.month(), moment.day()))
+        if self._popup is not None:
+            self._popup.hide()
+        # Тот же сигнал, что и при вводе руками: подписчики — отбор оплат,
+        # карточка платежа — не должны различать, набрали дату или отметили.
+        self.editingFinished.emit()
 
 
 class PaymentDialog(QDialog):

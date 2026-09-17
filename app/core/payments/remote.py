@@ -164,6 +164,7 @@ def _params(selection: Filter | None) -> dict[str, Any]:
         "start": chosen.start,
         "end": chosen.end,
         "statuses": [status.value for status in chosen.statuses],
+        "origins": [origin.value for origin in chosen.origins],
         "supplier_id": chosen.supplier_id or None,
         # Отбор идёт по нормализованному ключу, а не по имени: «НеваЛайн ООО»
         # и «ООО "Невалайн"» — один получатель. Ключ считается той же
@@ -188,6 +189,13 @@ def list_payments(
     """Отбор оплат. Порядок задаёт сервер, аргумент `order` не используется."""
     rows = transport.get("/api/payments", _params(selection))
     payments = [_payment(row) for row in rows]
+    if selection and selection.origins:
+        # Сервер старее клиента пропустит незнакомый отбор молча: лишние
+        # параметры запроса FastAPI ошибкой не считает. Без этой проверки на
+        # экран легла бы вся выборка, выданная за отфильтрованную, — а отличить
+        # «плана нет» от «фильтр не сработал» пользователю было бы нечем.
+        allowed = set(selection.origins)
+        payments = [payment for payment in payments if payment.origin in allowed]
     return payments[:limit] if limit else payments
 
 

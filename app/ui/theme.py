@@ -102,24 +102,17 @@ QWidget#Sidebar {{
 QLabel#Brand {{ font-size: 16px; font-weight: 700; }}
 QLabel#BrandSub {{ font-size: 11px; color: {Palette.TEXT_FAINT}; }}
 
-/* Какая база в работе. В общей — спокойная подпись; в локальной — жёлтая,
-   потому что это временное состояние, из которого надо выйти выгрузкой. */
-QPushButton#BaseChip {{
+/* Кнопка выгрузки локальной базы — рядом с переключателем BaseToggle,
+   видна только пока база локальная (см. BaseToggle в widgets/base_toggle.py). */
+QToolButton#BaseUploadButton {{
     background: {Palette.SURFACE_ALT};
     border: 1px solid {Palette.BORDER};
     border-radius: {Metrics.RADIUS_SM}px;
-    padding: 6px 10px;
-    margin: 0 0 12px 0;
-    text-align: left;
-    font-size: 11px;
-    font-weight: 600;
-    color: {Palette.TEXT_MUTED};
+    padding: 5px;
 }}
-QPushButton#BaseChip:hover {{ border-color: {Palette.TEXT_FAINT}; color: {Palette.TEXT}; }}
-QPushButton#BaseChip[local="true"] {{
-    background: {Palette.WARNING_SOFT};
+QToolButton#BaseUploadButton:hover {{
     border-color: {Palette.WARNING};
-    color: {Palette.WARNING};
+    background: {Palette.WARNING_SOFT};
 }}
 
 QPushButton#NavButton {{
@@ -233,6 +226,45 @@ QHeaderView::section {{
 }}
 QHeaderView::section:hover {{ background: {Palette.PRIMARY_SOFT}; color: {Palette.PRIMARY}; }}
 QTableCornerButton::section {{ background: {Palette.SURFACE_ALT}; border: none; }}
+
+/* Календарь в поле даты. Правила выше — про таблицы данных, и внутренней
+   таблице календаря они не годятся: отступы ячеек в 6 пикселей разносят сетку
+   дней, а системная синяя шапка навигации спорит со всем остальным окном. */
+QCalendarWidget {{ background: {Palette.SURFACE}; }}
+QCalendarWidget QWidget#qt_calendar_navigationbar {{
+    background: {Palette.SURFACE};
+    border-bottom: 1px solid {Palette.BORDER};
+}}
+QCalendarWidget QToolButton {{
+    background: transparent;
+    border: none;
+    border-radius: {Metrics.RADIUS_SM}px;
+    padding: 3px 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: {Palette.TEXT};
+}}
+QCalendarWidget QToolButton:hover {{
+    background: {Palette.PRIMARY_SOFT};
+    color: {Palette.PRIMARY};
+}}
+QCalendarWidget QToolButton::menu-indicator {{ image: none; }}
+QCalendarWidget QAbstractItemView {{
+    background: {Palette.SURFACE};
+    border: none;
+    outline: none;
+    font-size: 12px;
+    selection-background-color: {Palette.PRIMARY};
+    selection-color: {Palette.TEXT_ON_PRIMARY};
+}}
+QCalendarWidget QAbstractItemView::item {{ padding: 0; }}
+QCalendarWidget QAbstractItemView::item:hover {{ background: {Palette.PRIMARY_SOFT}; }}
+/* Выбранный день — заливкой: бледная подсветка из правил таблиц теряется
+   среди соседних чисел, а выбор даты нужно видеть с первого взгляда. */
+QCalendarWidget QAbstractItemView::item:selected {{
+    background: {Palette.PRIMARY};
+    color: {Palette.TEXT_ON_PRIMARY};
+}}
 
 QListWidget {{
     background: {Palette.SURFACE};

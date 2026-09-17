@@ -27,7 +27,7 @@ from ..core.payments import admin, data, transport
 from ..core.payments.admin import Account, Entry
 from ..core.suppliers import directory
 from ..core.settings import AppSettings
-from . import icons
+from . import icons, pages
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.account_dialogs import AccountDialog, PasswordShown
@@ -106,6 +106,7 @@ class AdminPage(QWidget):
             Column("Роль", lambda a: a.role, 170,
                    color=lambda a: None if a.is_active else QColor(Palette.TEXT_FAINT)),
             Column("Направления", lambda a: ", ".join(a.directions), 140),
+            Column("Разделы", lambda a: pages.describe(a.denied_pages), 220),
             Column("Имён в 1С", lambda a: len(a.responsible), 90,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             Column("Кто в 1С", lambda a: ", ".join(a.responsible), 320),

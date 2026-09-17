@@ -47,7 +47,7 @@ EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "vat", "pr
 
 def _conditions(
     text: str, start: date | None, end: date | None,
-    statuses: list[str], supplier_id: int, recipient_key: str,
+    statuses: list[str], origins: list[str], supplier_id: int, recipient_key: str,
     amount_from: float | None, amount_to: float | None,
     responsible: str, operation: str, over_limit: bool | None,
     dated_only: bool,
@@ -71,6 +71,9 @@ def _conditions(
     if statuses:
         parts.append("p.status = ANY(%s)")
         values.append(statuses)
+    if origins:
+        parts.append("p.origin = ANY(%s)")
+        values.append(origins)
     if supplier_id:
         parts.append("p.supplier_id = %s")
         values.append(supplier_id)
@@ -113,6 +116,7 @@ def list_payments(
     start: date | None = None,
     end: date | None = None,
     statuses: list[str] = Query(default=[]),
+    origins: list[str] = Query(default=[]),
     supplier_id: int = 0,
     recipient_key: str = "",
     amount_from: float | None = None,
@@ -124,7 +128,7 @@ def list_payments(
     mine: bool = False,
 ) -> list[PaymentOut]:
     where, values = _conditions(
-        text, start, end, statuses, supplier_id, recipient_key,
+        text, start, end, statuses, origins, supplier_id, recipient_key,
         amount_from, amount_to, responsible, operation, over_limit, dated_only)
     if mine and not user.is_admin:
         where += " AND p.responsible = ANY(%s)"

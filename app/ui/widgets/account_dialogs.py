@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.payments.admin import Account
+from ..pages import MANAGED
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
 
@@ -119,6 +121,9 @@ class AccountDialog(QDialog):
         if self._known_directions:
             self._build_directions(root)
 
+        self.pages: list[tuple[str, QCheckBox]] = []
+        self._build_pages(root)
+
         root.addWidget(SectionTitle("Чьи оплаты считаются своими"))
         root.addWidget(Hint(
             "Отмеченные имена — так человек записан в выгрузке 1С. Оплаты с "
@@ -179,6 +184,32 @@ class AccountDialog(QDialog):
         row.addStretch(1)
         root.addLayout(row)
 
+    def _build_pages(self, root: QVBoxLayout) -> None:
+        """Какие разделы человек видит в меню.
+
+        Отмечено — показывается. Снятая отметка убирает раздел из меню и
+        закрывает переход по сочетанию клавиш, но не заменяет прав на данные:
+        оплаты сервер отдаёт по своему правилу, а «Маркировка» работает по
+        личному сертификату. Здесь решается только то, чем человеку не
+        пользоваться — чтобы не мешало.
+        """
+        root.addWidget(SectionTitle("Разделы приложения"))
+        root.addWidget(Hint(
+            "Снимите отметку с того, что человеку не нужно, — раздел исчезнет "
+            "из меню. «Настройки» и личный кабинет доступны всегда, а "
+            "«Администрирование» открывается признаком администратора выше."))
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(Metrics.GAP)
+        grid.setVerticalSpacing(4)
+        closed = set(self.account.denied_pages)
+        for number, page in enumerate(MANAGED):
+            box = QCheckBox(page.title, self)
+            box.setChecked(page.code not in closed)
+            grid.addWidget(box, number // 3, number % 3)
+            self.pages.append((page.code, box))
+        root.addLayout(grid)
+
     def _accept(self) -> None:
         login = self.login.text().strip().lower()
         if not login:
@@ -205,6 +236,8 @@ class AccountDialog(QDialog):
         self.account.responsible = chosen
         self.account.directions = [code for code, box in self.directions
                                    if box.isChecked()]
+        self.account.denied_pages = [code for code, box in self.pages
+                                     if not box.isChecked()]
         self.account.is_admin = self.is_admin.isChecked()
         self.account.is_active = self.is_active.isChecked()
         return self.account

@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS user_responsible (
 
 CREATE INDEX IF NOT EXISTS user_responsible_name ON user_responsible(responsible);
 
+-- Разделы приложения, закрытые у учётки: маркировкой занимаются двое, а
+-- вкладка была у всех. Список закрытых, а не открытых, — раздел из новой
+-- версии должен появляться у всех сам, без обхода учёток с раздачей прав.
+-- Коды задаёт приложение; справочника здесь нет, иначе каждая новая вкладка
+-- требовала бы миграции ради проверки, которая ничего не защищает.
+CREATE TABLE IF NOT EXISTS user_page_denied (
+    user_id   BIGINT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    page_code TEXT   NOT NULL,
+    PRIMARY KEY (user_id, page_code)
+);
+
 -- --- оплаты -----------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS payment (

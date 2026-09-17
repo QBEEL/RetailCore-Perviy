@@ -385,6 +385,69 @@ class Stats:
         return self.total / self.count if self.count else 0.0
 
 
+# Недобор к плану, после которого строка считается выбившейся. Двадцать
+# процентов — не свойство данных, а договорённость отдела: меньше списывают на
+# округление сумм и перенос оплаты через край месяца.
+PLAN_DEVIATION_LIMIT = 20.0
+
+
+@dataclass(slots=True)
+class PlanFact:
+    """План и факт по одному поставщику за месяц.
+
+    План — всё намеченное на месяц, независимо от того, как запись появилась:
+    присланный Excel, заведённое вручную, вышедшее из заказа и переоценки,
+    заявка из 1С. Счёт, набитый в 1С и стоящий на конкретное число, запланирован
+    ровно так же, как строка из Excel, — по источнику их не делят.
+
+    Факт — оплаченное из этого же. Оплата не заводит новую запись, а меняет
+    статус существующей, поэтому факт всегда часть плана: оплатить больше, чем
+    намечено, нельзя — можно только наметить ещё.
+
+    Обе величины считаются по правилу `counts_to_budget`: отменённое и
+    непоставщические операции не в счёт, иначе недобор объяснялся бы не работой
+    менеджера, а налогами и арендой.
+    """
+
+    recipient: str = ""
+    supplier_id: int = 0
+    planned: float = 0.0
+    actual: float = 0.0
+    planned_count: int = 0
+    actual_count: int = 0
+
+    @property
+    def empty(self) -> bool:
+        """Ни плана, ни оплаты — показывать нечего."""
+        return not (self.planned or self.actual)
+
+    @property
+    def title(self) -> str:
+        return self.recipient or "без получателя"
+
+    @property
+    def left(self) -> float:
+        """Сколько из намеченного ещё не оплачено."""
+        return max(self.planned - self.actual, 0.0)
+
+    @property
+    def done_share(self) -> float | None:
+        """Исполнение плана в процентах.
+
+        `None`, когда плана не было вовсе: делить не на что. Оплаты без плана
+        при этом не бывает — запись сначала намечают, потом оплачивают.
+        """
+        if not self.planned:
+            return None
+        return self.actual / self.planned * 100.0
+
+    @property
+    def off_plan(self) -> bool:
+        """Недобрали больше положенного — строка должна быть заметна."""
+        share = self.done_share
+        return share is not None and share < 100.0 - PLAN_DEVIATION_LIMIT
+
+
 @dataclass(slots=True)
 class SupplierStats:
     """История оплат одного получателя — основа рейтинга и предложений."""

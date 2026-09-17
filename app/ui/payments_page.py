@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -43,9 +43,11 @@ from ..core.payments import (
     Filter,
     LEVEL_PRESETS,
     MONTHS,
+    PLAN_DEVIATION_LIMIT,
     Payment,
     PaymentOrigin,
     PaymentStatus,
+    PlanFact,
     STATUS_ORDER,
     Stats,
     SuggestionKind,
@@ -110,6 +112,12 @@ class PaymentsPage(QWidget):
         self.stats = Stats()
         self._known: dict[str, list[str]] = {}
         self._budgets: dict[tuple[int, int], Budget] = {}
+        # Сколько оплат в базе всего — из последнего полного чтения. Перенос
+        # это число не меняет, и спрашивать его у сервера заново незачем.
+        self._total = 0
+        # Вкладки, которым нужна пересборка. Считается открытая, остальные
+        # ждут перехода на них: см. _refresh_views.
+        self._stale: set[int] = set()
         self.selected_day: date | None = None
         today = date.today()
         self.year, self.month = today.year, today.month
@@ -173,11 +181,17 @@ class PaymentsPage(QWidget):
         self.conflicts_hint.hide()
         root.addWidget(self.conflicts_hint)
 
+        # Панель отбора строится до вкладок: `current_filter` читает её поля, а
+        # вкладки при сборке уже просят перечитать выборку.
+        self.filters = self._filters_panel()
+        root.addWidget(self.filters)
+
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._calendar_tab(), "Календарь")
         self.tabs.addTab(self._table_tab(), "Таблица")
         self.tabs.addTab(self._dashboard_tab(), "Аналитика")
+        self.tabs.addTab(self._plan_fact_tab(), "Исполнение плана")
         self.tabs.addTab(self._budget_tab(), "Бюджет")
         self.tabs.currentChanged.connect(self._tab_changed)
         root.addWidget(self.tabs, 1)
@@ -186,6 +200,174 @@ class PaymentsPage(QWidget):
             "Оплат пока нет. Нажмите «Импорт из 1С» и выберите выгрузку "
             "«Оплата поставщикам» — история загрузится целиком.", self)
         root.addWidget(self.empty)
+
+    # =========================================================================
+    # Отбор
+    # =========================================================================
+
+    def _filters_panel(self) -> QWidget:
+        """Условия отбора — одни на весь раздел.
+
+        Панель стоит над вкладками, а не внутри таблицы, потому что выборка у
+        календаря, аналитики, исполнения плана и бюджета общая: фильтр, спрятанный
+        в одну вкладку, молча менял бы данные на остальных четырёх.
+
+        Свернуть её можно: сетке календаря эти полтораста точек по высоте
+        нужнее, чем отбор, который меняют раз в день. Свёрнутая панель обязана
+        говорить, что отбор задан, — иначе неполный календарь не отличить от
+        пустого месяца.
+        """
+        panel = QWidget(self)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.filters_toggle = QPushButton("Фильтры", panel)
+        self.filters_toggle.setObjectName("Ghost")
+        self.filters_toggle.setIcon(icons.icon("filter"))
+        self.filters_toggle.setCheckable(True)
+        self.filters_toggle.setChecked(self.settings.payment_filters_open)
+        self.filters_toggle.toggled.connect(self._toggle_filters)
+        head.addWidget(self.filters_toggle)
+
+        self.filters_summary = Hint("", panel)
+        # Без переноса: подпись стоит в одну строку с кнопкой, и второй ряд
+        # раздвигал бы свёрнутую панель ровно в той высоте, ради которой её и
+        # сворачивают.
+        self.filters_summary.setWordWrap(False)
+        head.addWidget(self.filters_summary)
+        head.addStretch(1)
+        outer.addLayout(head)
+
+        self.filters_body = QWidget(panel)
+        body = QVBoxLayout(self.filters_body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(8)
+
+        first = QHBoxLayout()
+        first.setSpacing(8)
+        self.status_filter = SelectBox(self.filters_body)
+        self.status_filter.addItem("Все статусы", "")
+        for status in STATUS_ORDER:
+            self.status_filter.addItem(status.title, status.value)
+        first.addWidget(self.status_filter)
+
+        self.period_filter = SelectBox(self.filters_body)
+        for label, days in (
+            ("Всё время", 0), ("Текущий месяц", -1), ("30 дней", 30),
+            ("90 дней", 90), ("Год", 365), ("Будущие", -2),
+        ):
+            self.period_filter.addItem(label, days)
+        first.addWidget(self.period_filter)
+
+        # Источник отделяет присланный менеджером план от выгрузки 1С: в
+        # таблице они лежат вперемешку и на глаз не различаются.
+        self.origin_filter = SelectBox(self.filters_body)
+        self.origin_filter.addItem("Все источники", "")
+        for origin in PaymentOrigin:
+            self.origin_filter.addItem(origin.title, origin.value)
+        self.origin_filter.setMinimumWidth(170)
+        first.addWidget(self.origin_filter)
+
+        # Отбор по одному поставщику. Поиск в таблице ловит и похожие названия —
+        # список нужен, когда требуется ровно один и без соседей.
+        self.supplier_filter = SelectBox(self.filters_body)
+        self.supplier_filter.addItem("Все поставщики", "")
+        self.supplier_filter.setMinimumWidth(230)
+        first.addWidget(self.supplier_filter)
+
+        self.responsible_filter = SelectBox(self.filters_body)
+        self.responsible_filter.addItem("Все ответственные", "")
+        self.responsible_filter.setMinimumWidth(205)
+        first.addWidget(self.responsible_filter)
+
+        self.operation_filter = SelectBox(self.filters_body)
+        self.operation_filter.addItem("Все операции", "")
+        self.operation_filter.setMinimumWidth(170)
+        first.addWidget(self.operation_filter)
+        first.addStretch(1)
+        body.addLayout(first)
+
+        second = QHBoxLayout()
+        second.setSpacing(8)
+        second.addWidget(QLabel("Сумма от", self.filters_body))
+        self.amount_from = DecimalInput(self.filters_body)
+        self.amount_to = DecimalInput(self.filters_body)
+        for field in (self.amount_from, self.amount_to):
+            field.setRange(0.0, 1_000_000_000.0)
+            field.setDecimals(0)
+            field.setGroupSeparatorShown(True)
+            field.setMaximumWidth(140)
+        second.addWidget(self.amount_from)
+        second.addWidget(QLabel("до", self.filters_body))
+        second.addWidget(self.amount_to)
+
+        second.addSpacing(Metrics.GAP)
+        second.addWidget(QLabel("Даты с", self.filters_body))
+        self.date_from = DateInput(self.filters_body)
+        second.addWidget(self.date_from)
+        second.addWidget(QLabel("по", self.filters_body))
+        self.date_to = DateInput(self.filters_body)
+        second.addWidget(self.date_to)
+        for field in (self.date_from, self.date_to):
+            field.editingFinished.connect(self._dates_changed)
+
+        second.addSpacing(Metrics.GAP)
+        apply_button = QPushButton("Применить", self.filters_body)
+        apply_button.clicked.connect(self.reload)
+        second.addWidget(apply_button)
+        reset = QPushButton("Сбросить", self.filters_body)
+        reset.setObjectName("Ghost")
+        reset.setIcon(icons.icon("reset"))
+        reset.clicked.connect(self.reset_filters)
+        second.addWidget(reset)
+        second.addStretch(1)
+        body.addLayout(second)
+
+        outer.addWidget(self.filters_body)
+        # Подписка на перезагрузку — после наполнения списков, иначе
+        # `addItem` на пустом списке дёрнул бы её на этапе сборки окна.
+        for box in self._filter_boxes():
+            box.currentIndexChanged.connect(self.reload)
+        self.filters_body.setVisible(self.settings.payment_filters_open)
+        self._refresh_filters_summary()
+        return panel
+
+    def _filter_boxes(self) -> tuple[SelectBox, ...]:
+        return (
+            self.status_filter, self.period_filter, self.origin_filter,
+            self.supplier_filter, self.responsible_filter, self.operation_filter,
+        )
+
+    def _toggle_filters(self, opened: bool) -> None:
+        self.filters_body.setVisible(opened)
+        self.settings.payment_filters_open = opened
+        self.settings.save()
+
+    def _refresh_filters_summary(self) -> None:
+        """Строка рядом с кнопкой: что именно отобрано.
+
+        Нужна прежде всего свёрнутой панели. Без неё отфильтрованный календарь
+        выглядит как месяц, в котором почти ничего не запланировано.
+        """
+        names: list[str] = []
+        for box, label in (
+            (self.status_filter, "статус"), (self.origin_filter, "источник"),
+            (self.supplier_filter, "поставщик"), (self.responsible_filter, "ответственный"),
+            (self.operation_filter, "операция"),
+        ):
+            if box.currentData():
+                names.append(f"{label}: {box.currentText()}")
+        if self.date_from.value() or self.date_to.value():
+            names.append("свои даты")
+        elif self.period_filter.currentIndex() > 0:
+            names.append(f"период: {self.period_filter.currentText()}")
+        if float(self.amount_from.value()) or float(self.amount_to.value()):
+            names.append("сумма")
+        self.filters_summary.setText(
+            "отбор: " + " · ".join(names) if names else "отбор не задан")
 
     # =========================================================================
     # Календарь
@@ -250,11 +432,31 @@ class PaymentsPage(QWidget):
         body.addWidget(Hint(
             "Выделите оплаты (Ctrl или Shift) и перетащите их на другой день "
             "календаря; клетка целиком переносит весь день.", side))
+        self.day_list.itemSelectionChanged.connect(self._day_selection_changed)
+
+        day_buttons = QHBoxLayout()
+        day_buttons.setSpacing(8)
         self.day_add = QPushButton("Оплата на этот день", side)
         self.day_add.setIcon(icons.icon("card"))
         self.day_add.setEnabled(False)
         self.day_add.clicked.connect(self._create_on_day)
-        body.addWidget(self.day_add)
+        day_buttons.addWidget(self.day_add, 1)
+
+        self.day_delete = QPushButton("Удалить", side)
+        self.day_delete.setObjectName("Danger")
+        self.day_delete.setIcon(icons.icon("trash"))
+        self.day_delete.setEnabled(False)
+        self.day_delete.clicked.connect(self.delete_from_day)
+        day_buttons.addWidget(self.day_delete)
+        body.addLayout(day_buttons)
+
+        # Delete на списке — то же самое действие: удалять из списка клавишей
+        # привычнее, чем искать кнопку, а подтверждение защищает от промаха.
+        remove = QAction("Удалить", self.day_list)
+        remove.setShortcut(QKeySequence.StandardKey.Delete)
+        remove.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        remove.triggered.connect(self.delete_from_day)
+        self.day_list.addAction(remove)
         split.addWidget(side)
         split.setSizes([760, 340])
         layout.addWidget(split, 1)
@@ -269,11 +471,13 @@ class PaymentsPage(QWidget):
         self.month = (month - 1) % 12 + 1
         self.year = year
         self.refresh_calendar()
+        self.refresh_plan_fact()
 
     def show_today(self) -> None:
         today = date.today()
         self.year, self.month = today.year, today.month
         self.refresh_calendar()
+        self.refresh_plan_fact()
 
     def refresh_calendar(self) -> None:
         levels = self.settings.day_levels
@@ -311,6 +515,7 @@ class PaymentsPage(QWidget):
     def show_day(self, day: Day) -> None:
         self.selected_day = day.day
         self.day_add.setEnabled(True)
+        self.day_delete.setEnabled(False)
         self.day_title.setText(f"{day.day:%d.%m.%Y}, {_weekday(day.day)}")
         if not day.count:
             self.day_summary.setText("оплат нет")
@@ -327,6 +532,22 @@ class PaymentsPage(QWidget):
                 + (f" · {payment.responsible}" if payment.responsible else ""))
             item.setForeground(QColor(STATUS_COLORS[payment.status]))
             self.day_list.addItem(self.day_list.mark(item, payment))
+
+    def _day_selection_changed(self) -> None:
+        count = len(self.day_list.selected_ids(movable_only=False))
+        self.day_delete.setEnabled(count > 0)
+        self.day_delete.setText(f"Удалить ({count})" if count else "Удалить")
+
+    def delete_from_day(self) -> None:
+        """Удаление выбранных оплат прямо из календаря.
+
+        `movable_only=False`, в отличие от переноса: оплаченное перетаскивать
+        на другую дату нельзя, а удалять — можно, как и в таблице. Ошибочно
+        занесённый платёж остаётся ошибкой и после того, как ему проставили
+        статус «Оплачено».
+        """
+        chosen = set(self.day_list.selected_ids(movable_only=False))
+        self.delete_payments([p for p in self.rows if p.id in chosen])
 
     def _open_from_day(self, item: QListWidgetItem) -> None:
         payment_id = int(item.data(ROLE_PAYMENT_ID) or 0)
@@ -346,11 +567,20 @@ class PaymentsPage(QWidget):
         """
         chosen = {payment.id: payment for payment in self.rows if payment.id in set(ids)}
         movable = [p for p in chosen.values() if p.status.open and p.pay_date != day]
+        # Чужие отсеиваются здесь, до отправки, а не сервером после неё. Право
+        # считает всё равно он и присылает готовым с каждой записью — но зная
+        # заранее, что уйдёт, мы знаем и что изменилось, и можем поправить эти
+        # строки у себя вместо повторного чтения всей базы.
+        mine = [p for p in movable if store.may_edit(p)]
         if not movable:
             if chosen:
                 self.notify(
                     "Переносить нечего: оплачено, отменено или уже на этом дне",
                     ToastKind.WARNING)
+            return
+        if not mine:
+            self.notify("Перенести нечего: все выделенные оплаты чужие",
+                        ToastKind.WARNING)
             return
         if whole_day and len(movable) > 1 and not self._confirm_day_move(movable, day):
             return
@@ -360,23 +590,67 @@ class PaymentsPage(QWidget):
             # Перенос фиксируется статусом, иначе сдвинутое в прошлое тут же
             # стало бы просрочкой.
             changed = store.update_many(
-                [p.id for p in movable], status=PaymentStatus.MOVED, pay_date=day)
+                [p.id for p in mine], status=PaymentStatus.MOVED, pay_date=day)
         except ValueError as failure:
             self.notify(str(failure), ToastKind.ERROR)
             return
         if not changed:
             self.notify("Перенести не удалось: оплаты не изменились", ToastKind.WARNING)
             return
-        moved = (movable[0].title if changed == 1 and len(movable) == 1
+        moved = (mine[0].title if changed == 1 and len(mine) == 1
                  else payments_count(changed))
-        skipped = len(movable) - changed
+        skipped = len(movable) - len(mine)
         text = f"{moved}: перенесено на {day:%d.%m.%Y}"
         if skipped > 0:
-            # Общая база отклоняет чужие оплаты молча — иначе разница между
-            # «перенесли пять» и «перенесли три» осталась бы незамеченной.
+            # Чужие пропускаются молча — иначе разница между «перенесли пять» и
+            # «перенесли три» осталась бы незамеченной.
             text += f" · пропущено чужих: {skipped}"
         self.notify(text, ToastKind.SUCCESS if not skipped else ToastKind.WARNING)
-        self.reload()
+        if changed != len(mine):
+            # Права разошлись с тем, что прислал сервер: их могли сменить, пока
+            # выборка лежала на экране. Что именно не прошло — отсюда не видно,
+            # и единственный честный выход — перечитать.
+            self.reload()
+            return
+        self._apply_move(mine, day)
+
+    def _apply_move(self, moved: list[Payment], day: date) -> None:
+        """Применяет перенос к уже прочитанным строкам, не перечитывая базу.
+
+        Сервер записал ровно то, что здесь повторяется: дату и статус. Всё
+        остальное — суммы, получатели, права — перенос не трогает, поэтому
+        показанному можно верить до следующего полного чтения.
+        """
+        for payment in moved:
+            payment.pay_date = day
+            payment.status = PaymentStatus.MOVED
+        # Перенос может вывести строку из отбора — за границу периода или мимо
+        # выбранного статуса. Тогда её убираем: сервер при чтении не вернул бы
+        # её тоже, и оставить значило бы показывать выборку, которой нет.
+        dropped = {p.id for p in moved if self._dropped_by_filter(p)}
+        if dropped:
+            self.rows = [p for p in self.rows if p.id not in dropped]
+        self._refresh_views()
+        self._update_subtitle()
+
+    def _dropped_by_filter(self, payment: Payment) -> bool:
+        """Выпала ли строка из текущего отбора после переноса.
+
+        Проверяются только период и статус: перенос меняет ровно их. Сумма,
+        получатель, ответственный и происхождение остаются прежними — как
+        проходили отбор, так и проходят, и повторять здесь все его условия
+        значило бы завести вторую копию правила, которая однажды разойдётся.
+        """
+        selection = self.current_filter()
+        if selection.statuses and payment.status not in selection.statuses:
+            return True
+        if selection.start and (payment.pay_date is None
+                                or payment.pay_date < selection.start):
+            return True
+        if selection.end and (payment.pay_date is None
+                              or payment.pay_date > selection.end):
+            return True
+        return False
 
     def _confirm_day_move(self, movable: list[Payment], day: date) -> bool:
         """Перенос дня целиком спрашивают: клетку задевают мышью и случайно."""
@@ -399,68 +673,15 @@ class PaymentsPage(QWidget):
         layout.setContentsMargins(0, Metrics.GAP, 0, 0)
         layout.setSpacing(Metrics.GAP)
 
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        # Поиск отделён от панели отбора намеренно: он не меняет выборку, а
+        # сужает и подсвечивает уже показанные строки. На календарь и аналитику
+        # это не влияет, и обещать обратное соседством с фильтрами не стоит.
         self.search = QLineEdit(page)
-        self.search.setPlaceholderText("Поиск: поставщик, номер заявки, комментарий, ответственный")
+        self.search.setPlaceholderText(
+            "Поиск по показанным строкам: поставщик, заявка, комментарий, ответственный")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter_table)
-        top.addWidget(self.search, 1)
-
-        self.status_filter = SelectBox(page)
-        self.status_filter.addItem("Все статусы", "")
-        for status in STATUS_ORDER:
-            self.status_filter.addItem(status.title, status.value)
-        self.status_filter.currentIndexChanged.connect(self.reload)
-        top.addWidget(self.status_filter)
-
-        self.period_filter = SelectBox(page)
-        for label, days in (
-            ("Всё время", 0), ("Текущий месяц", -1), ("30 дней", 30),
-            ("90 дней", 90), ("Год", 365), ("Будущие", -2),
-        ):
-            self.period_filter.addItem(label, days)
-        self.period_filter.currentIndexChanged.connect(self.reload)
-        top.addWidget(self.period_filter)
-        layout.addLayout(top)
-
-        second = QHBoxLayout()
-        second.setSpacing(8)
-        second.addWidget(QLabel("Сумма от", page))
-        self.amount_from = DecimalInput(page)
-        self.amount_from.setRange(0.0, 1_000_000_000.0)
-        self.amount_from.setDecimals(0)
-        self.amount_from.setGroupSeparatorShown(True)
-        self.amount_from.setMaximumWidth(140)
-        second.addWidget(self.amount_from)
-        second.addWidget(QLabel("до", page))
-        self.amount_to = DecimalInput(page)
-        self.amount_to.setRange(0.0, 1_000_000_000.0)
-        self.amount_to.setDecimals(0)
-        self.amount_to.setGroupSeparatorShown(True)
-        self.amount_to.setMaximumWidth(140)
-        second.addWidget(self.amount_to)
-
-        self.responsible_filter = SelectBox(page)
-        self.responsible_filter.addItem("Все ответственные", "")
-        self.responsible_filter.setMinimumWidth(180)
-        second.addWidget(self.responsible_filter)
-
-        self.operation_filter = SelectBox(page)
-        self.operation_filter.addItem("Все операции", "")
-        self.operation_filter.setMinimumWidth(180)
-        second.addWidget(self.operation_filter)
-
-        apply_button = QPushButton("Применить", page)
-        apply_button.clicked.connect(self.reload)
-        second.addWidget(apply_button)
-        reset = QPushButton("Сбросить", page)
-        reset.setObjectName("Ghost")
-        reset.setIcon(icons.icon("reset"))
-        reset.clicked.connect(self.reset_filters)
-        second.addWidget(reset)
-        second.addStretch(1)
-        layout.addLayout(second)
+        layout.addWidget(self.search)
 
         self.table = DataTable(self._columns(), page)
         self.table.item_activated.connect(self.open_payment)
@@ -546,14 +767,36 @@ class PaymentsPage(QWidget):
             text += f" · отменённых {len(cancelled)} на {money(sum(p.amount for p in cancelled))} ₽"
         self.table_summary.setText(text)
 
+    def _dates_changed(self) -> None:
+        """Точные даты отменяют пресет периода.
+
+        Два отбора по одной и той же дате противоречили бы друг другу, и какой
+        сильнее — на глаз не определить. Поэтому заполненные поля выключают
+        список периодов, а пустые возвращают его обратно.
+        """
+        custom = bool(self.date_from.value() or self.date_to.value())
+        if custom and self.period_filter.currentIndex() != 0:
+            self.period_filter.blockSignals(True)
+            self.period_filter.setCurrentIndex(0)
+            self.period_filter.blockSignals(False)
+        self.period_filter.setEnabled(not custom)
+        self._refresh_filters_summary()
+        self.reload()
+
     def reset_filters(self) -> None:
+        # Сигналы списков заглушены на время сброса: каждый из них подписан на
+        # `reload`, и без этого сброс уходил бы на сервер столько раз, сколько
+        # здесь списков, — ради одной и той же выборки.
+        for box in self._filter_boxes():
+            box.blockSignals(True)
+            box.setCurrentIndex(0)
+            box.blockSignals(False)
         self.search.clear()
-        self.status_filter.setCurrentIndex(0)
-        self.period_filter.setCurrentIndex(0)
+        self.period_filter.setEnabled(True)
         self.amount_from.setValue(0)
         self.amount_to.setValue(0)
-        self.responsible_filter.setCurrentIndex(0)
-        self.operation_filter.setCurrentIndex(0)
+        self.date_from.set_value(None)
+        self.date_to.set_value(None)
         self.reload()
 
     def bulk_edit(self) -> None:
@@ -572,18 +815,27 @@ class PaymentsPage(QWidget):
         self.reload()
 
     def delete_selected(self) -> None:
-        selected = [p for p in self.table.selected_items() if p is not None]
-        if not selected:
+        self.delete_payments([p for p in self.table.selected_items() if p is not None])
+
+    def delete_payments(self, payments: list[Payment]) -> None:
+        """Удаление с подтверждением. Одно на таблицу и на календарь.
+
+        Спрашивают одинаково и удаляют одинаково откуда угодно: правило «что
+        можно удалить» не должно зависеть от того, на какой вкладке человек
+        это делает.
+        """
+        if not payments:
             return
+        total = money(sum(payment.amount for payment in payments))
         answer = QMessageBox.question(
             self, "Удалить оплаты",
-            f"Удалить {len(selected)} оплат безвозвратно?\n"
+            f"Удалить {len(payments)} оплат на {total} ₽ безвозвратно?\n"
             "Импортированные записи вернутся при следующем импорте выгрузки.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        removed = sum(1 for payment in selected if store.delete_payment(payment.id))
+        removed = sum(1 for payment in payments if store.delete_payment(payment.id))
         self.notify(f"Удалено оплат: {removed}", ToastKind.SUCCESS)
         self.reload()
 
@@ -931,6 +1183,119 @@ class PaymentsPage(QWidget):
         self.search.setText(stats.recipient)
 
     # =========================================================================
+    # Исполнение плана
+    # =========================================================================
+
+    def _plan_fact_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        previous = QPushButton("‹", page)
+        previous.setObjectName("Ghost")
+        previous.setFixedWidth(34)
+        previous.clicked.connect(lambda: self.shift_month(-1))
+        bar.addWidget(previous)
+
+        self.plan_month_label = QLabel("", page)
+        self.plan_month_label.setObjectName("SectionTitle")
+        self.plan_month_label.setMinimumWidth(170)
+        bar.addWidget(self.plan_month_label)
+
+        forward = QPushButton("›", page)
+        forward.setObjectName("Ghost")
+        forward.setFixedWidth(34)
+        forward.clicked.connect(lambda: self.shift_month(1))
+        bar.addWidget(forward)
+
+        today_button = QPushButton("Текущий месяц", page)
+        today_button.setObjectName("Ghost")
+        today_button.clicked.connect(self.show_today)
+        bar.addWidget(today_button)
+        bar.addStretch(1)
+
+        self.plan_fact_summary = QLabel("", page)
+        self.plan_fact_summary.setObjectName("Hint")
+        bar.addWidget(self.plan_fact_summary)
+        layout.addLayout(bar)
+
+        layout.addWidget(Hint(
+            "План — всё намеченное на месяц: присланный Excel, заведённое "
+            "вручную, оплаты из заказа и переоценки, заявки из 1С. Факт — "
+            "оплаченное из этого же. Красным выделены поставщики, у которых "
+            f"недобрали больше {PLAN_DEVIATION_LIMIT:.0f} % намеченного. "
+            "Двойной щелчок открывает карточку поставщика.", page))
+
+        self.plan_fact_table = DataTable(self._plan_fact_columns(), page)
+        self.plan_fact_table.item_activated.connect(self._open_supplier_from_plan)
+        layout.addWidget(self.plan_fact_table, 1)
+
+        self.plan_fact_hint = Hint("", page)
+        layout.addWidget(self.plan_fact_hint)
+        return page
+
+    def _plan_fact_columns(self) -> list[Column]:
+        # Цвет задаётся каждой колонке отдельно: подкрасить строку целиком
+        # таблица не умеет, а выбившийся поставщик должен читаться с одного
+        # взгляда, а не вылавливаться по одной ячейке.
+        def colour(row: PlanFact) -> QColor | None:
+            return QColor(Palette.DANGER) if row.off_plan else None
+
+        return [
+            Column("Поставщик", lambda r: r.title, width=280, highlight=True, color=colour),
+            Column("План, ₽", lambda r: money(r.planned) if r.planned else "—", width=140,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.planned, color=colour),
+            Column("Факт, ₽", lambda r: money(r.actual) if r.actual else "—", width=140,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.actual, color=colour),
+            Column("Осталось, ₽", lambda r: money(r.left) if r.left else "—", width=150,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.left, color=colour),
+            Column("Исполнено, %", _done_text, width=160,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.done_share if r.done_share is not None
+                   else 0.0, color=colour),
+            Column("Строк плана", lambda r: r.planned_count, width=145,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.planned_count, color=colour),
+            Column("Оплат", lambda r: r.actual_count, width=100,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   sort_key=lambda r: r.actual_count, color=colour),
+        ]
+
+    def refresh_plan_fact(self) -> None:
+        rows = analytics.plan_vs_fact(self.rows, self.year, self.month)
+        self.plan_fact_table.set_items(rows)
+        self.plan_month_label.setText(f"{MONTHS[self.month - 1]} {self.year}")
+
+        planned, actual, off = analytics.plan_totals(rows)
+        if not rows:
+            self.plan_fact_summary.setText("за этот месяц оплат нет")
+            self.plan_fact_hint.setText(
+                "План на месяц загружается кнопкой «План из Excel» → «Загрузить "
+                "заполненный план» либо заводится оплатами прямо в программе.")
+            return
+        self.plan_fact_summary.setText(
+            f"поставщиков: {len(rows)} · план {money(planned)} ₽ · "
+            f"факт {money(actual)} ₽")
+
+        parts = [f"Осталось оплатить: {money(planned - actual)} ₽"]
+        if planned:
+            parts.append(f"· исполнено {actual / planned * 100:.1f} %")
+        if off:
+            parts.append(f"· недобор больше {PLAN_DEVIATION_LIMIT:.0f} % "
+                         f"у поставщиков: {off}")
+        self.plan_fact_hint.setText(" ".join(parts))
+
+    def _open_supplier_from_plan(self, row: PlanFact) -> None:
+        if row is not None and row.supplier_id and self._show_supplier:
+            self._show_supplier(row.supplier_id)
+
+    # =========================================================================
     # Бюджет
     # =========================================================================
 
@@ -1061,6 +1426,20 @@ class PaymentsPage(QWidget):
         selection = Filter()
         if value := self.status_filter.currentData():
             selection.statuses = (PaymentStatus(value),)
+        if value := self.origin_filter.currentData():
+            selection.origins = (PaymentOrigin(value),)
+        if name := self.supplier_filter.currentData():
+            selection.recipient = name
+        start, end = self.date_from.value(), self.date_to.value()
+        if start and end and start > end:
+            # Границы, введённые наоборот, — описка, а не запрос пустой
+            # выборки: поменять их местами понятнее, чем показать ноль строк.
+            start, end = end, start
+            self.date_from.set_value(start)
+            self.date_to.set_value(end)
+        if start or end:
+            selection.start, selection.end = start, end
+            return self._with_amounts(selection)
         days = int(self.period_filter.currentData() or 0)
         today = date.today()
         if days == -1:
@@ -1071,6 +1450,10 @@ class PaymentsPage(QWidget):
             selection.start = today
         elif days > 0:
             selection.start = today - timedelta(days=days)
+        return self._with_amounts(selection)
+
+    def _with_amounts(self, selection: Filter) -> Filter:
+        """Дозаполняет условия, не зависящие от выбранного периода."""
         if value := float(self.amount_from.value()):
             selection.amount_from = value
         if value := float(self.amount_to.value()):
@@ -1102,19 +1485,15 @@ class PaymentsPage(QWidget):
         self._loaded = True
 
         self._fill_filter_lists(known)
+        self._refresh_filters_summary()
         self._load_budgets()
-        self.table.set_items(rows)
-        self._update_table_summary()
-        self.refresh_calendar()
-        self.refresh_dashboard()
-        self.refresh_budget()
+        self._refresh_views()
 
-        total = store.count_payments()
-        self.empty.setVisible(total == 0)
-        self.tabs.setVisible(total > 0)
-        self.subtitle.setText(
-            f"Оплат в базе: {total} · показано {len(rows)} · "
-            f"объём выборки {money(self.stats.total)} ₽")
+        self._total = store.count_payments()
+        self.empty.setVisible(self._total == 0)
+        self.tabs.setVisible(self._total > 0)
+        self.filters.setVisible(self._total > 0)
+        self._update_subtitle()
         unlinked = len(store.unlinked_recipients())
         self.link_button.setText(
             f"Привязать получателей ({unlinked})" if unlinked else "Привязать получателей")
@@ -1122,6 +1501,44 @@ class PaymentsPage(QWidget):
         if overdue:
             self.notify(f"Просроченными стали {overdue} оплат", ToastKind.WARNING)
         self._check_conflicts()
+
+    def _refresh_views(self) -> None:
+        """Пересобирает показанное из уже прочитанных строк.
+
+        Ни одного обращения к серверу: календарь, таблица, аналитика, план-факт
+        и бюджет — производные от `self.rows`. Отдельно от чтения это нужно
+        ради переноса: он меняет дату и статус нескольких известных строк, а
+        полное чтение обошлось бы в пять мегабайт ответа на каждое
+        перетаскивание.
+
+        Считается только открытая вкладка. Аналитика на семи тысячах строк —
+        рейтинг поставщиков и четыре графика — стоит больше сотни миллисекунд,
+        и платить их при каждом перетаскивании за экран, на который никто в
+        этот момент не смотрит, незачем. Остальные вкладки помечаются
+        устаревшими и пересобираются, когда на них перейдут.
+        """
+        self.stats = analytics.overview(self.rows)
+        self._stale = set(range(self.tabs.count()))
+        self._refresh_current_tab()
+
+    def _refresh_current_tab(self) -> None:
+        """Пересобирает открытую вкладку, если её содержимое устарело."""
+        builders = (self.refresh_calendar, self._refresh_table,
+                    self.refresh_dashboard, self.refresh_plan_fact,
+                    self.refresh_budget)
+        index = self.tabs.currentIndex()
+        if index in self._stale and 0 <= index < len(builders):
+            self._stale.discard(index)
+            builders[index]()
+
+    def _refresh_table(self) -> None:
+        self.table.set_items(self.rows)
+        self._update_table_summary()
+
+    def _update_subtitle(self) -> None:
+        self.subtitle.setText(
+            f"Оплат в базе: {self._total} · показано {len(self.rows)} · "
+            f"объём выборки {money(self.stats.total)} ₽")
 
     def _check_conflicts(self) -> None:
         """Спрашивает сервер, каким чужим поставщикам я платил.
@@ -1149,6 +1566,7 @@ class PaymentsPage(QWidget):
         for box, key, label in (
             (self.responsible_filter, "responsible", "Все ответственные"),
             (self.operation_filter, "operations", "Все операции"),
+            (self.supplier_filter, "recipients", "Все поставщики"),
         ):
             current = box.currentData()
             box.blockSignals(True)
@@ -1387,6 +1805,8 @@ class PaymentsPage(QWidget):
     def _tab_changed(self, _index: int) -> None:
         if not self._loaded:
             self.reload()
+            return
+        self._refresh_current_tab()
 
 
 def _load_all(
@@ -1396,6 +1816,11 @@ def _load_all(
     overdue = store.refresh_overdue()
     rows = store.list_payments(selection, order="pay_date DESC, id DESC")
     return rows, store.known_values(), overdue
+
+
+def _done_text(row: PlanFact) -> str:
+    share = row.done_share
+    return "—" if share is None else f"{share:.1f} %"
 
 
 def _weekday(moment: date) -> str:

@@ -20,7 +20,13 @@ _SELECT = (
     "       COALESCE((SELECT array_agg(d.code ORDER BY d.sort_order)"
     "                   FROM user_direction ud"
     "                   JOIN direction d ON d.id = ud.direction_id"
-    "                  WHERE ud.user_id = u.id), '{}') AS directions"
+    "                  WHERE ud.user_id = u.id), '{}') AS directions,"
+    # Закрытые разделы приложения. Подзапросом, как и направления: с ещё одним
+    # LEFT JOIN строки размножились бы и array_agg по именам из 1С считал бы
+    # каждое столько раз, сколько у человека закрыто вкладок.
+    "       COALESCE((SELECT array_agg(p.page_code ORDER BY p.page_code)"
+    "                   FROM user_page_denied p"
+    "                  WHERE p.user_id = u.id), '{}') AS denied_pages"
     " FROM app_user u LEFT JOIN user_responsible r ON r.user_id = u.id"
 )
 
@@ -36,6 +42,15 @@ def _save_directions(user_id: int, codes: list[str]) -> None:
         db.execute(
             "INSERT INTO user_direction (user_id, direction_id)"
             " SELECT %s, id FROM direction WHERE code = %s"
+            " ON CONFLICT DO NOTHING", (user_id, code))
+
+
+def _save_pages(user_id: int, codes: list[str]) -> None:
+    """Переписывает список закрытых разделов — так же целиком, как направления."""
+    db.execute("DELETE FROM user_page_denied WHERE user_id = %s", (user_id,))
+    for code in codes:
+        db.execute(
+            "INSERT INTO user_page_denied (user_id, page_code) VALUES (%s, %s)"
             " ON CONFLICT DO NOTHING", (user_id, code))
 
 
@@ -71,6 +86,7 @@ def create_user(form: UserIn,
         db.execute("INSERT INTO user_responsible (user_id, responsible)"
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], name))
     _save_directions(row["id"], form.directions)
+    _save_pages(row["id"], form.denied_pages)
     db.execute(
         "INSERT INTO audit_log (user_id, entity, entity_id, action)"
         " VALUES (%s, 'app_user', %s, 'create')", (user.id, row["id"]))
@@ -100,6 +116,7 @@ def update_user(user_id: int, form: UserIn,
         db.execute("INSERT INTO user_responsible (user_id, responsible)"
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, name))
     _save_directions(user_id, form.directions)
+    _save_pages(user_id, form.denied_pages)
     db.execute(
         "INSERT INTO audit_log (user_id, entity, entity_id, action)"
         " VALUES (%s, 'app_user', %s, 'update')", (user.id, user_id))

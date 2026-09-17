@@ -28,6 +28,10 @@ class Account:
     # пусты у всех остальных — бухгалтерия и маркетинг оплаты проводят, но
     # поставщиков не ведут, и закрепление им предлагать не за чем.
     directions: list[str] = field(default_factory=list)
+    # Разделы приложения, закрытые этой учётке (коды из app/ui/pages.py).
+    # Закрытые, а не открытые: раздел, добавленный новой версией, должен
+    # появиться у всех сам, без обхода учёток с раздачей прав.
+    denied_pages: list[str] = field(default_factory=list)
     is_admin: bool = False
     is_active: bool = True
     created_at: datetime | None = None
@@ -96,6 +100,7 @@ def _account(row: dict) -> Account:
         id=int(row["id"]), login=row["login"], full_name=row["full_name"],
         responsible=list(row.get("responsible", [])),
         directions=list(row.get("directions", []) or []),
+        denied_pages=list(row.get("denied_pages", []) or []),
         is_admin=bool(row["is_admin"]), is_active=bool(row["is_active"]),
         created_at=_moment(row.get("created_at")))
 
@@ -111,6 +116,7 @@ def create(account: Account) -> tuple[Account, str]:
     answer = transport.post("/api/users", {
         "login": account.login, "full_name": account.full_name,
         "responsible": account.responsible, "directions": account.directions,
+        "denied_pages": account.denied_pages,
         "is_admin": account.is_admin, "is_active": account.is_active})
     account.id = int(answer["id"])
     account.login = answer["login"]
@@ -121,6 +127,7 @@ def save(account: Account) -> Account:
     return _account(transport.put(f"/api/users/{account.id}", {
         "login": account.login, "full_name": account.full_name,
         "responsible": account.responsible, "directions": account.directions,
+        "denied_pages": account.denied_pages,
         "is_admin": account.is_admin, "is_active": account.is_active}))
 
 

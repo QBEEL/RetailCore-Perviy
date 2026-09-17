@@ -80,6 +80,9 @@ class Filter:
     start: date | None = None
     end: date | None = None
     statuses: tuple[PaymentStatus, ...] = ()
+    # Откуда взялась запись. Нужен, чтобы отделить присланный менеджером план
+    # от выгрузки 1С: в таблице они лежат вперемешку и на глаз не различаются.
+    origins: tuple[PaymentOrigin, ...] = ()
     supplier_id: int = 0
     recipient: str = ""
     amount_from: float | None = None
@@ -94,7 +97,8 @@ class Filter:
     @property
     def active(self) -> bool:
         return bool(
-            self.text or self.start or self.end or self.statuses or self.supplier_id
+            self.text or self.start or self.end or self.statuses or self.origins
+            or self.supplier_id
             or self.recipient or self.amount_from is not None or self.amount_to is not None
             or self.responsible or self.operation or self.over_limit is not None
             or self.suppliers_only
@@ -122,6 +126,10 @@ class Filter:
             marks = ", ".join("?" for _ in self.statuses)
             parts.append(f"status IN ({marks})")
             values.extend(status.value for status in self.statuses)
+        if self.origins:
+            marks = ", ".join("?" for _ in self.origins)
+            parts.append(f"origin IN ({marks})")
+            values.extend(origin.value for origin in self.origins)
         if self.supplier_id:
             parts.append("supplier_id = ?")
             values.append(self.supplier_id)

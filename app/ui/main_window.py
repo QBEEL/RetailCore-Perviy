@@ -9,11 +9,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -35,37 +35,22 @@ from ..core.payments import data as payments_data
 from ..core.payments import transport
 from .admin_page import AdminPage
 from .suppliers_page import SuppliersPage
+from .pages import PAGES, index_of
 from .theme import Metrics, Palette
 from .update_check import UpdateChecker
+from .widgets.base_toggle import BaseToggle
 from .widgets.common import fade_in
 from .widgets.toast import ToastKind, ToastManager
 from .widgets.update_dialog import UpdateDialog
 
-PAGES = (
-    ("Сопоставление", "match", "Ctrl+1"),
-    ("Заказ", "order", "Ctrl+2"),
-    ("Быстрая смена цен", "price", "Ctrl+3"),
-    ("Оплаты", "payments", "Ctrl+4"),
-    ("Поставщики", "suppliers", "Ctrl+5"),
-    # Сочетание буквенное, а не следующее по счёту: ряд Ctrl+1…Ctrl+0 занят
-    # целиком, и вставка в его середину сдвинула бы все привычные сочетания
-    # ради одного нового раздела.
-    ("Маркировка", "marking", "Ctrl+M"),
-    ("Отчётность", "report", "Ctrl+6"),
-    ("Каталог", "catalog", "Ctrl+7"),
-    ("История данных", "history", "Ctrl+8"),
-    ("Настройки", "settings", "Ctrl+9"),
-    # Последняя страница, поэтому Ctrl+0: Ctrl+10 не существует, а разрывать
-    # ряд ради неё пришлось бы во всех остальных сочетаниях.
-    ("Администрирование", "admin", "Ctrl+0"),
-)
-
-# Номера страниц в стопке — по порядку PAGES.
-PAGE_PAYMENTS = 3
-PAGE_SUPPLIERS = 4
-PAGE_MARKING = 5
-PAGE_REPORTS = 6
-PAGE_ADMIN = 10
+# Номера страниц в стопке — по порядку PAGES. Считаются по коду, а не пишутся
+# числами: новый раздел в середине списка иначе тихо сдвинул бы половину из них.
+PAGE_PAYMENTS = index_of("payments")
+PAGE_SUPPLIERS = index_of("suppliers")
+PAGE_MARKING = index_of("marking")
+PAGE_REPORTS = index_of("reports")
+PAGE_ADMIN = index_of("admin")
+PAGE_MATCH = index_of("match")
 # Личный кабинет добавлен после списка, а не внутрь него: вставка в середину
 # сдвинула бы все номера страниц и сочетания клавиш, к которым люди привыкли.
 PAGE_PROFILE = len(PAGES)
@@ -154,6 +139,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._restore_geometry()
         self._lock_server_pages()
+        self._sync_page_access()
         self.match_page.restore()
         self.pages.currentChanged.connect(self._on_page_changed)
         if self.offline:
@@ -190,31 +176,37 @@ class MainWindow(QMainWindow):
         # оплаты, заведённые «не там», обнаруживаются только когда их
         # хватились. Переключатель — администратору, остальные работают в
         # общей базе всегда, и выбирать им не из чего.
-        self._base_button = QPushButton("", bar)
-        self._base_button.setObjectName("BaseChip")
-        base_menu = QMenu(self._base_button)
-        self._shared_action = base_menu.addAction(
-            "Общая база на сервере", lambda: self.set_local_base(False))
-        self._local_action = base_menu.addAction(
-            "Локальная база этого компьютера", lambda: self.set_local_base(True))
-        for action in (self._shared_action, self._local_action):
-            action.setCheckable(True)
-        base_menu.addSeparator()
-        self._upload_action = base_menu.addAction(
-            "Выгрузить локальные оплаты на сервер…", self.upload_local_base)
-        self._base_button.setMenu(base_menu)
-        layout.addWidget(self._base_button)
-        self._sync_base_button()
+        self._base_row = QWidget(bar)
+        base_row_layout = QHBoxLayout(self._base_row)
+        base_row_layout.setContentsMargins(0, 0, 0, 12)
+        base_row_layout.setSpacing(6)
+
+        self._base_toggle = BaseToggle(self._base_row)
+        self._base_toggle.setToolTip(
+            "Какая база в работе — общая на сервере или локальная на этом компьютере")
+        self._base_toggle.toggled.connect(self.set_local_base)
+        base_row_layout.addWidget(self._base_toggle, 1)
+
+        self._upload_button = QToolButton(self._base_row)
+        self._upload_button.setObjectName("BaseUploadButton")
+        self._upload_button.setIcon(icons.icon("export"))
+        self._upload_button.setToolTip("Выгрузить локальные оплаты на сервер…")
+        self._upload_button.clicked.connect(self.upload_local_base)
+        self._upload_button.setVisible(False)
+        base_row_layout.addWidget(self._upload_button)
+
+        layout.addWidget(self._base_row)
+        self._sync_base_button(animate=False)
 
         self._nav_group = QButtonGroup(bar)
         self._nav_group.setExclusive(True)
-        for index, (title, icon_name, shortcut) in enumerate(PAGES):
-            button = QPushButton(f"  {title}", bar)
+        for index, page in enumerate(PAGES):
+            button = QPushButton(f"  {page.title}", bar)
             button.setObjectName("NavButton")
             button.setCheckable(True)
             button.setChecked(index == 0)
-            button.setIcon(icons.icon(icon_name))
-            button.setToolTip(f"{title} ({shortcut})")
+            button.setIcon(icons.icon(page.icon))
+            button.setToolTip(f"{page.title} ({page.shortcut})")
             button.clicked.connect(lambda _=False, i=index: self.show_page(i))
             self._nav_group.addButton(button, index)
             layout.addWidget(button)
@@ -246,22 +238,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
         return bar
 
-    def _sync_base_button(self) -> None:
-        """Подпись и вид кнопки базы. Не администратору её показывать не за чем."""
+    def _sync_base_button(self, animate: bool = True) -> None:
+        """Положение переключателя базы. Не администратору его показывать не за чем."""
         allowed = transport.session.active and transport.session.is_admin
-        self._base_button.setVisible(allowed)
+        self._base_row.setVisible(allowed)
         if not allowed:
             return
         local = payments_data.local_only()
-        self._shared_action.setChecked(not local)
-        self._local_action.setChecked(local)
-        self._upload_action.setEnabled(local)
-        self._base_button.setText("  Локальная база" if local else "  Общая база")
-        self._base_button.setProperty("local", local)
-        # Смена свойства сама по себе стиль не пересчитывает — Qt перечитывает
-        # правила только по указанию.
-        self._base_button.style().unpolish(self._base_button)
-        self._base_button.style().polish(self._base_button)
+        self._base_toggle.set_local(local, animate=animate)
+        was_visible = self._upload_button.isVisible()
+        self._upload_button.setVisible(local)
+        if animate and local and not was_visible:
+            fade_in(self._upload_button)
 
     def set_local_base(self, local: bool) -> None:
         """Переключает источник оплат и перечитывает то, что уже показано."""
@@ -274,7 +262,7 @@ class MainWindow(QMainWindow):
         self.payments_page.reload()
         self.notify(
             "Оплаты идут в локальную базу этого компьютера. Выгрузить их в "
-            "общую можно там же, в меню базы." if local else
+            "общую можно кнопкой рядом с переключателем." if local else
             "Оплаты снова читаются и пишутся в общую базу отдела.",
             ToastKind.WARNING if local else ToastKind.SUCCESS)
 
@@ -321,19 +309,61 @@ class MainWindow(QMainWindow):
         self._admin_button.setVisible(allowed)
         self._sync_profile_button()
         self._sync_base_button()
+        self._sync_page_access()
         if not allowed and self.pages.currentIndex() == PAGE_ADMIN:
             # Вышли из общей базы, стоя на этом разделе: оставлять открытой
             # страницу, которой больше нет в меню, нельзя.
-            self.show_page(0)
+            self._open(self._first_open_page())
 
-    def show_page(self, index: int) -> None:
+    def _sync_page_access(self) -> None:
+        """Убирает из меню разделы, закрытые администратором этой учётке."""
+        for index, page in enumerate(PAGES):
+            if not page.managed:
+                continue
+            if button := self._nav_group.button(index):
+                button.setVisible(transport.session.may_open(page.code))
+        if not self._page_allowed(self.pages.currentIndex()):
+            # Без уведомления: при запуске человек ничего не нажимал, а
+            # объяснять закрытый раздел тому, кто его и не открывал, незачем.
+            self._open(self._first_open_page())
+
+    def _page_allowed(self, index: int) -> bool:
+        if index >= len(PAGES):
+            # Личный кабинет: туда ходят менять пароль и выходить из учётки, и
+            # закрывать его нечем — он и есть выход из положения.
+            return True
+        page = PAGES[index]
+        if index == PAGE_ADMIN:
+            return transport.session.active and transport.session.is_admin
+        return not page.managed or transport.session.may_open(page.code)
+
+    def _first_open_page(self) -> int:
+        """Куда отправить человека, когда открытая страница ему закрыта."""
+        for index in range(len(PAGES)):
+            if self._page_allowed(index):
+                return index
+        return PAGE_PROFILE
+
+    def show_page(self, index: int) -> bool:
+        """Открывает раздел. Ложь — он закрыт, и переход не состоялся."""
+        if not self._page_allowed(index):
+            # Молчать здесь нельзя: человек нажал Ctrl+M, ничего не произошло,
+            # и решит, что программа сломалась, а не что раздел ему закрыли.
+            self.notify(f"Раздел «{PAGES[index].title}» закрыт администратором",
+                        ToastKind.WARNING)
+            return False
+        self._open(index)
+        return True
+
+    def _open(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
         if button := self._nav_group.button(index):
             button.setChecked(True)
 
     def show_supplier(self, supplier_id: int) -> None:
         """Открывает карточку поставщика — переход с цен или с оплат."""
-        self.show_page(PAGE_SUPPLIERS)
+        if not self.show_page(PAGE_SUPPLIERS):
+            return
         self.suppliers_page.show_supplier(supplier_id)
 
     def plan_payment(
@@ -353,7 +383,8 @@ class MainWindow(QMainWindow):
         комментарий и дата, посчитанная по отсрочке. Ничего не сохраняется —
         решение остаётся за пользователем.
         """
-        self.show_page(PAGE_PAYMENTS)
+        if not self.show_page(PAGE_PAYMENTS):
+            return
         self.payments_page.restore()
         self.payments_page.plan_from_module(
             recipient=recipient,
@@ -433,8 +464,8 @@ class MainWindow(QMainWindow):
     # --- горячие клавиши ------------------------------------------------------
 
     def _build_actions(self) -> None:
-        for index, (_, _, shortcut) in enumerate(PAGES):
-            self._add_action(shortcut, lambda i=index: self.show_page(i))
+        for index, page in enumerate(PAGES):
+            self._add_action(page.shortcut, lambda i=index: self.show_page(i))
         self._add_action("F5", self._run_current)
         self._add_action(QKeySequence.StandardKey.Save, self._save_current)
         self._add_action(QKeySequence.StandardKey.Find, self._focus_search)
@@ -464,8 +495,7 @@ class MainWindow(QMainWindow):
             self.reports_page.run_build()
         elif page is self.marking_page:
             self.marking_page.run_check()
-        else:
-            self.show_page(0)
+        elif self.show_page(PAGE_MATCH):
             self.match_page.run_matching()
 
     def _save_current(self) -> None:

@@ -1,8 +1,12 @@
 """Сетка месяца: суммы и платежи по дням с цветовой индикацией.
 
-Цвет показывает сумму за день, а просрочка — рамкой, не цветом. Иначе
-просроченные тридцать тысяч потерялись бы в зелёном дне, а именно они требуют
-внимания в первую очередь.
+Цвет показывает сумму за день, а просрочка — отдельной точкой, не цветом.
+Иначе просроченные тридцать тысяч потерялись бы в зелёном дне, а именно они
+требуют внимания в первую очередь.
+
+Клетка обходится без рамок: сорок две обведённые ячейки складывались в рябь, в
+которой терялось и содержимое, и пометки «сегодня» и «просрочено». День держит
+форму фоном, а пометки — заливкой числа и точкой.
 
 Пороги цвета берутся из настроек. Значения по умолчанию подобраны по истории:
 медиана дня с оплатами — 1,43 млн, и шкала в сотнях тысяч покрасила бы красным
@@ -20,6 +24,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -31,8 +36,8 @@ from PySide6.QtWidgets import (
 from ...core.payments import DEFAULT_DAY_LEVELS, Day, DayLevel, Payment, WEEKDAYS
 from ..theme import Metrics, Palette
 
-# Цвет уровня: рамка и фон. Зелёный не выделяется вовсе — спокойный день не
-# должен притягивать взгляд.
+# Цвет уровня: сумма и фон клетки. Зелёный не выделяется вовсе — спокойный
+# день не должен притягивать взгляд.
 LEVEL_COLORS: dict[DayLevel, tuple[str, str]] = {
     DayLevel.EMPTY: (Palette.BORDER, Palette.SURFACE),
     DayLevel.LIGHT: (Palette.SUCCESS, "#f0fdf4"),
@@ -40,6 +45,10 @@ LEVEL_COLORS: dict[DayLevel, tuple[str, str]] = {
     DayLevel.HIGH: ("#ea580c", "#fff7ed"),
     DayLevel.CRITICAL: (Palette.DANGER, "#fef2f2"),
 }
+
+# Сторона кружка с числом дня. Нечётной она быть не должна: радиус считается
+# половиной, и на нечётной кружок выходит скошенным.
+DAY_BADGE = 18
 
 MIME_PAYMENT = "application/x-retailcore-payment"
 
@@ -126,23 +135,43 @@ class DayCell(QFrame):
         self.day: date | None = None
         self.data: Day | None = None
         self._style = ""
-        self.setMinimumHeight(84)
+        # Стиль клетки задаётся по имени, а не селектором QFrame: QLabel в Qt —
+        # наследник QFrame, и общее правило обводило рамкой каждую подпись
+        # внутри, превращая клетку в россыпь пустых полей.
+        self.setObjectName("DayCell")
+        self.setMinimumHeight(72)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(2)
+        layout.setContentsMargins(7, 5, 7, 5)
+        layout.setSpacing(1)
 
-        head = QLabel("", self)
-        head.setStyleSheet("font-size: 13px; font-weight: 600;")
-        self.number = head
-        layout.addWidget(head)
+        # Число и сумма — в одной строке: раздельными они занимали две строки
+        # из трёх, и на сами платежи в клетке места почти не оставалось.
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(4)
+
+        self.number = QLabel("", self)
+        self.number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.number.setFixedSize(DAY_BADGE, DAY_BADGE)
+        head.addWidget(self.number)
+
+        # Просрочка — точкой. Цвет в клетке занят суммой дня, а красить им ещё
+        # и просрочку значило бы путать «много денег» с «пропустили срок».
+        self.alert = QLabel("", self)
+        self.alert.setFixedSize(6, 6)
+        self.alert.setStyleSheet(
+            f"background: {Palette.DANGER}; border-radius: 3px;")
+        self.alert.hide()
+        head.addWidget(self.alert)
+        head.addStretch(1)
 
         self.total = QLabel("", self)
-        self.total.setStyleSheet("font-size: 12px; font-weight: 600;")
-        layout.addWidget(self.total)
+        head.addWidget(self.total)
+        layout.addLayout(head)
 
         self.detail = QLabel("", self)
         self.detail.setObjectName("Hint")
@@ -165,37 +194,41 @@ class DayCell(QFrame):
             self.number.setText("")
             self.total.setText("")
             self.detail.setText("")
-            self._style = "background: transparent; border: none;"
+            self.alert.hide()
+            self._style = "QFrame#DayCell { background: transparent; }"
             self.setStyleSheet(self._style)
             self.setToolTip("")
             return
 
         level = data.level(levels) if data is not None else DayLevel.EMPTY
-        border, background = LEVEL_COLORS[level]
+        accent, background = LEVEL_COLORS[level]
         weekend = day.weekday() >= 5
         if muted:
             background = Palette.SURFACE_ALT
-            border = Palette.BORDER
         elif weekend and level is DayLevel.EMPTY:
             background = Palette.SURFACE_ALT
 
-        width = 1
-        if data is not None and data.overdue:
-            # Просрочка помечается рамкой: цвет занят суммой, а пропустить
-            # просроченный платёж нельзя даже в спокойный день.
-            border, width = Palette.DANGER, 2
-        elif today is not None and day == today:
-            border, width = Palette.PRIMARY, 2
-
         self._style = (
-            f"QFrame {{ background: {background}; border: {width}px solid {border};"
+            f"QFrame#DayCell {{ background: {background};"
             f" border-radius: {Metrics.RADIUS_SM}px; }}")
         self.setStyleSheet(self._style)
 
         colour = Palette.TEXT_FAINT if muted else (
             Palette.TEXT_MUTED if weekend else Palette.TEXT)
         self.number.setText(str(day.day))
-        self.number.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {colour};")
+        if today is not None and day == today and not muted:
+            # Сегодня — заливкой числа, а не рамкой вокруг клетки: рамка спорила
+            # с соседними клетками за внимание и ломала ровность сетки.
+            self.number.setStyleSheet(
+                f"font-size: 11px; font-weight: 700;"
+                f" color: {Palette.TEXT_ON_PRIMARY}; background: {Palette.PRIMARY};"
+                f" border-radius: {DAY_BADGE // 2}px;")
+        else:
+            self.number.setStyleSheet(
+                f"font-size: 12px; font-weight: 600; color: {colour};"
+                " background: transparent;")
+
+        self.alert.setVisible(bool(data is not None and data.overdue and not muted))
 
         if data is None or not data.count:
             self.total.setText("")
@@ -292,8 +325,15 @@ class MonthGrid(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.levels = DEFAULT_DAY_LEVELS
+        # Подложка темнее клеток: без неё белые клетки лежали на почти белом
+        # фоне страницы и сливались с ним в одно поле. Края дней теперь держат
+        # промежутки между плитками, а не рамка вокруг каждой.
+        self.setObjectName("MonthGrid")
+        self.setStyleSheet(
+            f"QWidget#MonthGrid {{ background: {Palette.BORDER};"
+            f" border-radius: {Metrics.RADIUS}px; }}")
         layout = QGridLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(4)
 
         for column, name in enumerate(WEEKDAYS):
