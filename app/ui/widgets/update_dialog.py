@@ -167,10 +167,11 @@ class UpdateDialog(QWidget):
         self._primary.setVisible(True)
         self._wire(self._primary, self.close)
 
-    def _show_error(self, message: str) -> None:
+    def _show_error(self, message: str,
+                    title: str = "Не удалось проверить обновления") -> None:
         self._reset_buttons()
         self._icon.setPixmap(icons.icon("warning", Palette.WARNING).pixmap(28, 28))
-        self._title.setText("Не удалось проверить обновления")
+        self._title.setText(title)
         self._message.setText(message)
         self._changelog.setText("")
         self._progress.setVisible(False)
@@ -225,8 +226,29 @@ class UpdateDialog(QWidget):
         self.checker.download(manifest)
 
     def _restart(self) -> None:
+        """Ставит обновление. Молчать при отказе нельзя.
+
+        Исключение из слота Qt приложение не роняет — оно лишь печатает след в
+        поток, которого пользователь не видит. Именно так выглядела ошибка на
+        macOS: нажатие «Перезапустить сейчас» не делало ничего.
+        """
+        try:
+            updater.apply_update(self._downloaded_path)
+        except updater.ManualInstallRequired as reason:
+            updater.log_event(f"Manual install required: {reason}")
+            # Образ открывается сам: человеку остаётся перетащить программу, а
+            # не искать, куда делся скачанный файл.
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_path))
+            self._show_error(str(reason), "Установите новую версию сами")
+            self.show()
+            return
+        except OSError as failure:
+            updater.log_event(f"Update failed: {failure}")
+            self._show_error(f"Не удалось установить обновление: {failure}",
+                             "Обновление не установилось")
+            self.show()
+            return
         updater.log_event("Update successful")
-        updater.apply_update(self._downloaded_path)
         QApplication.instance().quit()
 
     def _remind_later(self, manifest: updater.ReleaseManifest) -> None:

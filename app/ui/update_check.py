@@ -15,7 +15,6 @@ GITHUB_OWNER = "QBEEL"
 GITHUB_REPO = "RetailCore-Perviy"
 
 _API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-_EXE_ASSET = "RetailCore.exe"
 _MANIFEST_ASSET = "version.json"
 _USER_AGENT = b"RetailCore-Updater"
 
@@ -55,7 +54,9 @@ class UpdateChecker(QObject):
         try:
             data = json.loads(bytes(reply.readAll()).decode("utf-8"))
             assets = {asset["name"]: asset["browser_download_url"] for asset in data["assets"]}
-            exe_url = assets[_EXE_ASSET]
+            # Файл своей платформы: на macOS это образ, а не сборка для
+            # Windows, которую здесь скачивали до версии 3.3.1.
+            exe_url = assets[updater.release_asset()]
             manifest_url = assets[_MANIFEST_ASSET]
             version = str(data["tag_name"]).lstrip("vV")
         except (KeyError, ValueError, TypeError) as exc:
@@ -89,7 +90,7 @@ class UpdateChecker(QObject):
                 version=version,
                 exe_url=exe_url,
                 mandatory=bool(data.get("mandatory", False)),
-                sha256=str(data.get("sha256", "")),
+                sha256=updater.manifest_hash(data),
                 changelog=[str(item) for item in data.get("changelog", [])],
             )
         except (ValueError, TypeError) as exc:
@@ -112,7 +113,7 @@ class UpdateChecker(QObject):
             return
         directory = Path(tempfile.gettempdir()) / "RetailCore" / "update"
         directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / _EXE_ASSET
+        destination = directory / updater.release_asset()
         self._download_file = open(destination, "wb")
         self._download_path = str(destination)
         self._download_manifest = manifest

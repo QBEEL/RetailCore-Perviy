@@ -65,18 +65,11 @@ jobs:
           $size = (Get-Item $exe).Length / 1MB
           Write-Host "RetailCore.exe: $([math]::Round($size, 1)) MB"
 
-      # Манифест автообновления. Собирается здесь, рядом с exe: контрольная
-      # сумма считается по тому самому файлу, который уйдёт в релиз.
-      - name: Build version.json
-        run: python tools/make_version_json.py dist/RetailCore.exe CHANGELOG.md dist/version.json
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RetailCore-Windows
-          path: |
-            dist/RetailCore.exe
-            dist/version.json
+          path: dist/RetailCore.exe
           retention-days: 30
 
   # ─────────────────────────────── macOS ──────────────────────────────────
@@ -149,6 +142,15 @@ jobs:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
+      # Код нужен ради tools/ и CHANGELOG.md: манифест собирается здесь.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -165,6 +167,15 @@ jobs:
         id: version
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
+      # Манифест собирается здесь, а не в сборке под Windows: сумма нужна для
+      # обоих файлов, а рядом они оказываются только на этом шаге. Клиент
+      # сверяет сумму того файла, который скачал сам, — на macOS это образ.
+      - name: Build version.json
+        run: |
+          python tools/make_version_json.py \
+            artifacts/RetailCore.exe CHANGELOG.md artifacts/version.json \
+            artifacts/RetailCore.dmg
+
       # Без version.json проверка обновлений у клиента обрывается на KeyError и
       # показывает «Неожиданный ответ GitHub» — релиз с двумя файлами вместо
       # трёх выглядит целым, но оставляет всех на старой версии.
@@ -173,7 +184,19 @@ jobs:
           for name in RetailCore.exe RetailCore.dmg version.json; do
             test -f "artifacts/$name" || { echo "::error::Нет файла $name"; exit 1; }
           done
-          echo "версия в манифесте: $(python -c "import json;print(json.load(open('artifacts/version.json'))['version'])")"
+          # Обе суммы обязательны: без своей платформа отклоняет скачанное как
+          # повреждённое, и обновление не ставится ни у кого на этой системе.
+          python - <<'PY'
+          import hashlib, json, pathlib, sys
+          manifest = json.loads(pathlib.Path("artifacts/version.json").read_text("utf-8"))
+          print("версия в манифесте:", manifest["version"])
+          for key, name in (("sha256", "RetailCore.exe"), ("sha256_macos", "RetailCore.dmg")):
+              actual = hashlib.sha256(pathlib.Path("artifacts", name).read_bytes()).hexdigest()
+              if manifest.get(key, "").lower() != actual:
+                  print(f"::error::{key} не совпадает с {name}")
+                  sys.exit(1)
+              print(f"{key} сходится с {name}")
+          PY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

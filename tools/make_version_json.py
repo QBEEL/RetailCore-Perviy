@@ -10,7 +10,11 @@
 версии в CHANGELOG.md. Передавать их аргументами значило бы держать номер
 версии в трёх местах и однажды выложить манифест от предыдущей сборки.
 
-Запуск:  python tools/make_version_json.py <exe> <CHANGELOG.md> <куда>
+Сумм в манифесте две: `sha256` для сборки Windows и `sha256_macos` для образа.
+Одной не хватает — клиент сверяет контрольную сумму того файла, который скачал
+сам, а файлы у платформ разные.
+
+Запуск:  python tools/make_version_json.py <exe> <CHANGELOG.md> <куда> [dmg]
 """
 from __future__ import annotations
 
@@ -56,7 +60,8 @@ def changelog_for(version: str, changelog: Path) -> list[str]:
     return lines
 
 
-def build(exe: Path, changelog: Path, target: Path, *, root: Path | None = None) -> dict:
+def build(exe: Path, changelog: Path, target: Path, *,
+          dmg: Path | None = None, root: Path | None = None) -> dict:
     version = app_version(root)
     manifest = {
         "version": version,
@@ -64,10 +69,19 @@ def build(exe: Path, changelog: Path, target: Path, *, root: Path | None = None)
         # запирает работу до установки новой версии.
         "mandatory": False,
         "changelog": changelog_for(version, changelog),
-        "sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+        # Ключ `sha256` закреплён за сборкой для Windows: его читают уже
+        # выпущенные версии, и переносить их на другое имя нельзя — они
+        # перестали бы обновляться. Образ macOS получает свой ключ.
+        "sha256": _digest(exe),
     }
+    if dmg is not None:
+        manifest["sha256_macos"] = _digest(dmg)
     target.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", "utf-8")
     return manifest
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def use_utf8_output() -> None:
@@ -85,16 +99,24 @@ def use_utf8_output() -> None:
 
 def main() -> int:
     use_utf8_output()
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         print(__doc__)
         return 2
-    exe, changelog, target = (Path(argument) for argument in sys.argv[1:])
-    if not exe.is_file():
-        print(f"Не найден файл сборки: {exe}")
-        return 1
-    manifest = build(exe, changelog, target)
+    exe, changelog, target = (Path(argument) for argument in sys.argv[1:4])
+    dmg = Path(sys.argv[4]) if len(sys.argv) == 5 else None
+    for required in (exe, dmg):
+        if required is not None and not required.is_file():
+            print(f"Не найден файл сборки: {required}")
+            return 1
+    manifest = build(exe, changelog, target, dmg=dmg)
     print(f"версия: {manifest['version']}")
-    print(f"sha256: {manifest['sha256']}")
+    print(f"sha256 windows: {manifest['sha256']}")
+    if dmg is None:
+        # macOS качает образ и сверяет сумму, которой в манифесте нет, —
+        # обновление отвалится на проверке целостности у каждого.
+        print("ВНИМАНИЕ: образ macOS не передан, ключа sha256_macos нет")
+    else:
+        print(f"sha256 macos:   {manifest['sha256_macos']}")
     print(f"changelog: {len(manifest['changelog'])} строк")
     if not manifest["changelog"]:
         # Не ошибка, но в окне обновления людям будет нечего прочитать.
