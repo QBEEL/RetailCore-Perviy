@@ -22,8 +22,18 @@ from .codes import (
     parse_many,
     split_lines,
 )
+from .onec import (
+    Catalog,
+    Item,
+    LineMatch,
+    MatchKind,
+    OnecProblem,
+    read_catalog,
+)
+from .reconcile import LineProgress, Reconciliation, Scan, Verdict
 from .session import Organisation
 from .suz import Credentials
+from .upd import Document, Line, Mark, UpdProblem, read as read_upd
 from .models import (
     BATCH_SIZE,
     REQUESTS_PER_SECOND,
@@ -49,13 +59,26 @@ __all__ = [
     "CodeState",
     "Contour",
     "Credentials",
+    "Catalog",
+    "Document",
     "GROUPS",
+    "Item",
+    "Line",
+    "LineMatch",
+    "LineProgress",
+    "Mark",
+    "MatchKind",
+    "OnecProblem",
     "Operation",
     "Organisation",
     "OperationKind",
     "OperationStatus",
     "ProductGroup",
     "REQUESTS_PER_SECOND",
+    "Reconciliation",
+    "Scan",
+    "UpdProblem",
+    "Verdict",
     "fingerprint",
     "group_of",
     "gtin_valid",
@@ -63,5 +86,7 @@ __all__ = [
     "parse",
     "parse_many",
     "parse_state",
+    "read_catalog",
+    "read_upd",
     "split_lines",
 ]

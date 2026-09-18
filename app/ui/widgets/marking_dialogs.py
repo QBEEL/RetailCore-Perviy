@@ -1,4 +1,9 @@
-"""Диалоги маркировки: под какой организацией входить.
+"""Диалоги маркировки: под какой организацией входить и чем товар приходуется.
+
+Общее у них одно: программа не решает за человека там, где ошибка незаметна.
+Вход не под той организацией и коды, заведённые чужой номенклатуре, выясняются
+много позже — поэтому оба решения спрашиваются окном, а ответ запоминается,
+чтобы спрашивать во второй раз не пришлось.
 
 Сертификат по машиночитаемой доверенности действует за нескольких участников
 оборота, и система не выбирает за нас: на вход без ИНН боевой контур отвечает
@@ -34,6 +39,10 @@ from .common import Hint, SectionTitle
 
 # Длина ИНН: у организации десять знаков, у предпринимателя двенадцать.
 INN_LENGTHS = (10, 12)
+
+# Сколько строк номенклатуры показывать по поиску. Список в тысячу строк не
+# помогает выбрать, а сообщение «уточните запрос» — помогает.
+MAX_FOUND = 200
 
 
 class OrganisationDialog(QDialog):
@@ -234,3 +243,136 @@ class OrderConfirmDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+
+class NomenclatureDialog(QDialog):
+    """Выбор номенклатуры 1С для строки документа, не сошедшейся сама.
+
+    Открывается, когда поставщик назвал товар иначе, чем он называется в базе.
+    Сверху — ближайшие по названию, ниже — поиск по всей выгрузке: похожие
+    угадываются не всегда, и упереться в короткий список нельзя.
+
+    Выбранное запоминается по GTIN и больше не спрашивается. Это и есть смысл
+    окна: назвать соответствие один раз, а не на каждой поставке. Поэтому же
+    здесь показан GTIN — именно он, а не название, свяжет товар в следующий раз.
+    """
+
+    def __init__(self, line, catalog, parent: QWidget | None = None,
+                 current_key: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Номенклатура 1С")
+        self.setModal(True)
+        self.setMinimumWidth(640)
+        self._line = line
+        self._catalog = catalog
+        self._shown: list = []
+        self._build()
+        self._fill(catalog.similar(line.name), current_key)
+
+    # --- разметка ---------------------------------------------------------------
+
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
+        root.setSpacing(Metrics.GAP)
+
+        root.addWidget(SectionTitle(self._line.title, self))
+        gtin = f" · код товара {self._line.gtin}" if self._line.gtin else ""
+        root.addWidget(Hint(
+            f"Так этот товар назван в документе поставщика{gtin}. Выберите, чем "
+            "он приходуется в 1С — выбор запомнится по коду товара и больше "
+            "спрашиваться не будет.", self))
+
+        self.search = QLineEdit(self)
+        self.search.setPlaceholderText(
+            "Поиск по всей номенклатуре — слово из названия или код")
+        self.search.textChanged.connect(self._on_search)
+        root.addWidget(self.search)
+
+        self.list = QListWidget(self)
+        self.list.itemDoubleClicked.connect(lambda _: self.accept())
+        self.list.currentRowChanged.connect(self._sync_buttons)
+        root.addWidget(self.list, 1)
+
+        self.note = Hint("", self)
+        root.addWidget(self.note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self)
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("Привязать")
+        self.ok_button.setObjectName("Primary")
+        self.ok_button.setIcon(icons.icon("link"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        # Снять привязку нужно там же, где её ставят: ошибочная привязка иначе
+        # переживёт все последующие поставки молча.
+        self.clear_button = buttons.addButton("Снять привязку",
+                                              QDialogButtonBox.ButtonRole.ResetRole)
+        self.clear_button.setIcon(icons.icon("unlink"))
+        self.clear_button.clicked.connect(self._unlink)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    # --- список -----------------------------------------------------------------
+
+    def _fill(self, items, current_key: str = "") -> None:
+        self._shown = list(items)
+        self.list.clear()
+        for item in self._shown:
+            entry = QListWidgetItem(f"{item.name}   ·   {item.short}", self.list)
+            entry.setData(Qt.ItemDataRole.UserRole, item)
+        if current_key:
+            for row, item in enumerate(self._shown):
+                if item.key == current_key:
+                    self.list.setCurrentRow(row)
+                    break
+        if self.list.currentRow() < 0 and self._shown:
+            self.list.setCurrentRow(0)
+        self._sync_note()
+        self._sync_buttons()
+
+    def _on_search(self, text: str) -> None:
+        wanted = text.strip().casefold().replace("ё", "е")
+        if not wanted:
+            self._fill(self._catalog.similar(self._line.name))
+            return
+        words = wanted.split()
+        found = [item for item in self._catalog.items
+                 if all(word in f"{item.name} {item.code}".casefold().replace("ё", "е")
+                        for word in words)]
+        self._fill(found[:MAX_FOUND])
+
+    def _sync_note(self) -> None:
+        if not self._shown:
+            self.note.setText(
+                "Ничего не нашлось. Если этого товара в 1С ещё нет, заведите "
+                "его и перечитайте выгрузку — привязать не к чему.")
+            self.note.setStyleSheet(f"color: {Palette.WARNING};")
+            return
+        self.note.setStyleSheet("")
+        self.note.setText(
+            f"Показано: {len(self._shown)}. Без поиска это ближайшие по названию."
+            if not self.search.text().strip() else f"Найдено: {len(self._shown)}")
+
+    def _sync_buttons(self) -> None:
+        self.ok_button.setEnabled(self.list.currentRow() >= 0)
+
+    def _unlink(self) -> None:
+        self._cleared = True
+        self.accept()
+
+    # --- результат ---------------------------------------------------------------
+
+    @property
+    def cleared(self) -> bool:
+        """Нажата ли «Снять привязку» вместо выбора."""
+        return getattr(self, "_cleared", False)
+
+    @property
+    def chosen(self):
+        if self.cleared:
+            return None
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None

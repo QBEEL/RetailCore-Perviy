@@ -494,7 +494,9 @@ class MainWindow(QMainWindow):
         elif page is self.reports_page:
             self.reports_page.run_build()
         elif page is self.marking_page:
-            self.marking_page.run_check()
+            # Страница решает сама: подвкладок на ней три, и «запустить» на
+            # каждой значит своё.
+            self.marking_page.run_current()
         elif self.show_page(PAGE_MATCH):
             self.match_page.run_matching()
 
@@ -506,6 +508,8 @@ class MainWindow(QMainWindow):
             self.order_page.save()
         elif page is self.reports_page:
             self.reports_page.save()
+        elif page is self.marking_page:
+            self.marking_page.save_current()
         else:
             self.match_page.save_results()
 

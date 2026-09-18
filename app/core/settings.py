@@ -87,6 +87,17 @@ class AppSettings:
     # что узнаётся он только обращением к закрытому ключу — спрашивать систему
     # заново на каждый вход значит требовать лишний пароль к контейнеру.
     marking_organisations: list[dict[str, str]] = field(default_factory=list)
+    # Звук при расхождении на сверке. По умолчанию включён: сверяют, глядя на
+    # товар, а не на экран, и расхождение должно быть слышно.
+    marking_reconcile_sound: bool = True
+    # Выгрузка номенклатуры 1С для сопоставления кодов. Помнится путь, а не
+    # содержимое: номенклатура меняется, и читать её надо заново, но выбирать
+    # один и тот же файл на каждой поставке — лишнее действие.
+    marking_onec_catalog: str = ""
+    # Привязки, сделанные руками: GTIN → код номенклатуры, характеристика и
+    # название для показа. Товар тот же самый от поставки к поставке, и второй
+    # раз спрашивать о нём незачем.
+    marking_onec_links: dict[str, dict[str, str]] = field(default_factory=dict)
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -272,6 +283,16 @@ class AppSettings:
             for item in (data.get("marking_organisations") or [])
             if isinstance(item, dict) and (inn := str(item.get("inn") or "").strip())
         ]
+        self.marking_reconcile_sound = bool(
+            data.get("marking_reconcile_sound", self.marking_reconcile_sound))
+        self.marking_onec_catalog = str(data.get("marking_onec_catalog", ""))
+        self.marking_onec_links = {
+            key: {"code": str(item.get("code") or ""),
+                  "feature": str(item.get("feature") or ""),
+                  "name": str(item.get("name") or "")}
+            for key, item in (data.get("marking_onec_links") or {}).items()
+            if isinstance(item, dict) and item.get("code")
+        }
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -342,6 +363,9 @@ class AppSettings:
             "marking_inn": self.marking_inn,
             "marking_organisation": self.marking_organisation,
             "marking_organisations": self.marking_organisations,
+            "marking_reconcile_sound": self.marking_reconcile_sound,
+            "marking_onec_catalog": self.marking_onec_catalog,
+            "marking_onec_links": self.marking_onec_links,
         }
 
     def remember_payment_import(self, path: str) -> None:

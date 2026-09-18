@@ -11,6 +11,12 @@ True API — оттуда сведения о кодах. В СУЗ, котор�
 кабинета. Отсюда отдельная карточка рядом с картой входа, а не строка в
 настройках.
 
+Третья работа — сверка с документом — не требует ни того, ни другого входа.
+Коды из УПД и коды с этикеток сравниваются на этом компьютере, и ни сеть, ни
+сертификат для этого не нужны. Стоит она отдельной подвкладкой потому, что
+отвечает на свой вопрос: проверка говорит, чей код и в обороте ли он, а сверка
+— то ли приехало, что написано в документе.
+
 Из операций доступна одна проверка: она ничего не меняет в ГИС МТ. Приёмки,
 отгрузки и вывода из оборота здесь нет намеренно — ядро их не отправляет (см.
 `STATUS_POLLING_READY` в `core/marking/service.py`), а кнопка, которой нечего
@@ -22,12 +28,14 @@ True API — оттуда сведения о кодах. В СУЗ, котор�
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Sequence
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -35,6 +43,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -56,13 +65,22 @@ from ..core.marking import (
     codes as codes_module,
 )
 from ..core.marking import orders as orders_module, service
+from ..core.marking import onec as onec_module
+from ..core.marking import reconcile as reconcile_module, upd as upd_module
+from ..core.marking.onec import Catalog, LineMatch, MatchKind, OnecProblem
 from ..core.marking.orders import ReleaseMethod
+from ..core.marking.reconcile import Reconciliation, Scan, Verdict
+from ..core.marking.upd import Document, Line, UpdProblem
 from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title
-from .widgets.marking_dialogs import OrderConfirmDialog, OrganisationDialog
+from .widgets.marking_dialogs import (
+    NomenclatureDialog,
+    OrderConfirmDialog,
+    OrganisationDialog,
+)
 from .widgets.toast import ToastKind
 
 # Сколько строк результата показывать. Проверяют тысячами, а глазами смотрят на
@@ -75,6 +93,20 @@ PARSE_DELAY = 250
 
 # Сколько последних операций показывать в журнале.
 JOURNAL_LIMIT = 50
+
+# Подвкладки по порядку работы: сначала узнать, что за коды, потом сверить с
+# документом, и отдельно — заказать свои.
+CHECK_TAB = 0
+RECONCILE_TAB = 1
+
+# Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
+# косится краем глаза, и различать ответы он должен цветом, а не чтением.
+VERDICT_COLORS: dict[Verdict, tuple[str, str]] = {
+    Verdict.MATCHED: (Palette.SUCCESS, Palette.SUCCESS_SOFT),
+    Verdict.REPEAT: (Palette.WARNING, Palette.WARNING_SOFT),
+    Verdict.UNKNOWN: (Palette.DANGER, Palette.DANGER_SOFT),
+    Verdict.BROKEN: (Palette.DANGER, Palette.DANGER_SOFT),
+}
 
 
 class MarkingPage(QWidget):
@@ -101,6 +133,17 @@ class MarkingPage(QWidget):
         # его обесценивает.
         self._suz_answer = ""
         self._orders: list = []
+        # Документ, с которым идёт сверка, и её ход. Живут, пока открыто окно:
+        # сверку начинают на приёмке и заканчивают через полчаса, уходя за
+        # каждой следующей коробкой, и терять её при переключении вкладки
+        # значило бы начинать сначала.
+        self._upd: Document | None = None
+        self._session: Reconciliation | None = None
+        # Номенклатура 1С и то, как на неё легли строки документа. Держится
+        # рядом со сверкой: выгрузка в 1С — её последний шаг, и разносить их
+        # по разным местам значит заставить искать документ дважды.
+        self._catalog: Catalog | None = None
+        self._matches: list[LineMatch] = []
         self._busy = False
         self._parse_timer = QTimer(self)
         self._parse_timer.setSingleShot(True)
@@ -108,6 +151,8 @@ class MarkingPage(QWidget):
         self._parse_timer.timeout.connect(self._reparse)
         self._build()
         self._restore_choices()
+        self._restore_catalog()
+        self._sync_reconcile()
         self._sync_state()
 
     # --- разметка -------------------------------------------------------------
@@ -122,16 +167,25 @@ class MarkingPage(QWidget):
         root.addWidget(Subtitle(
             "Проверка кодов спрашивает «Честный ЗНАК», что он знает о коде, и "
             "требует входа по сертификату. Заказ кодов идёт через СУЗ и требует "
-            "её реквизитов — это разные системы и разные способы представиться.",
+            "её реквизитов — это разные системы и разные способы представиться. "
+            "Сверка с УПД не требует ни входа, ни сети: документ и этикетки "
+            "сравниваются здесь.",
             self))
 
-        # Подвкладки, а не одна длинная страница: работы здесь две, и они не
+        # Подвкладки, а не одна длинная страница: работы здесь три, и они не
         # пересекаются. Проверка кодов идёт через ГИС МТ по сертификату, заказ —
-        # через СУЗ по её реквизитам, и держать перед глазами обе значит каждый
-        # раз выбирать, какая половина экрана сейчас не нужна.
+        # через СУЗ по её реквизитам, сверка не идёт никуда вовсе, и держать
+        # перед глазами все три значит каждый раз выбирать, какие две трети
+        # экрана сейчас не нужны.
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._check_tab(), icons.icon("marking"), "Проверка кодов")
+        self.tabs.addTab(self._reconcile_tab(), icons.icon("compare"),
+                         "Сверка кодов маркировки")
         self.tabs.addTab(self._order_tab(), icons.icon("order"), "Заказ кодов")
+        # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
+        # в поле сканирования при открытии вкладки — не удобство, а условие
+        # работы: иначе первый же код уедет в поле поиска или в никуда.
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
     def _check_tab(self) -> QWidget:
@@ -143,6 +197,25 @@ class MarkingPage(QWidget):
         body.addWidget(self._codes_card())
         body.addWidget(self._result_card(), 1)
         body.addWidget(self._journal_card())
+        return page
+
+    def _reconcile_tab(self) -> QWidget:
+        """Сверка приехавшего товара с кодами из УПД.
+
+        Стоит рядом с проверкой кодов, а не вместо неё: проверка спрашивает
+        «Честный ЗНАК», чей код и в обороте ли он, а сверка отвечает на другой
+        вопрос — то ли приехало, что написано в документе. Для сверки не нужны
+        ни сертификат, ни сеть: обе стороны сравнения лежат на этом компьютере.
+        """
+        page = QWidget(self)
+        body = QVBoxLayout(page)
+        body.setContentsMargins(0, Metrics.GAP, 0, 0)
+        body.setSpacing(Metrics.GAP)
+        body.addWidget(self._upd_card())
+        body.addWidget(self._scan_card())
+        body.addWidget(self._progress_card(), 1)
+        body.addWidget(self._onec_card())
+        body.addWidget(self._extra_card())
         return page
 
     def _order_tab(self) -> QWidget:
@@ -510,6 +583,231 @@ class MarkingPage(QWidget):
 
         self.journal_hint = Hint("", card)
         body.addWidget(self.journal_hint)
+        return card
+
+    # --- карточки сверки ------------------------------------------------------
+
+    def _upd_card(self) -> Card:
+        """Документ, с которым сверяемся.
+
+        Берётся тот самый XML, что приходит по ЭДО, — он лежит в папке рядом с
+        печатной формой, и в нём перечислен каждый экземпляр. Архив, скачанный
+        из Диадока целиком, тоже подходит: распаковывать его ради одного файла
+        человеку незачем.
+        """
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Документ", card))
+        header.addStretch(1)
+        self.upd_button = self._action(card, "Загрузить УПД", "open", self.load_upd)
+        self.upd_button.setObjectName("Primary")
+        self.upd_check_button = self._action(card, "Спросить «Честный ЗНАК»",
+                                             "marking", self.codes_to_check)
+        self.upd_check_button.setToolTip(
+            "Перенести коды документа на вкладку «Проверка кодов»: сверка "
+            "говорит, то ли приехало, а «Честный ЗНАК» — чьё оно и в обороте ли")
+        self.upd_report_button = self._action(card, "Акт сверки", "export",
+                                              self.save_report)
+        self.upd_forget_button = self._action(card, "Убрать", "clear", self.forget_upd)
+        for button in (self.upd_button, self.upd_check_button,
+                       self.upd_report_button, self.upd_forget_button):
+            header.addWidget(button)
+        body.addLayout(header)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(Metrics.GAP)
+        self.tile_upd_lines = MetricTile("Позиций", Palette.INFO, card)
+        self.tile_upd_codes = MetricTile("Кодов в документе", Palette.PRIMARY, card)
+        for tile in (self.tile_upd_lines, self.tile_upd_codes):
+            tiles.addWidget(tile, 1)
+        tiles.addStretch(2)
+        body.addLayout(tiles)
+
+        self.upd_hint = Hint("", card)
+        body.addWidget(self.upd_hint)
+        return card
+
+    def _scan_card(self) -> Card:
+        """Поле сканирования и ответ на последний скан.
+
+        Ответ вынесен в отдельную широкую плашку с цветом во всю ширину. Читать
+        его некогда: вещь в руках, следующая в коробке, и различаться ответы
+        должны раньше, чем прочитаны, — зелёное значит «клади», красное значит
+        «остановись».
+        """
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Сканирование", card))
+        header.addStretch(1)
+        self.undo_button = self._action(card, "Отменить скан", "reset",
+                                        self.undo_scan)
+        self.undo_button.setToolTip(
+            "Снять последний скан — если пикнули не ту вещь")
+        header.addWidget(self.undo_button)
+        self.restart_button = self._action(card, "Начать заново", "refresh",
+                                           self.restart_reconcile)
+        header.addWidget(self.restart_button)
+        body.addLayout(header)
+
+        self.scan_edit = QLineEdit(card)
+        self.scan_edit.setPlaceholderText(
+            "Наведите сканер на DataMatrix — код придёт сюда сам")
+        self.scan_edit.setMinimumHeight(38)
+        self.scan_edit.returnPressed.connect(self.accept_scan)
+        body.addWidget(self.scan_edit)
+
+        self.verdict_label = QLabel("", card)
+        self.verdict_label.setWordWrap(True)
+        self.verdict_label.setMinimumHeight(46)
+        self.verdict_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        body.addWidget(self.verdict_label)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(Metrics.GAP)
+        self.tile_scanned = MetricTile("Сверено", Palette.SUCCESS, card)
+        self.tile_left = MetricTile("Осталось", Palette.PRIMARY, card)
+        self.tile_extra = MetricTile("Лишних", Palette.DANGER, card)
+        self.tile_scan_repeats = MetricTile("Повторов", Palette.WARNING, card)
+        for tile in (self.tile_scanned, self.tile_left, self.tile_extra,
+                     self.tile_scan_repeats):
+            tiles.addWidget(tile, 1)
+        body.addLayout(tiles)
+
+        self.sound_box = QCheckBox("Звук при расхождении", card)
+        self.sound_box.setToolTip(
+            "Смотреть на экран после каждой вещи некогда — о расхождении лучше "
+            "услышать")
+        self.sound_box.setChecked(self.settings.marking_reconcile_sound)
+        self.sound_box.toggled.connect(self._on_sound_changed)
+        body.addWidget(self.sound_box)
+
+        self.scan_hint = Hint("", card)
+        body.addWidget(self.scan_hint)
+        return card
+
+    def _progress_card(self) -> Card:
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Позиции документа", card))
+        header.addStretch(1)
+        self.open_only_box = QCheckBox("Только незакрытые", card)
+        self.open_only_box.setToolTip(
+            "Оставить строки, по которым сверено не всё")
+        self.open_only_box.stateChanged.connect(self._fill_progress)
+        header.addWidget(self.open_only_box)
+        body.addLayout(header)
+
+        self.progress = QTableWidget(0, 6, card)
+        self.progress.setHorizontalHeaderLabels(
+            ["Товар", "Код товара", "По документу", "Сверено", "Состояние",
+             "Номенклатура 1С"])
+        self.progress.verticalHeader().setVisible(False)
+        self.progress.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.progress.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.progress.setAlternatingRowColors(True)
+        # Двойной щелчок по строке — привязать номенклатуру. Правится оно ровно
+        # там, где видно, что не сошлось, а не в отдельном окне со списком.
+        self.progress.itemDoubleClicked.connect(self._on_progress_activated)
+        head = self.progress.horizontalHeader()
+        head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3, 4):
+            head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.progress.setColumnWidth(5, 210)
+        body.addWidget(self.progress, 1)
+
+        self.progress_hint = Hint(
+            "Сверка идёт без сети и без сертификата: документ и коды на товаре "
+            "сравниваются на этом компьютере.", card)
+        body.addWidget(self.progress_hint)
+        return card
+
+    def _onec_card(self) -> Card:
+        """Последний шаг приёмки: завести сверенные коды в 1С.
+
+        Номенклатура берётся из выгрузки 1С — связать название поставщика с
+        кодом номенклатуры больше неоткуда. Путь к выгрузке запоминается и
+        перечитывается сам: файл один и тот же от поставки к поставке, а
+        содержимое меняется, и держать в памяти прошлое значило бы однажды
+        не найти заведённый вчера товар.
+        """
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Выгрузка в 1С", card))
+        header.addStretch(1)
+        self.catalog_button = self._action(card, "Номенклатура 1С", "catalog",
+                                           self.load_catalog)
+        self.catalog_button.setToolTip(
+            "Выгрузка из 1С: название, код номенклатуры, характеристика и, если "
+            "есть, штрихкод")
+        header.addWidget(self.catalog_button)
+        self.link_button = self._action(card, "Привязать вручную", "link",
+                                        self.link_selected)
+        self.link_button.setToolTip(
+            "Выбрать номенклатуру для строки, которая не сошлась сама "
+            "(или двойной щелчок по строке)")
+        header.addWidget(self.link_button)
+        self.onec_button = self._action(card, "Файл для 1С", "export",
+                                        self.save_onec)
+        self.onec_button.setObjectName("Primary")
+        header.addWidget(self.onec_button)
+        body.addLayout(header)
+
+        self.only_scanned_box = QCheckBox("Только сверенные коды", card)
+        self.only_scanned_box.setChecked(True)
+        self.only_scanned_box.setToolTip(
+            "Код из документа, которого не нашлось на товаре, — это вещь, "
+            "которая не приехала. Заводить ей штрихкод значит поставить в 1С "
+            "на приход то, чего нет")
+        self.only_scanned_box.toggled.connect(self._sync_onec_hint)
+        body.addWidget(self.only_scanned_box)
+
+        self.onec_hint = Hint("", card)
+        body.addWidget(self.onec_hint)
+        return card
+
+    def _extra_card(self) -> Card:
+        """Коды, которых в документе нет.
+
+        Карточка прячется, пока лишних нет: пустая таблица занимает половину
+        экрана и каждый раз заставляет проверить, не пропущено ли в ней что-то.
+        """
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Лишние коды", card))
+        header.addStretch(1)
+        body.addLayout(header)
+
+        self.extra = QTableWidget(0, 3, card)
+        self.extra.setHorizontalHeaderLabels(["Когда", "Код", "Что не так"])
+        self.extra.verticalHeader().setVisible(False)
+        self.extra.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.extra.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.extra.setMaximumHeight(150)
+        head = self.extra.horizontalHeader()
+        head.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        head.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.extra.setColumnWidth(2, 280)
+        body.addWidget(self.extra)
+
+        self.extra_card = card
+        card.setVisible(False)
         return card
 
     def _action(self, parent: QWidget, title: str, icon: str,
@@ -1320,6 +1618,447 @@ class MarkingPage(QWidget):
             "Операции хранятся на этом компьютере: они подписаны личным "
             "сертификатом и через общий сервер не проходят.")
 
+    # --- сверка с документом ----------------------------------------------------
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == RECONCILE_TAB:
+            self._focus_scan()
+
+    def _focus_scan(self) -> None:
+        """Курсор в поле сканирования. Без этого сканер печатает мимо."""
+        if self._session is not None:
+            self.scan_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def load_upd(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "УПД с кодами маркировки", "",
+            "Документы ЭДО (*.xml *.zip);;Все файлы (*.*)")
+        if not path:
+            return
+        # Разбор идёт прямо здесь, без фоновой задачи: документ на сотню строк —
+        # это два десятка килобайт, и окно не успевает моргнуть. Фоновая задача
+        # ради такого только развела бы обработку ошибок по двум местам.
+        try:
+            document = upd_module.read(path)
+        except UpdProblem as problem:
+            self.notify(str(problem), ToastKind.ERROR)
+            return
+        self._upd = document
+        self._session = Reconciliation(document)
+        self._clear_verdict()
+        self._rematch()
+        self._sync_reconcile()
+        self.tabs.setCurrentIndex(RECONCILE_TAB)
+        self._focus_scan()
+        if repeated := self._session.repeated_in_document:
+            # Это ошибка поставщика, и заметить её нужно до сверки: строку с
+            # таким кодом не закрыть в принципе — второй такой вещи в коробке
+            # нет, а недостача покажется нашей.
+            self.notify(
+                f"В документе {len(repeated)} кодов записаны дважды — "
+                "сверить их до конца не выйдет, это ошибка поставщика",
+                ToastKind.WARNING)
+        else:
+            self.notify(f"{document.title}: к сверке {self._session.total} кодов",
+                        ToastKind.SUCCESS)
+
+    def forget_upd(self) -> None:
+        self._upd = None
+        self._session = None
+        self._matches = []
+        self.scan_edit.clear()
+        self._clear_verdict()
+        self._sync_reconcile()
+
+    def accept_scan(self) -> None:
+        """Принимает один код из поля сканирования.
+
+        Поле очищается всегда — и после удачного скана, и после лишнего кода.
+        Оставленный в нём код сканер допишет своим, и следующая вещь окажется
+        «не разобрана» по нашей вине.
+        """
+        text = self.scan_edit.text().strip()
+        self.scan_edit.clear()
+        if self._session is None:
+            if text:
+                self.notify("Сначала загрузите УПД, с которым сверяемся",
+                            ToastKind.WARNING)
+            return
+        if not text:
+            return
+        scan = self._session.scan(text)
+        self._show_verdict(scan)
+        self._sync_reconcile()
+        self._reveal(scan)
+
+    def undo_scan(self) -> None:
+        if self._session is None:
+            return
+        scan = self._session.undo()
+        if scan is None:
+            self.notify("Отменять нечего: ни одного скана ещё не было",
+                        ToastKind.INFO)
+            return
+        self._clear_verdict(f"Скан снят: {scan.title}")
+        self._sync_reconcile()
+        self._focus_scan()
+
+    def restart_reconcile(self) -> None:
+        if self._session is None:
+            return
+        self._session.reset()
+        self._clear_verdict("Сверка начата заново.")
+        self._sync_reconcile()
+        self._focus_scan()
+
+    def _on_sound_changed(self, enabled: bool) -> None:
+        self.settings.marking_reconcile_sound = enabled
+        self.settings.save()
+
+    def _show_verdict(self, scan: Scan) -> None:
+        """Ответ на скан: цвет, товар и — если что-то не так — что именно."""
+        color, background = VERDICT_COLORS[scan.verdict]
+        where = f" · {scan.line.title}" if scan.line else ""
+        note = f" — {scan.note}" if scan.note else ""
+        self.verdict_label.setText(f"{scan.verdict.title}{where}{note}")
+        self.verdict_label.setStyleSheet(
+            f"color: {color}; background: {background}; font-size: 15px;"
+            f" font-weight: 600; border-radius: {Metrics.RADIUS}px;"
+            " padding: 10px 14px;")
+        if not scan.verdict.good and self.sound_box.isChecked():
+            QApplication.beep()
+
+    def _clear_verdict(self, text: str = "") -> None:
+        self.verdict_label.setText(text)
+        self.verdict_label.setStyleSheet(
+            f"color: {Palette.TEXT_MUTED}; padding: 10px 14px;" if text else "")
+
+    def _sync_reconcile(self) -> None:
+        """Приводит плитки, таблицы и кнопки сверки к тому, что уже сверено."""
+        session = self._session
+        document = self._upd
+        self.tile_upd_lines.set_value(len(document.marked_lines) if document else 0)
+        self.tile_upd_codes.set_value(len(document.marks) if document else 0)
+        self.tile_scanned.set_value(session.done if session else 0)
+        self.tile_left.set_value(session.left if session else 0)
+        self.tile_extra.set_value(len(session.extra) if session else 0)
+        self.tile_scan_repeats.set_value(session.repeats if session else 0)
+
+        self.upd_hint.setText(
+            document.summary if document else
+            "Документ не загружен. Нужен тот же XML, что пришёл по ЭДО, — он "
+            "лежит в папке с документом рядом с печатной формой.")
+        self.scan_edit.setEnabled(session is not None)
+        for button in (self.upd_check_button, self.upd_report_button,
+                       self.upd_forget_button, self.undo_button,
+                       self.restart_button):
+            button.setEnabled(session is not None)
+
+        if session is None:
+            self.scan_hint.setText("")
+            self.scan_hint.setStyleSheet("")
+        else:
+            self.scan_hint.setText(session.summary)
+            # Цветом помечается только несошедшееся: зелёный на каждой подписи
+            # перестаёт что-либо значить к третьей коробке.
+            trouble = bool(session.extra) or bool(session.repeats)
+            self.scan_hint.setStyleSheet(
+                f"color: {Palette.DANGER};" if trouble else "")
+        self._fill_progress()
+        self._fill_extra()
+        self._sync_onec_hint()
+
+    def _reveal(self, scan: Scan) -> None:
+        """Подводит таблицу к строке, по которой только что пикнули.
+
+        В документе на полсотни строк нужная почти всегда за пределами экрана,
+        а посмотреть на неё хочется ровно после скана: сколько по ней осталось —
+        это и есть «доставать ли из коробки ещё такую же».
+        """
+        if scan.line is None:
+            return
+        for row in range(self.progress.rowCount()):
+            cell = self.progress.item(row, 0)
+            if cell is not None and cell.data(Qt.ItemDataRole.UserRole) == scan.line.number:
+                self.progress.selectRow(row)
+                self.progress.scrollToItem(
+                    cell, QAbstractItemView.ScrollHint.PositionAtCenter)
+                return
+
+    def _fill_progress(self) -> None:
+        items = self._session.progress if self._session else []
+        if self.open_only_box.isChecked():
+            items = [item for item in items if not item.done]
+        self.progress.setRowCount(len(items))
+        for row, item in enumerate(items):
+            found = self._match_of(item.line.number)
+            cells = (item.line.title, item.line.gtin, str(item.expected),
+                     str(item.scanned), item.state, _onec_cell(found))
+            for column, text in enumerate(cells):
+                cell = QTableWidgetItem(text)
+                cell.setToolTip(_onec_tip(found) if column == 5 else text)
+                if column == 0:
+                    # Номер строки документа держится в самой ячейке: искать её
+                    # потом по названию или GTIN значило бы промахнуться на
+                    # двух строках одного товара.
+                    cell.setData(Qt.ItemDataRole.UserRole, item.line.number)
+                if column in (2, 3):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                if column == 4:
+                    cell.setForeground(QColor(
+                        Palette.SUCCESS if item.done else Palette.WARNING))
+                if column == 5 and (colour := _onec_colour(found)):
+                    cell.setForeground(QColor(colour))
+                self.progress.setItem(row, column, cell)
+        if self._session is None:
+            self.progress_hint.setText(
+                "Сверка идёт без сети и без сертификата: документ и коды на "
+                "товаре сравниваются на этом компьютере.")
+            return
+        if self._session.complete:
+            self.progress_hint.setText(
+                "Сошлось: всё из документа найдено, лишнего не приехало. "
+                "Документ можно подписывать.")
+            self.progress_hint.setStyleSheet(f"color: {Palette.SUCCESS};")
+            return
+        self.progress_hint.setStyleSheet("")
+        # «Осталось», а не «не найдено»: посреди сверки непросканированное —
+        # это ещё не недостача, а очередь. Недостачей оно станет, когда коробка
+        # кончится, и решает это человек, а не программа.
+        self.progress_hint.setText(
+            f"Осталось просканировать: {self._session.left} · лишних кодов: "
+            f"{len(self._session.extra)}. Расхождения стоит закрыть до подписания "
+            "УПД: после него товар уже числится за нами.")
+
+    def _fill_extra(self) -> None:
+        found = self._session.extra if self._session else []
+        self.extra.setRowCount(len(found))
+        for row, scan in enumerate(found):
+            cells = (f"{scan.at:%H:%M:%S}", scan.raw, scan.note)
+            for column, text in enumerate(cells):
+                cell = QTableWidgetItem(text)
+                cell.setToolTip(text)
+                if column == 2:
+                    cell.setForeground(QColor(Palette.DANGER))
+                self.extra.setItem(row, column, cell)
+        self.extra_card.setVisible(bool(found))
+
+    def codes_to_check(self) -> None:
+        """Переносит коды документа на вкладку проверки.
+
+        Сверка и проверка отвечают на разные вопросы, и один без другого
+        неполон: сверка говорит, что приехало ровно то, что в документе, а
+        «Честный ЗНАК» — что эти коды в обороте и принадлежат поставщику.
+        """
+        if self._upd is None:
+            return
+        text = "\n".join(mark.value for _, mark in self._upd.marks)
+        existing = self.codes_edit.toPlainText().strip()
+        self.codes_edit.setPlainText(f"{existing}\n{text}" if existing else text)
+        self._reparse()
+        self.tabs.setCurrentIndex(CHECK_TAB)
+        self.notify(
+            f"Перенесено кодов: {len(self._upd.marks)}. "
+            "Для проверки нужен вход по сертификату", ToastKind.INFO)
+
+    def save_report(self) -> None:
+        if self._session is None:
+            return
+        folder = os.path.dirname(self._upd.source) if self._upd else ""
+        suggested = reconcile_module.default_name(self._session, folder)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить акт сверки", suggested, "Excel (*.xlsx)")
+        if not path:
+            return
+        run_task(
+            reconcile_module.save_report,
+            self._session, path,
+            on_result=lambda saved: self.notify(
+                f"Акт сверки сохранён: {os.path.basename(saved)}",
+                ToastKind.SUCCESS),
+            on_error=lambda message: self.notify(
+                f"Не удалось сохранить акт: {message}", ToastKind.ERROR),
+        )
+
+    # --- выгрузка в 1С ------------------------------------------------------------
+
+    def load_catalog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выгрузка номенклатуры из 1С",
+            self.settings.marking_onec_catalog,
+            "Книги Excel (*.xlsx *.xls);;Все файлы (*.*)")
+        if not path:
+            return
+        if not self._read_catalog(path, quiet=False):
+            return
+        self.settings.marking_onec_catalog = path
+        self.settings.save()
+        self._rematch()
+        self.notify(f"Номенклатура 1С: {len(self._catalog.items)} позиций",
+                    ToastKind.SUCCESS)
+
+    def _read_catalog(self, path: str, quiet: bool = True) -> bool:
+        """Читает выгрузку. Молча — только когда её никто не просил читать."""
+        try:
+            self._catalog = onec_module.read_catalog(path)
+        except OnecProblem as problem:
+            self._catalog = None
+            if not quiet:
+                self.notify(str(problem), ToastKind.ERROR)
+            return False
+        return True
+
+    def _restore_catalog(self) -> None:
+        """Перечитывает выгрузку прошлого запуска.
+
+        Молча: файл могли переложить или удалить, и упрёк об этом при каждом
+        открытии вкладки — не то, ради чего её открывают. Что выгрузки нет,
+        видно по подписи под кнопкой.
+        """
+        path = self.settings.marking_onec_catalog
+        if path and os.path.exists(path):
+            self._read_catalog(path)
+
+    def _rematch(self) -> None:
+        """Заново раскладывает строки документа по номенклатуре 1С."""
+        if self._upd is None or self._catalog is None:
+            self._matches = []
+        else:
+            self._matches = onec_module.match(
+                self._upd.marked_lines, self._catalog,
+                self.settings.marking_onec_links)
+        self._fill_progress()
+        self._sync_onec_hint()
+
+    def _match_of(self, number: str) -> LineMatch | None:
+        return next((item for item in self._matches
+                     if item.line.number == number), None)
+
+    def _on_progress_activated(self, cell: QTableWidgetItem) -> None:
+        number = self.progress.item(cell.row(), 0)
+        if number is not None:
+            self._link_line(str(number.data(Qt.ItemDataRole.UserRole) or ""))
+
+    def link_selected(self) -> None:
+        row = self.progress.currentRow()
+        if row < 0:
+            self.notify("Выберите строку, которой нужно назначить номенклатуру",
+                        ToastKind.INFO)
+            return
+        cell = self.progress.item(row, 0)
+        if cell is not None:
+            self._link_line(str(cell.data(Qt.ItemDataRole.UserRole) or ""))
+
+    def _link_line(self, number: str) -> None:
+        """Спрашивает номенклатуру для строки и запоминает ответ по GTIN."""
+        if self._catalog is None:
+            self.notify("Сначала загрузите выгрузку номенклатуры из 1С",
+                        ToastKind.WARNING)
+            return
+        found = self._match_of(number)
+        if found is None:
+            return
+        current = found.item.key if found.item else ""
+        dialog = NomenclatureDialog(found.line, self._catalog, self, current)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        key = onec_module.gtin_key(found.line.gtin)
+        if not key:
+            # Без кода товара привязку не к чему привязать: на следующей
+            # поставке та же строка придёт как новая.
+            self.notify("У строки нет кода товара — привязку не запомнить",
+                        ToastKind.WARNING)
+            return
+        if dialog.cleared:
+            self.settings.marking_onec_links.pop(key, None)
+        else:
+            chosen = dialog.chosen
+            if chosen is None:
+                return
+            self.settings.marking_onec_links[key] = {
+                "code": chosen.code, "feature": chosen.feature,
+                "name": chosen.name}
+        self.settings.save()
+        self._rematch()
+
+    def save_onec(self) -> None:
+        if self._session is None or not self._matches:
+            return
+        folder = os.path.dirname(self._upd.source) if self._upd else ""
+        suggested = onec_module.default_name(self._session, folder)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Файл для загрузки в 1С", suggested, "Excel (*.xlsx)")
+        if not path:
+            return
+        try:
+            report = onec_module.save(
+                self._matches, self._session, path,
+                self.only_scanned_box.isChecked())
+        except OnecProblem as problem:
+            self.notify(str(problem), ToastKind.ERROR)
+            return
+        except OSError as error:
+            self.notify(f"Не удалось сохранить файл: {error}", ToastKind.ERROR)
+            return
+        self._sync_onec_hint(report)
+        if report.clean:
+            self.notify(f"Готово к загрузке в 1С: {report.rows} кодов",
+                        ToastKind.SUCCESS)
+        else:
+            # Молчать об этом нельзя: загруженная половина выглядит в 1С точно
+            # так же, как загруженное целиком.
+            self.notify(
+                f"Записано {report.rows} кодов, но {report.skipped_codes} не "
+                f"попало: {len(report.skipped_lines)} позиций без номенклатуры",
+                ToastKind.WARNING)
+
+    def _sync_onec_hint(self, report: onec_module.Export | None = None) -> None:
+        ready = bool(self._session and self._matches
+                     and any(item.ready for item in self._matches))
+        self.onec_button.setEnabled(ready)
+        self.link_button.setEnabled(self._catalog is not None and bool(self._matches))
+        self.only_scanned_box.setEnabled(self._session is not None)
+        if self._catalog is None:
+            self.onec_hint.setStyleSheet("")
+            self.onec_hint.setText(
+                "Выгрузка номенклатуры не загружена. Нужны название, код "
+                "номенклатуры и характеристика — по ним коды и лягут на товар "
+                "в 1С.")
+            return
+        parts = [self._catalog.summary]
+        if self._upd is not None:
+            parts.append(onec_module.summarize(self._matches))
+        if report is not None:
+            parts.append(report.summary)
+        self.onec_hint.setText(" · ".join(parts))
+        waiting = sum(1 for item in self._matches if not item.ready)
+        self.onec_hint.setStyleSheet(
+            f"color: {Palette.WARNING};" if waiting else "")
+
+    # --- горячие клавиши ----------------------------------------------------------
+
+    def run_current(self) -> None:
+        """Что делает F5 на этой странице. Зависит от открытой подвкладки.
+
+        На сверке проверять нечего: она идёт непрерывно, скан за сканом. Зато
+        ровно там F5 нужнее всего — вернуть курсор в поле сканирования, если он
+        уехал в таблицу или в переключатель. А без документа F5 предлагает его
+        выбрать: это и есть первое действие на странице.
+        """
+        if self.tabs.currentIndex() != RECONCILE_TAB:
+            self.run_check()
+            return
+        if self._session is None:
+            self.load_upd()
+            return
+        self._focus_scan()
+
+    def save_current(self) -> None:
+        """Что сохраняет Ctrl+S. На сверке — акт, на остальных подвкладках нечего."""
+        if self.tabs.currentIndex() == RECONCILE_TAB and self._session is not None:
+            self.save_report()
+
     # --- состояние страницы ----------------------------------------------------------
 
     def restore(self) -> None:
@@ -1328,6 +2067,8 @@ class MarkingPage(QWidget):
         self.reload_journal()
         self._load_suz()
         self.reload_orders()
+        self._restore_catalog()
+        self._rematch()
         self._sync_state()
 
     def _set_busy(self, busy: bool) -> None:
@@ -1483,6 +2224,43 @@ def _read_text(path: str) -> str:
             continue
     with open(path, encoding="utf-8", errors="replace") as handle:
         return handle.read()
+
+
+def _onec_cell(found: LineMatch | None) -> str:
+    """Что показать в колонке «Номенклатура 1С»."""
+    if found is None:
+        return "—"
+    if found.ready and found.item is not None:
+        return found.item.short
+    if found.candidates:
+        # У неподтверждённой строки показывается название, а не код: решают
+        # «то же это или не то» по названию, а код номенклатуры об этом не
+        # говорит человеку ничего.
+        return f"похоже: {found.candidates[0].name}"
+    return "не найдено"
+
+
+def _onec_tip(found: LineMatch | None) -> str:
+    """Подсказка на ячейке. Короткого «00-00127672 · M» для решения мало."""
+    if found is None:
+        return "Выгрузка номенклатуры 1С не загружена — сопоставлять не с чем"
+    if found.ready and found.item is not None:
+        return f"{found.item.name}\n{found.kind.title}"
+    if found.candidates:
+        names = "\n".join(f"• {item.name} · {item.short}"
+                          for item in found.candidates[:5])
+        return ("Само не применяется — подтвердите двойным щелчком.\n"
+                f"Ближайшее в 1С:\n{names}")
+    return ("В выгрузке нет ничего похожего. Заведите товар в 1С и перечитайте "
+            "выгрузку либо привяжите вручную")
+
+
+def _onec_colour(found: LineMatch | None) -> str:
+    if found is None:
+        return ""
+    if found.ready:
+        return Palette.SUCCESS if found.kind is not MatchKind.MANUAL else Palette.PRIMARY
+    return Palette.WARNING if found.candidates else Palette.DANGER
 
 
 def _state_color(item: CodeInfo) -> str:
