@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -83,5 +84,16 @@ class AliasesDialog(QDialog):
         self._fill()
 
     def _clear(self) -> None:
+        if not self.aliases:
+            return
+        # Привязки копятся месяцами, а кнопка стоит рядом с «Удалить выбранные».
+        answer = QMessageBox.question(
+            self, "Удалить все исключения",
+            f"Удалить все исключения ({len(self.aliases)})?\n\n"
+            "Вернуть их будет нельзя — позиции придётся привязывать заново.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         self.aliases.clear()
         self._fill()
