@@ -27,6 +27,13 @@ from pathlib import Path
 _VERSION_RE = re.compile(r'__version__\s*=\s*"([^"]+)"')
 ROOT = Path(__file__).resolve().parents[1]
 
+# Скрипт запускается как `python tools/make_version_json.py`: корень проекта
+# в путь поиска не попадает, а разбор CHANGELOG общий с приложением.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.core import changelog as _changelog  # noqa: E402
+
 
 def app_version(root: Path | None = None) -> str:
     """Версия приложения — та же строка, что показана в боковом меню."""
@@ -44,20 +51,7 @@ def changelog_for(version: str, changelog: Path) -> list[str]:
     описанием, чем не выпустить вовсе. Пустой список окно обновления просто не
     покажет, а собранный exe от этого не хуже.
     """
-    if not changelog.exists():
-        return []
-    lines: list[str] = []
-    inside = False
-    for line in changelog.read_text("utf-8").splitlines():
-        if line.startswith("## "):
-            # Раздел версии начинается здесь и кончается следующим таким же.
-            if inside:
-                break
-            inside = line[3:].strip().lstrip("vV") == version
-            continue
-        if inside and (stripped := line.strip().lstrip("-*").strip()):
-            lines.append(stripped)
-    return lines
+    return _changelog.read(changelog, version)
 
 
 def build(exe: Path, changelog: Path, target: Path, *,

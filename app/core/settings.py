@@ -53,6 +53,9 @@ class AppSettings:
     update_show_changelog: bool = True
     update_skip_version: str = ""
     update_remind_after: str = ""
+    # Версия, чей список изменений человек уже видел. Отстаёт от текущей —
+    # значит, программа обновилась, и при запуске показывается «Что нового».
+    seen_version: str = ""
     snapshots_enabled: bool = True
     recent_payment_import: list[str] = field(default_factory=list)
     # Пороги суммы за день для цветовой индикации календаря. По умолчанию
@@ -252,6 +255,9 @@ class AppSettings:
         self.update_show_changelog = bool(data.get("update_show_changelog", self.update_show_changelog))
         self.update_skip_version = str(data.get("update_skip_version", ""))
         self.update_remind_after = str(data.get("update_remind_after", ""))
+        # Настройки есть, а отметки нет — программа обновилась с версии, которая
+        # ещё не вела отметку. Это обновление, а не первая установка.
+        self.seen_version = str(data.get("seen_version") or "0")
         self.snapshots_enabled = bool(data.get("snapshots_enabled", self.snapshots_enabled))
         self.recent_payment_import = [
             p for p in data.get("recent_payment_import", []) if isinstance(p, str)]
@@ -348,6 +354,7 @@ class AppSettings:
             "update_show_changelog": self.update_show_changelog,
             "update_skip_version": self.update_skip_version,
             "update_remind_after": self.update_remind_after,
+            "seen_version": self.seen_version,
             "snapshots_enabled": self.snapshots_enabled,
             "recent_payment_import": self.recent_payment_import,
             "payment_levels": self.payment_levels,

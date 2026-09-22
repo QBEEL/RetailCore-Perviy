@@ -35,7 +35,10 @@ EXCLUDED = [
 
 from PyInstaller.utils.hooks import collect_data_files
 
-DATAS = [("app/ui/assets", "app/ui/assets")] + collect_data_files("qtawesome")
+# CHANGELOG вшивается в сборку: новая версия при первом запуске сама
+# показывает, что в ней поменялось.
+DATAS = ([("app/ui/assets", "app/ui/assets"), ("CHANGELOG.md", ".")]
+         + collect_data_files("qtawesome"))
 
 # Иконка: CI конвертирует app.png → app.icns перед сборкой.
 ICON = "app/ui/assets/app.icns" if os.path.exists("app/ui/assets/app.icns") else None

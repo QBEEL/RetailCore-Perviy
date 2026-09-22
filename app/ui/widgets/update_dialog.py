@@ -104,6 +104,7 @@ class UpdateDialog(QWidget):
                 return
         if self.settings.update_download_auto and updater.is_frozen():
             self._show_checking(f"Загружается версия {manifest.version}…")
+            self._show_changelog(manifest.changelog)
             self.show()
             self.checker.download(manifest)
         else:
@@ -184,10 +185,7 @@ class UpdateDialog(QWidget):
         self._icon.setPixmap(icons.icon("update", Palette.PRIMARY).pixmap(28, 28))
         self._title.setText(f"Доступна новая версия {manifest.version}")
         self._message.setText(extra_hint or "Обновить сейчас?")
-        if self.settings.update_show_changelog and manifest.changelog:
-            self._changelog.setText("Что нового:\n" + "\n".join(f"• {line}" for line in manifest.changelog))
-        else:
-            self._changelog.setText("")
+        self._show_changelog(manifest.changelog)
         self._progress.setVisible(False)
 
         self._primary.setText("Обновить")
@@ -208,11 +206,32 @@ class UpdateDialog(QWidget):
         self._icon.setPixmap(icons.icon("check", Palette.SUCCESS).pixmap(28, 28))
         self._title.setText(f"Версия {self._manifest.version} готова к установке")
         self._message.setText("Приложение перезапустится с новой версией.")
-        self._changelog.setText("")
+        # При автозагрузке это окно — первое, что человек видит об обновлении,
+        # и без списка изменений оно сводилось к голому «перезапустите».
+        self._show_changelog(self._manifest.changelog)
         self._progress.setVisible(False)
         self._primary.setText("Перезапустить сейчас")
         self._primary.setVisible(True)
         self._wire(self._primary, self._restart)
+
+    def show_whats_new(self, version: str, lines: list[str]) -> None:
+        """Первый запуск после обновления: что поменялось в этой версии."""
+        self._reset_buttons()
+        self._icon.setPixmap(icons.icon("check", Palette.SUCCESS).pixmap(28, 28))
+        self._title.setText(f"Программа обновлена до версии {version}")
+        self._message.setText("")
+        self._show_changelog(lines)
+        self._progress.setVisible(False)
+        self._primary.setText("Понятно")
+        self._primary.setVisible(True)
+        self._wire(self._primary, self.close)
+        self.show()
+
+    def _show_changelog(self, lines: list[str]) -> None:
+        if self.settings.update_show_changelog and lines:
+            self._changelog.setText("Что нового:\n" + "\n".join(f"• {line}" for line in lines))
+        else:
+            self._changelog.setText("")
 
     # --- действия -------------------------------------------------------------
 

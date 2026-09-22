@@ -29,7 +29,10 @@ EXCLUDED = [
 from PyInstaller.utils.hooks import collect_data_files
 
 # qtawesome тащит шрифты с иконками — без них интерфейс останется без значков.
-DATAS = [("app/ui/assets", "app/ui/assets")] + collect_data_files("qtawesome")
+# CHANGELOG вшивается в сборку: новая версия при первом запуске сама
+# показывает, что в ней поменялось.
+DATAS = ([("app/ui/assets", "app/ui/assets"), ("CHANGELOG.md", ".")]
+         + collect_data_files("qtawesome"))
 
 a = Analysis(
     ["run.py"],

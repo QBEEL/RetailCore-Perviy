@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_TITLE, __version__
+from ..core import changelog
 from ..core.settings import AppSettings
 from . import icons
 from .catalog_page import CatalogPage
@@ -150,8 +151,23 @@ class MainWindow(QMainWindow):
 
         self.update_checker = UpdateChecker(self)
         self.update_dialog = UpdateDialog(settings, self.update_checker, self)
+        QTimer.singleShot(800, self._show_whats_new)
         if settings.update_check_auto:
             QTimer.singleShot(2000, self.update_dialog.run_silent)
+
+    def _show_whats_new(self) -> None:
+        """После обновления — список изменений новой версии, один раз.
+
+        Окно обновления рисует ещё старая версия, и что оно покажет, от новой
+        не зависит. Поэтому новая версия рассказывает о себе сама.
+        """
+        seen = self.settings.seen_version
+        if seen == __version__:
+            return
+        self.settings.seen_version = __version__
+        self.settings.save()
+        if changelog.is_upgrade(seen, __version__) and (lines := changelog.bundled(__version__)):
+            self.update_dialog.show_whats_new(__version__, lines)
 
     # --- навигация ------------------------------------------------------------
 
