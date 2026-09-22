@@ -142,21 +142,17 @@ class Alias:
             keys.append(code)
         if self.source_ean:
             keys.append(f"e:{self.source_ean}")
-        # Характеристика входит в ключ: у оттенков 01 и 02 название одинаковое,
-        # и без неё исключение для одного применилось бы ко всем.
-        keys += _name_keys(self.source_name, self.source_trait)
+        # Характеристика входит в ключ: у оттенков 01 и 02 и у объёмов 80 и
+        # 250 мл название одинаковое, и без неё исключение для одного
+        # применилось бы ко всем. Поэтому общее название без характеристики —
+        # ключ только у исключений, сохранённых до появления характеристики.
+        if name := _name_key(self.source_name, self.source_trait):
+            keys.append(name)
         return keys
 
     def identity(self) -> set[str]:
-        """Ключи, по которым исключение считается тем же самым при замене.
-
-        Общее название без характеристики сюда не входит: иначе привязка для
-        оттенка 02 удалила бы привязку оттенка 01.
-        """
-        keys = {key for key in self.keys() if not key.startswith("n:")}
-        if precise := _name_keys(self.source_name, self.source_trait):
-            keys.add(precise[0])
-        return keys
+        """Ключи, по которым исключение считается тем же самым при замене."""
+        return set(self.keys())
 
     @property
     def title(self) -> str:
@@ -229,15 +225,18 @@ _ALIAS_FIELDS = (
 )
 
 
-def _name_keys(name: str, trait: str) -> list[str]:
-    """Ключ с характеристикой и без неё: исключения, сохранённые до появления
-    характеристики, должны продолжать работать."""
-    keys = []
-    if trait and (full := comparable(f"{name} {trait}")):
-        keys.append(f"n:{full}")
-    if plain := comparable(name):
-        keys.append(f"n:{plain}")
-    return keys
+def _name_key(name: str, trait: str) -> str:
+    """Ключ по названию и характеристике.
+
+    Характеристика берётся как есть, без ``comparable``: та вырезает величины,
+    и «80 мл» и «250 мл» превратились бы в одну и ту же пустую строку.
+    """
+    plain = comparable(name)
+    if not plain:
+        return ""
+    if trait := normalize_text(trait):
+        return f"n:{plain} | {trait}"
+    return f"n:{plain}"
 
 
 def _line_keys(line: "OrderLine") -> list[str]:
@@ -246,7 +245,13 @@ def _line_keys(line: "OrderLine") -> list[str]:
         keys.append(code)
     if line.ean:
         keys.append(f"e:{line.ean}")
-    return keys + _name_keys(line.name, line.trait)
+    if name := _name_key(line.name, line.trait):
+        keys.append(name)
+    # Общее название — чтобы находились исключения, сохранённые до появления
+    # характеристики. Исключения с характеристикой по нему не ищутся.
+    if line.trait and (plain := _name_key(line.name, "")):
+        keys.append(plain)
+    return keys
 
 
 @dataclass(slots=True)

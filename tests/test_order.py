@@ -318,6 +318,23 @@ def test_alias_for_one_shade_does_not_bind_another(shades_export: str, marked_fo
     assert all(line.method == "Исключение" for line in lines)
 
 
+def test_alias_for_one_volume_does_not_bind_another(marked_form: str) -> None:
+    """Объём в характеристике — не шум: 80 и 250 мл — разные строки бланка."""
+    index = order.TargetIndex(order.detect_target(marked_form))
+    name = "Аромасвеча Шкатулка Boca Aroma Sunny island"
+    small = order.OrderLine(1, "", "", name, 35, trait="80 мл")
+    large = order.OrderLine(2, "", "", name, 20, trait="250 мл")
+    other = order.OrderLine(3, "", "", name, 5, trait="500 мл")
+
+    book = order.AliasBook()
+    book.remember(small, index.info(2))
+    book.remember(large, index.info(3))
+    assert len(book) == 2
+    assert book.find(small).target_article == index.info(2).article
+    assert book.find(large).target_article == index.info(3).article
+    assert book.find(other) is None
+
+
 def test_alias_without_trait_still_works(shades_export: str, marked_form: str) -> None:
     """Исключения, сохранённые до появления характеристики, не теряются."""
     saved = order.Alias(source_article="ZR-01", source_name="Тональный крем для лица",
