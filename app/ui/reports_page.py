@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +39,7 @@ from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title, fade_in
+from .widgets.ledger_tab import LedgerTab
 from .widgets.report_dialogs import ProfileDialog, StoreRulesDialog
 from .widgets.toast import ToastKind
 
@@ -76,14 +78,41 @@ class ReportsPage(QWidget):
         root.setSpacing(Metrics.GAP)
 
         root.addWidget(Title("Отчётность", self))
-        root.addWidget(Subtitle(
+        self.subtitle = Subtitle(
             "Отчёт по акциям для поставщика собирается из выгрузок продаж: фильтр, "
             "сводная и оформление берутся из профиля, а продажи объединённых "
-            "магазинов складываются по общим правилам.", self))
+            "магазинов складываются по общим правилам.", self)
+        root.addWidget(self.subtitle)
 
-        root.addWidget(self._profile_card())
-        root.addWidget(self._sources_card())
-        root.addWidget(self._result_card(), 1)
+        # Два разных отчёта с разными исходниками: один уходит поставщику, другой
+        # разбирает ведомость для себя. Держать их на одной странице подряд —
+        # значит заставлять пролистывать чужую работу до своей.
+        self.tabs = QTabWidget(self)
+        self.tabs.addTab(self._supplier_tab(), "Отчёт поставщику")
+        self.tabs.addTab(LedgerTab(self.settings, self.notify, self),
+                         "Ведомость по складам")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root.addWidget(self.tabs, 1)
+
+    def _supplier_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+        layout.addWidget(self._profile_card())
+        layout.addWidget(self._sources_card())
+        layout.addWidget(self._result_card(), 1)
+        return page
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Подзаголовок описывает открытую вкладку, а не страницу целиком."""
+        self.subtitle.setText(
+            "Отчёт по акциям для поставщика собирается из выгрузок продаж: "
+            "фильтр, сводная и оформление берутся из профиля, а продажи "
+            "объединённых магазинов складываются по общим правилам."
+            if index == 0 else
+            "Ведомость по товарам на складах из 1С — в читаемый вид: чего не "
+            "хватило, что расходится, как дела по каждому магазину.")
 
     def _profile_card(self) -> Card:
         card = Card(self)
