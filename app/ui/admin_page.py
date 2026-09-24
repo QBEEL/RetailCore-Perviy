@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.payments import admin, data, transport
-from ..core.payments.admin import Account, Entry
+from ..core.payments.admin import Account, Entry, Scope
 from ..core.suppliers import directory
 from ..core.settings import AppSettings
 from . import icons, pages
@@ -32,6 +33,7 @@ from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.account_dialogs import AccountDialog, PasswordShown
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title
+from .widgets.database_dialogs import WipeDialog
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 
@@ -43,15 +45,21 @@ def _moment(value: datetime | None) -> str:
 class AdminPage(QWidget):
     """Страница администрирования."""
 
-    def __init__(self, settings: AppSettings, notify, parent: QWidget | None = None) -> None:
+    def __init__(self, settings: AppSettings, notify,
+                 parent: QWidget | None = None,
+                 on_wiped: Callable[[], None] | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
         self.notify = notify
+        # Кого предупредить, что оплат больше нет. Раздел оплат читает базу
+        # один раз, и без этого он до перезапуска показывал бы стёртое.
+        self._on_wiped = on_wiped
         self.accounts: list[Account] = []
         self.entries: list[Entry] = []
         self._known: list[str] = []
         self._directions: list[tuple[str, str]] = []
         self._claims: list[directory.Entry] = []
+        self._scope = Scope()
         self._loaded = False
 
         root = QVBoxLayout(self)
@@ -90,6 +98,7 @@ class AdminPage(QWidget):
         self.tabs.addTab(self._accounts_tab(), "Учётные записи")
         self.tabs.addTab(self._claims_tab(), "Закрепление поставщиков")
         self.tabs.addTab(self._journal_tab(), "Журнал изменений")
+        self.tabs.addTab(self._maintenance_tab(), "Обслуживание")
         root.addWidget(self.tabs, 1)
 
     # --- вкладки --------------------------------------------------------------
@@ -208,6 +217,50 @@ class AdminPage(QWidget):
         layout.addWidget(self.journal_table, 1)
         return page
 
+    def _maintenance_tab(self) -> QWidget:
+        """Удаление данных общей базы.
+
+        Отдельной вкладкой, а не кнопкой рядом с правкой учёток: это действие
+        выполняют раз в год, и стоять оно должно там, где его не нажмут заодно.
+        """
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+
+        card = Card(page)
+        card.body().addWidget(SectionTitle("Удаление данных"))
+        card.body().addWidget(Hint(
+            "Стирает все оплаты вместе с вложениями, бюджетами, журналом "
+            "импортов и привязками получателей — у всех менеджеров сразу. "
+            "Нужно, когда выгрузку из 1С переносят заново и накопленное с ней "
+            "уже не сходится."))
+        card.body().addWidget(Hint(
+            "Учётные записи, направления, закрепление поставщиков и журнал "
+            "изменений остаются: восстанавливать их руками дольше, чем "
+            "повторить импорт. Отменить удаление нельзя — данные вернутся "
+            "только из ночной резервной копии сервера."))
+
+        self.scope_label = QLabel("", page)
+        self.scope_label.setObjectName("Hint")
+        self.scope_label.setWordWrap(True)
+        card.body().addWidget(self.scope_label)
+
+        actions = QHBoxLayout()
+        self.wipe_button = QPushButton("Удалить данные базы", page)
+        self.wipe_button.setObjectName("Danger")
+        self.wipe_button.setIcon(icons.icon("trash", Palette.DANGER))
+        self.wipe_button.setToolTip(
+            "Потребует набрать слово подтверждения и ваш пароль")
+        self.wipe_button.clicked.connect(self.wipe_database)
+        actions.addWidget(self.wipe_button)
+        actions.addStretch(1)
+        card.body().addLayout(actions)
+
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
     # --- загрузка -------------------------------------------------------------
 
     def restore(self) -> None:
@@ -221,7 +274,8 @@ class AdminPage(QWidget):
         self.tabs.setVisible(available)
         for button in (self.new_button, self.refresh_button,
                        self.edit_button, self.reset_button,
-                       self.fix_button, self.reject_button):
+                       self.fix_button, self.reject_button,
+                       self.wipe_button):
             button.setEnabled(available)
         if not available:
             self.subtitle.setText("Требуется вход администратором")
@@ -231,7 +285,7 @@ class AdminPage(QWidget):
 
     def _apply(self, payload: tuple) -> None:
         (self.accounts, self.entries, self._known,
-         self._directions, self._claims) = payload
+         self._directions, self._claims, self._scope) = payload
         self._loaded = True
         self.accounts_table.set_items(self.accounts)
         self.journal_table.set_items(self.entries)
@@ -253,6 +307,19 @@ class AdminPage(QWidget):
         # править их некому, и это стоит замечать до того, как спросят.
         linked = {name for account in self.accounts for name in account.responsible}
         self.hint.setText(f"без учётной записи в 1С: {len(set(self._known) - linked)}")
+
+        if not self._scope.supported:
+            # Раздел открылся, а удалять нечем: сервер старой версии такого
+            # адреса не знает. Молчать об этом нельзя — при полной базе
+            # «данных нет» выглядело бы как потеря данных.
+            self.scope_label.setText(
+                "Серверная часть не обновлена — удаление данных ей ещё "
+                "неизвестно. Обновите сервер, и раздел заработает.")
+        else:
+            self.scope_label.setText(
+                f"Сейчас в базе: {self._scope.summary}"
+                if not self._scope.empty else "Данных в базе нет — стирать нечего")
+        self.wipe_button.setEnabled(self._scope.supported and not self._scope.empty)
 
     def _failed(self, message: str) -> None:
         self.notify(message, ToastKind.ERROR)
@@ -368,17 +435,45 @@ class AdminPage(QWidget):
         self.notify(message, ToastKind.SUCCESS)
         self.reload()
 
+    # --- удаление данных ------------------------------------------------------
+
+    def wipe_database(self) -> None:
+        """Удаление данных общей базы после двойного подтверждения."""
+        if self._scope.empty:
+            self.notify("Данных в базе нет — стирать нечего", ToastKind.INFO)
+            return
+        dialog = WipeDialog(self._scope, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        password = dialog.result_password()
+        self.wipe_button.setEnabled(False)
+        run_task(lambda: admin.wipe(password),
+                 on_result=self._wiped, on_error=self._wipe_failed)
+
+    def _wiped(self, erased: Scope) -> None:
+        self.notify(f"Данные удалены: {erased.summary}", ToastKind.SUCCESS)
+        if self._on_wiped:
+            self._on_wiped()
+        self.reload()
+
+    def _wipe_failed(self, message: str) -> None:
+        # Кнопку возвращаем на место: неверный пароль — это повод повторить, а
+        # не причина закрыть раздел до обновления страницы.
+        self.wipe_button.setEnabled(True)
+        self.notify(message, ToastKind.ERROR)
+
 
 def _load_all() -> tuple:
-    """Учётки, журнал, имена из 1С, справочник направлений и очередь заявок.
+    """Учётки, журнал, имена из 1С, направления, заявки и объём базы.
 
-    Одним походом: страница показывает всё сразу, а пять последовательных
-    запросов из интерфейса — это пять поводов подождать.
+    Одним походом: страница показывает всё сразу, а шесть последовательных
+    запросов из интерфейса — это шесть поводов подождать.
     """
     known = data.known_values().get("responsible", [])
     directions = [(item.code, item.title) for item in directory.directions()]
     claims = directory.pending_claims().items
-    return admin.accounts(), admin.journal(), known, directions, claims
+    return (admin.accounts(), admin.journal(), known, directions, claims,
+            admin.scope())
 
 
 def _reject(drafts: list[tuple[str, list[int]]]) -> int:

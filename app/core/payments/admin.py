@@ -50,6 +50,54 @@ class Account:
 
 
 @dataclass(slots=True)
+class Scope:
+    """Что стоит в общей базе — и что из этого стирается удалением.
+
+    Считается сервером перед показом диалога: соглашаться на удаление, не видя
+    его объёма, человеку не на чем.
+    """
+
+    payments: int = 0
+    files: int = 0
+    budgets: int = 0
+    imports: int = 0
+    links: int = 0
+    # Умеет ли сервер удалять данные. Пустой объём и необновлённый сервер — это
+    # разные ответы, и путать их нельзя: «данных нет» при полной базе сбивает с
+    # толку сильнее, чем прямое «сервер не обновлён».
+    supported: bool = True
+
+    @property
+    def empty(self) -> bool:
+        return not self.total
+
+    @property
+    def total(self) -> int:
+        return (self.payments + self.files + self.budgets
+                + self.imports + self.links)
+
+    @property
+    def summary(self) -> str:
+        """Перечисление непустого — для диалога и для сообщения после."""
+        parts = [f"{value} {title}" for title, value in (
+            (_plural(self.payments, "оплата", "оплаты", "оплат"), self.payments),
+            (_plural(self.files, "вложение", "вложения", "вложений"), self.files),
+            (_plural(self.budgets, "бюджет", "бюджета", "бюджетов"), self.budgets),
+            (_plural(self.imports, "импорт", "импорта", "импортов"), self.imports),
+            (_plural(self.links, "привязка", "привязки", "привязок"), self.links),
+        ) if value]
+        return ", ".join(parts) if parts else "ничего"
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Форма слова при числе: 1 оплата, 2 оплаты, 5 оплат."""
+    tail, tens = count % 10, count % 100
+    if tens in range(11, 20) or tail == 0 or tail >= 5:
+        return many
+    return one if tail == 1 else few
+
+
+@dataclass(slots=True)
 class Entry:
     """Строка журнала изменений."""
 
@@ -84,6 +132,12 @@ FIELD_TITLES = {
     "recipient": "получатель",
     "ids": "записей",
     "note": "примечание",
+    # Что стёрло удаление данных: журнал остаётся, и объём удаления виден в нём.
+    "payments": "оплат",
+    "files": "вложений",
+    "budgets": "бюджетов",
+    "imports": "импортов",
+    "links": "привязок",
 }
 
 
@@ -134,6 +188,47 @@ def save(account: Account) -> Account:
 def reset_password(account_id: int) -> str:
     """Назначает новый пароль. Прежний восстановить нельзя — только заменить."""
     return transport.post(f"/api/users/{account_id}/password")["password"]
+
+
+# --- удаление данных -----------------------------------------------------------
+
+# Слово подтверждения. Такое же ждёт сервер: набрать его — единственный способ
+# сказать «да» этому действию.
+CONFIRM = "УДАЛИТЬ"
+
+
+def _scope(row: dict) -> Scope:
+    return Scope(payments=int(row.get("payments", 0)),
+                 files=int(row.get("files", 0)),
+                 budgets=int(row.get("budgets", 0)),
+                 imports=int(row.get("imports", 0)),
+                 links=int(row.get("links", 0)))
+
+
+def scope() -> Scope:
+    """Объём базы: сколько чего сотрёт удаление.
+
+    Сервер прежней версии об удалении не знает и отвечает «нет такого адреса».
+    Отдельным признаком, а не пустым объёмом: раздел из-за этого открываться не
+    перестаёт, но и сказать «данных нет» при полной базе он не должен.
+    """
+    try:
+        return _scope(transport.get("/api/maintenance/scope") or {})
+    except transport.ServerError as error:
+        if error.status == 404:
+            return Scope(supported=False)
+        raise
+
+
+def wipe(password: str) -> Scope:
+    """Стирает оплаты и всё при них. Возвращает то, что было удалено.
+
+    Пароль уходит на сервер вместе с запросом: токена для такого действия мало —
+    он лежит в памяти открытого приложения, а пароль знает только владелец
+    учётной записи.
+    """
+    return _scope(transport.post("/api/maintenance/wipe",
+                                 {"confirm": CONFIRM, "password": password}) or {})
 
 
 # --- журнал --------------------------------------------------------------------

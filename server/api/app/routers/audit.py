@@ -27,6 +27,8 @@ ACTIONS = {
     "password": "смена пароля",
     "reset_password": "сброс пароля",
     "import": "импорт из 1С",
+    "wipe": "удаление данных",
+    "wipe_denied": "удаление отклонено: неверный пароль",
 }
 
 ENTITIES = {
@@ -34,6 +36,7 @@ ENTITIES = {
     "budget": "бюджет",
     "recipient_link": "привязка получателя",
     "app_user": "учётная запись",
+    "database": "база данных",
 }
 
 

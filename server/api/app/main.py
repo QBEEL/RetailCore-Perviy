@@ -12,6 +12,7 @@ from .routers import (
     budgets,
     files,
     imports,
+    maintenance,
     payments,
     recipients,
     reports,
@@ -44,6 +45,7 @@ app.include_router(files.router)
 app.include_router(budgets.router)
 app.include_router(recipients.router)
 app.include_router(imports.router)
+app.include_router(maintenance.router)
 app.include_router(reports.router)
 app.include_router(suppliers.router)
 app.include_router(sync.router)

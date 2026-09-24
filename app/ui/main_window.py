@@ -121,7 +121,8 @@ class MainWindow(QMainWindow):
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
         self.settings_page = SettingsPage(settings, self.notify, self.pages, self._check_updates_now)
-        self.admin_page = AdminPage(settings, self.notify, self.pages)
+        self.admin_page = AdminPage(settings, self.notify, self.pages,
+                                    self.payments_page.invalidate)
         self.profile_page = ProfilePage(settings, self.notify, self.pages,
                                         self.sign_out)
         for page in (self.match_page, self.order_page, self.price_page, self.payments_page,
