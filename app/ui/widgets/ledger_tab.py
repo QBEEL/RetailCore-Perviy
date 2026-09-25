@@ -46,8 +46,9 @@ def _qty(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ")
 
 
-def _share(value: float) -> str:
-    return f"{value:.0%}" if value else ""
+def _share(value: float, shown: bool = True) -> str:
+    """Доля. Пусто, если запас в выгрузке неполный и доля была бы выдуманной."""
+    return f"{value:.0%}" if value and shown else ""
 
 
 class LedgerTab(QWidget):
@@ -59,7 +60,7 @@ class LedgerTab(QWidget):
         super().__init__(parent)
         self.settings = settings
         self.notify = notify
-        self._path = ""
+        self._paths: list[str] = []
         self._report: ledger.Report | None = None
         self._busy = False
         self._build()
@@ -82,7 +83,7 @@ class LedgerTab(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Ведомость из 1С", card))
         header.addStretch(1)
-        self.pick_button = self._action(card, "Выбрать файл", "open", self.pick)
+        self.pick_button = self._action(card, "Выбрать файлы", "open", self.pick)
         self.parse_button = self._action(card, "Разобрать", "run", self.parse)
         self.parse_button.setObjectName("Primary")
         self.parse_button.setEnabled(False)
@@ -98,10 +99,12 @@ class LedgerTab(QWidget):
         body.addWidget(self.path_label)
 
         body.addWidget(Hint(
-            "Подходит выгрузка «Ведомость по товарам на складах» из 1С в Excel. "
-            "Колонки ищутся по подписям в шапке, поэтому состав складов может "
-            "меняться. Строки групп не считаются: их числа — итоги вложенных "
-            "товаров.", card))
+            "Подходит выгрузка «Ведомость по товарам на складах» из 1С в Excel: "
+            "склады в колонках, склад колонкой или группами строк, один склад "
+            "на файл. Можно выбрать несколько файлов — например, по файлу от "
+            "каждого магазина, — они сведутся в одну ведомость. Колонки ищутся "
+            "по подписям в шапке, строки групп не считаются: их числа — итоги "
+            "вложенных товаров.", card))
         return card
 
     def _result_card(self) -> Card:
@@ -166,31 +169,38 @@ class LedgerTab(QWidget):
     # --- действия --------------------------------------------------------------
 
     def pick(self) -> None:
-        start = os.path.dirname(self._path) if self._path else os.path.expanduser("~")
-        path, _ = QFileDialog.getOpenFileName(
+        start = (os.path.dirname(self._paths[0]) if self._paths
+                 else os.path.expanduser("~"))
+        paths, _ = QFileDialog.getOpenFileNames(
             self, "Ведомость по товарам на складах", start,
             f"Выгрузка 1С ({' '.join(ledger.EXTENSIONS)})")
-        if not path:
+        if not paths:
             return
-        self._path = path
-        self.path_label.setText(path)
+        self._paths = paths
+        if len(paths) == 1:
+            self.path_label.setText(paths[0])
+        else:
+            self.path_label.setText(
+                f"Файлов: {len(paths)} — "
+                + ", ".join(os.path.basename(path) for path in paths))
         self.parse_button.setEnabled(True)
         self.save_button.setEnabled(False)
-        self.hint.setText("Файл выбран — нажмите «Разобрать».")
+        self.hint.setText("Файлы выбраны — нажмите «Разобрать»." if len(paths) > 1
+                          else "Файл выбран — нажмите «Разобрать».")
 
     def parse(self) -> None:
-        if not self._path or self._busy:
+        if not self._paths or self._busy:
             return
         self._set_busy(True)
         self.hint.setText("Читаю выгрузку…")
-        path = self._path
-        run_task(lambda: ledger.build(ledger.read(path)),
+        paths = list(self._paths)
+        run_task(lambda: ledger.build(ledger.read_many(paths)),
                  on_result=self._show, on_error=self._failed)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.pick_button.setEnabled(not busy)
-        self.parse_button.setEnabled(not busy and bool(self._path))
+        self.parse_button.setEnabled(not busy and bool(self._paths))
         self.save_button.setEnabled(not busy and self._report is not None)
 
     def _failed(self, message: str) -> None:
@@ -218,10 +228,14 @@ class LedgerTab(QWidget):
                               if report.negative else "Ошибки учёта")
 
         self._warn(report)
-        self.hint.setText(
-            f"{report.ledger.title} · магазинов: {len(report.ledger.shops)} · "
-            f"товаров: {len(report.ledger.items)} · израсходовано от запаса: "
-            f"{total.share:.1%}")
+        parts = [report.ledger.title, report.ledger.layout]
+        if len(report.ledger.sources) > 1:
+            parts.append(f"файлов: {len(report.ledger.sources)}")
+        parts += [f"магазинов: {len(report.ledger.shops)}",
+                  f"товаров: {len(report.ledger.items)}"]
+        if report.shares:
+            parts.append(f"израсходовано от запаса: {total.share:.1%}")
+        self.hint.setText(" · ".join(part for part in parts if part))
         self.notify("Ведомость разобрана", ToastKind.SUCCESS)
 
     def _warn(self, report: ledger.Report) -> None:
@@ -232,6 +246,7 @@ class LedgerTab(QWidget):
             notes.append(
                 "Сумма по складам не сошлась с колонкой «Итого» в файле — "
                 "числам верить нельзя, пришлите файл на разбор")
+        notes.extend(report.ledger.warnings)
         if report.doubled:
             names = ", ".join(store.title for store in report.doubled)
             notes.append(f"Склады с одинаковым названием разведены номером: {names}")
@@ -263,7 +278,8 @@ class LedgerTab(QWidget):
             self._put(table, row, 3, _qty(line.move.outgoing), align=RIGHT,
                       color=Palette.DANGER)
             self._put(table, row, 4, _qty(line.move.closing), align=RIGHT)
-            self._put(table, row, 5, _share(line.move.share), align=RIGHT)
+            self._put(table, row, 5, _share(line.move.share, report.shares),
+                      align=RIGHT)
         self._stretch(table, 1)
 
     def _fill_top(self, report: ledger.Report) -> None:
@@ -295,7 +311,8 @@ class LedgerTab(QWidget):
             self._put(table, row, 4, str(total.items), align=RIGHT)
             self._put(table, row, 5, str(total.ran_out) if total.ran_out else "",
                       align=RIGHT, color=Palette.DANGER if total.ran_out else "")
-            self._put(table, row, 6, _share(total.move.share), align=RIGHT)
+            self._put(table, row, 6, _share(total.move.share, report.shares),
+                      align=RIGHT)
             for column in range(7):
                 if cell := table.item(row, column):
                     font = cell.font()
@@ -306,7 +323,8 @@ class LedgerTab(QWidget):
                 self._put(table, row, 1, line.name)
                 self._put(table, row, 2, _qty(line.move.outgoing), align=RIGHT)
                 self._put(table, row, 3, _qty(line.move.closing), align=RIGHT)
-                self._put(table, row, 6, _share(line.move.share), align=RIGHT)
+                self._put(table, row, 6, _share(line.move.share, report.shares),
+                          align=RIGHT)
                 row += 1
         self._stretch(table, 1)
 
@@ -354,7 +372,8 @@ class LedgerTab(QWidget):
     def save(self) -> None:
         if self._report is None:
             return
-        folder = os.path.dirname(self._path) or os.path.expanduser("~")
+        folder = ((os.path.dirname(self._paths[0]) if self._paths else "")
+                  or os.path.expanduser("~"))
         path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить разбор", ledger.default_name(folder),
             "Excel (*.xlsx)")

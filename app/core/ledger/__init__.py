@@ -5,8 +5,8 @@
 итог стоит рядом с данными, а среди складов попадаются одноимённые и служебные
 «в пути». Ответить по такой таблице на вопрос «чего не хватило» нельзя.
 
-Разбор (`parse`), выводы (`analysis`) и оформление (`export`) разделены и
-проверяются по отдельности. Главная проверка разбора — сверка с итоговой
+Разбор (`parse`), сведение нескольких файлов (`merge`), выводы (`analysis`) и
+оформление (`export`) разделены и проверяются по отдельности. Главная проверка разбора — сверка с итоговой
 колонкой самого файла: если сумма по складам с ней не сходится, шапку прочитали
 неверно, и об этом нужно сказать, а не показывать красивые неверные числа.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from .analysis import ItemTotal, Line, Report, STORE_TOP, TOP_LIMIT, build
 from .export import default_name, save
+from .merge import merge, read_many
 from .models import Item, Ledger, Movement, Store
 from .parse import ParseError, read
 
@@ -34,6 +35,8 @@ __all__ = [
     "TOP_LIMIT",
     "build",
     "default_name",
+    "merge",
     "read",
+    "read_many",
     "save",
 ]

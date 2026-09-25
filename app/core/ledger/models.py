@@ -12,6 +12,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Четыре поля движения. Порядок — как в ведомости 1С.
+FIELDS = ("opening", "incoming", "outgoing", "closing")
+
 
 @dataclass(frozen=True, slots=True)
 class Store:
@@ -25,7 +28,8 @@ class Store:
 
     name: str
     title: str
-    column: int
+    # Первая колонка склада в файле; у макетов, где склад идёт строкой, — 0.
+    column: int = 0
     # Склад «в пути»: товар отгружен, но не принят. Продаж там не бывает, и в
     # анализе он только мешает — но остаток в пути видеть нужно.
     transit: bool = False
@@ -75,11 +79,21 @@ class Item:
     article: str = ""
     name: str = ""
     unit: str = ""
+    # Код номенклатуры 1С. Есть не во всех выгрузках, но где есть — это самый
+    # надёжный ключ при сведении нескольких файлов: артикулы в карточках пишут
+    # через косую черту и по-разному, а код один.
+    code: str = ""
     # Ключ — `title` склада, а не имя: одноимённые склады различаются только им.
     moves: dict[str, Movement] = field(default_factory=dict)
 
     def move(self, title: str) -> Movement:
         return self.moves.get(title) or Movement()
+
+    def add(self, title: str, piece: Movement) -> None:
+        """Прибавляет движение по складу к уже известному."""
+        move = self.moves.setdefault(title, Movement())
+        for name in FIELDS:
+            setattr(move, name, getattr(move, name) + getattr(piece, name))
 
     def total(self, titles: list[str]) -> Movement:
         """Сумма движения по перечисленным складам."""
@@ -106,6 +120,15 @@ class Ledger:
     # этом нельзя: отчёт с потерянной колонкой выглядит целым.
     reported: Movement | None = None
     title: str = ""
+    # Как прочитан файл — название вида отчёта, показывается пользователю.
+    layout: str = ""
+    # Какие поля движения были в файле. Отсутствующее поле читается нулём, и
+    # выводы вроде «ушло от запаса» по нему делать нельзя — ноль там не факт.
+    fields: frozenset[str] = frozenset(FIELDS)
+    # Из каких файлов собрана ведомость.
+    sources: list[str] = field(default_factory=list)
+    # Что пользователю стоит знать о разборе, помимо сверки с итогом.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def shops(self) -> list[Store]:
@@ -133,6 +156,11 @@ class Ledger:
         return result
 
     @property
+    def complete(self) -> bool:
+        """Есть ли все четыре поля — от этого зависят доли «ушло от запаса»."""
+        return self.fields >= set(FIELDS)
+
+    @property
     def balanced(self) -> bool:
         """Сходится ли разбор с итоговой колонкой отчёта.
 
@@ -142,5 +170,5 @@ class Ledger:
         if self.reported is None:
             return True
         mine = self.total([store.title for store in self.stores])
-        return all(abs(getattr(mine, field) - getattr(self.reported, field)) < 0.01
-                   for field in ("opening", "incoming", "outgoing", "closing"))
+        return all(abs(getattr(mine, name) - getattr(self.reported, name)) < 0.01
+                   for name in self.fields)

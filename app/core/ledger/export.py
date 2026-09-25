@@ -53,6 +53,11 @@ def default_name(folder: str) -> str:
 
 # --- оформление ----------------------------------------------------------------
 
+def _share(report: Report, value: float) -> float | None:
+    """Доля «ушло от запаса» — пусто, если запас в выгрузке неполный."""
+    return value if report.shares else None
+
+
 def _title(sheet: Worksheet, row: int, text: str, width: int) -> int:
     cell = sheet.cell(row, 1, text)
     cell.font = Font(FONT, size=13, bold=True, color="1F3864")
@@ -129,13 +134,15 @@ def _summary(sheet: Worksheet, report: Report) -> None:
 
     total = report.total
     rows = [
+        ("Вид отчёта", report.ledger.layout),
+        ("Файлов", len(report.ledger.sources) or 1),
         ("Магазинов", len(report.ledger.shops)),
         ("Товаров в ведомости", len(report.ledger.items)),
         ("Начальный остаток", total.opening),
         ("Приход", total.incoming),
         ("Расход", total.outgoing),
         ("Конечный остаток", total.closing),
-        ("Израсходовано от запаса", total.share),
+        ("Израсходовано от запаса", _share(report, total.share)),
         ("Кончилось, а расход был", len(report.shortages)),
         ("Остатка меньше, чем ушло", len(report.tight)),
         ("Отрицательный остаток", len(report.negative)),
@@ -143,9 +150,14 @@ def _summary(sheet: Worksheet, report: Report) -> None:
     ]
     row = _head(sheet, row, ["Показатель", "Значение"])
     for number, (name, value) in enumerate(rows):
-        fmt = "t%" if name == "Израсходовано от запаса" else "tn"
+        fmt = ("t%" if name == "Израсходовано от запаса"
+               else "tt" if isinstance(value, str) else "tn")
         _row(sheet, row, [name, value], formats=fmt, stripe=number % 2 == 1)
         row += 1
+
+    for warning in report.ledger.warnings:
+        row += 1
+        row = _note(sheet, row, warning, 4)
 
     if report.doubled:
         row += 1
@@ -168,7 +180,7 @@ def _lines_sheet(sheet: Worksheet, report: Report, lines: list[Line], *,
     for number, line in enumerate(lines):
         _row(sheet, row, [line.article, line.name, line.store,
                           line.move.outgoing, line.move.closing,
-                          line.move.share],
+                          _share(report, line.move.share)],
              formats="tttnn%", stripe=number % 2 == 1, warn=warn)
         row += 1
     if not lines:
@@ -198,7 +210,7 @@ def _shortages(sheet: Worksheet, report: Report) -> None:
     for number, line in enumerate(report.negative):
         _row(sheet, row, [line.article, line.name, line.store,
                           line.move.outgoing, line.move.closing,
-                          line.move.share],
+                          _share(report, line.move.share)],
              formats="tttnn%", stripe=number % 2 == 1, warn=True)
         row += 1
     if not report.negative:
@@ -237,7 +249,7 @@ def _stores(sheet: Worksheet, report: Report) -> None:
     for total in report.stores:
         cell_row = [total.store.title, "— всего по магазину", total.move.outgoing,
                     total.move.closing, total.items, total.ran_out,
-                    total.move.share]
+                    _share(report, total.move.share)]
         _row(sheet, row, cell_row, formats="ttnnnn%")
         for column in range(1, 8):
             sheet.cell(row, column).font = Font(FONT, size=10, bold=True)
@@ -245,7 +257,8 @@ def _stores(sheet: Worksheet, report: Report) -> None:
         row += 1
         for number, line in enumerate(total.top):
             _row(sheet, row, ["", line.name, line.move.outgoing,
-                              line.move.closing, None, None, line.move.share],
+                              line.move.closing, None, None,
+                              _share(report, line.move.share)],
                  formats="ttnntt%", stripe=number % 2 == 1,
                  warn=line.move.ran_out)
             row += 1

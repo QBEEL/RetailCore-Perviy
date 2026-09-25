@@ -97,6 +97,15 @@ class Report:
         return self.items[:self.limit]
 
     @property
+    def shares(self) -> bool:
+        """Можно ли показывать «ушло от запаса».
+
+        Запас — это начальный остаток плюс приход. Если одного из полей в
+        выгрузке нет, оно прочитано нулём, и доля вышла бы выдуманной.
+        """
+        return self.ledger.complete
+
+    @property
     def doubled(self) -> list[Store]:
         """Склады с повторяющимся названием — о них стоит предупредить."""
         return [store for store in self.ledger.stores if store.doubled]
