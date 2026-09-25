@@ -362,3 +362,57 @@ def test_повторное_открытие_не_плодит_окна(page):
     page.date_from._show_calendar()
 
     assert page.date_from._popup is first
+
+
+# --- направление ------------------------------------------------------------------
+
+def _directions():
+    from app.core.suppliers.directory import Direction
+    return [Direction(code="beauty", title="Beauty", sort_order=1),
+            Direction(code="fashion", title="Fashion", sort_order=2)]
+
+
+def test_без_входа_направление_недоступно(page):
+    assert page.direction_filter.isEnabled() is False
+    assert page.current_filter().direction == ""
+
+
+def test_направление_уходит_в_условия(page, monkeypatch):
+    from app.ui import payments_page as module
+    monkeypatch.setattr(module, "run_task",
+                        lambda fn, *a, on_result, on_error=None: on_result(_directions()))
+    page._load_directions()
+    titles = [page.direction_filter.itemText(i) for i in range(page.direction_filter.count())]
+    assert titles == ["Все направления", "Beauty", "Fashion", "Остальные"]
+
+    page.direction_filter.setCurrentIndex(page.direction_filter.findData("fashion"))
+    assert page.current_filter().direction == "fashion"
+    page._refresh_filters_summary()
+    assert "направление: Fashion" in page.filters_summary.text()
+    hint = page.direction_filter.toolTip()
+    assert "Баранова Олеся" in hint
+    assert "Лёвкина София" in hint and "Л?вкина" not in hint
+
+    page.reset_filters()
+    assert page.current_filter().direction == ""
+
+
+def test_выборка_отбирается_по_направлению(monkeypatch):
+    from app.core.payments.store import Filter
+    from app.ui import payments_page as module
+    rows = [Payment(amount=1.0, recipient="Суперкосметикс ООО", responsible="Когай Анна"),
+            Payment(amount=2.0, recipient="Суперкосметикс ООО", responsible="Баранова Олеся"),
+            Payment(amount=3.0, recipient="Ростелеком ПАО", responsible="Когай Анна")]
+    monkeypatch.setattr(data, "online", lambda: False)
+    monkeypatch.setattr(store, "refresh_overdue", lambda *a, **k: 0)
+    monkeypatch.setattr(store, "list_payments", lambda *a, **k: list(rows))
+    monkeypatch.setattr(store, "known_values", lambda *a, **k: {})
+    monkeypatch.setattr(module.directory, "direction_keys",
+                        lambda: {"суперкосметикс": ("beauty",)})
+
+    picked, _, _ = module._load_all(Filter(direction="beauty"))
+    assert [p.amount for p in picked] == [1.0]
+    picked, _, _ = module._load_all(Filter(direction="fashion"))
+    assert [p.amount for p in picked] == [2.0]
+    picked, _, _ = module._load_all(Filter(direction="none"))
+    assert [p.amount for p in picked] == [3.0]

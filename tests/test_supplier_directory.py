@@ -283,3 +283,55 @@ def test_без_входа_направлений_нет_и_ошибки_тож�
 
     assert not directory.online()
     assert directory.directions() == []
+
+
+# --- направления для отбора оплат ---------------------------------------------------
+
+def test_ключи_направлений_собираются_по_всем_направлениям(calls, monkeypatch):
+    """Словарь для отбора оплат: только поставщики с направлением, со всех страниц."""
+    log, answers = calls
+    answers["/api/suppliers/directions"] = [
+        {"id": 1, "code": "beauty", "title": "Beauty", "sort_order": 1},
+        {"id": 2, "code": "fashion", "title": "Fashion", "sort_order": 2},
+    ]
+    pages = {
+        ("beauty", 1): {"items": [_entry(directions=["beauty"])],
+                        "total": 2, "page": 1, "page_size": 500},
+        ("beauty", 2): {"items": [_entry(recipient_key="nevalain",
+                                         directions=["beauty", "fashion"])],
+                        "total": 2, "page": 2, "page_size": 500},
+        ("fashion", 1): {"items": [_entry(recipient_key="nevalain",
+                                          directions=["beauty", "fashion"])],
+                         "total": 1, "page": 1, "page_size": 500},
+    }
+    original = transport.get
+
+    def get(path, params=None):
+        if path == "/api/suppliers":
+            log.append(("GET", path, params))
+            return pages[(params["direction"], params["page"])]
+        return original(path, params)
+
+    monkeypatch.setattr(transport, "get", get)
+    # Страница в пятьсот строк, а в тесте всего две: итог «2» при первой
+    # странице в одну строку должен заставить прочитать вторую.
+    monkeypatch.setattr(directory, "suppliers",
+                        lambda **kw: directory._page(get("/api/suppliers", kw)))
+
+    keys = directory.direction_keys()
+
+    assert keys == {"superkosmetiks": ("beauty",),
+                    "nevalain": ("beauty", "fashion")}
+
+
+def test_без_входа_ключей_направлений_нет(monkeypatch):
+    monkeypatch.setattr(transport.session, "token", "")
+    assert directory.direction_keys() == {}
+
+
+def test_ключ_с_кириллицей_кодируется_в_адресе(calls):
+    """Настоящие ключи — «сафило снг»: пробел и кириллица в пути запроса."""
+    log, _ = calls
+    directory.set_directions("сафило снг", ["fashion"])
+    _, path, _ = log[0]
+    assert path == "/api/suppliers/%D1%81%D0%B0%D1%84%D0%B8%D0%BB%D0%BE%20%D1%81%D0%BD%D0%B3/directions"

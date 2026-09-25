@@ -56,6 +56,11 @@ from ..core.payments import (
     service,
     transport,
 )
+from ..core.payments.directions import (
+    NO_DIRECTION,
+    RESPONSIBLE_DIRECTIONS,
+    by_direction,
+)
 # Источник оплат выбирается на каждом вызове: общая база, если выполнен вход,
 # иначе своя локальная. Имя `store` оставлено прежним — вызовов по нему
 # полтора десятка, и переименование ничего бы не дало.
@@ -248,6 +253,16 @@ class PaymentsPage(QWidget):
 
         first = QHBoxLayout()
         first.setSpacing(8)
+        # Направление первым: это самый крупный разрез, и календарь с бюджетом
+        # чаще всего смотрят по своему отделу. Список наполняется с сервера
+        # после входа — см. `_load_directions`.
+        self.direction_filter = SelectBox(self.filters_body)
+        self.direction_filter.addItem("Все направления", "")
+        self.direction_filter.setMinimumWidth(170)
+        self.direction_filter.setEnabled(False)
+        self.direction_filter.setToolTip("Направления доступны после входа в общую базу")
+        first.addWidget(self.direction_filter)
+
         self.status_filter = SelectBox(self.filters_body)
         self.status_filter.addItem("Все статусы", "")
         for status in STATUS_ORDER:
@@ -337,6 +352,7 @@ class PaymentsPage(QWidget):
 
     def _filter_boxes(self) -> tuple[SelectBox, ...]:
         return (
+            self.direction_filter,
             self.status_filter, self.period_filter, self.origin_filter,
             self.supplier_filter, self.responsible_filter, self.operation_filter,
         )
@@ -354,6 +370,7 @@ class PaymentsPage(QWidget):
         """
         names: list[str] = []
         for box, label in (
+            (self.direction_filter, "направление"),
             (self.status_filter, "статус"), (self.origin_filter, "источник"),
             (self.supplier_filter, "поставщик"), (self.responsible_filter, "ответственный"),
             (self.operation_filter, "операция"),
@@ -1462,6 +1479,8 @@ class PaymentsPage(QWidget):
             selection.responsible = name
         if name := self.operation_filter.currentData():
             selection.operation = name
+        if code := self.direction_filter.currentData():
+            selection.direction = code
         return selection
 
     def reload(self) -> None:
@@ -1562,6 +1581,33 @@ class PaymentsPage(QWidget):
         run_task(directory.conflicts, on_result=show,
                  on_error=lambda _: self.conflicts_hint.hide())
 
+    def _load_directions(self) -> None:
+        """Наполняет список направлений с сервера.
+
+        Отдельной задачей: список нужен один раз на вход, а не на каждое
+        перечитывание выборки. Без входа направлений нет — список гаснет и
+        возвращается к «Все направления»: отбор, который нечем посчитать,
+        показывал бы неполный календарь под видом отфильтрованного.
+        """
+        def fill(items: list) -> None:
+            current = self.direction_filter.currentData()
+            self.direction_filter.blockSignals(True)
+            self.direction_filter.clear()
+            self.direction_filter.addItem("Все направления", "")
+            for item in items:
+                self.direction_filter.addItem(item.title, item.code)
+            if items:
+                self.direction_filter.addItem("Остальные", NO_DIRECTION)
+            self.direction_filter.setCurrentIndex(
+                max(self.direction_filter.findData(current), 0))
+            self.direction_filter.blockSignals(False)
+            self.direction_filter.setEnabled(bool(items))
+            self.direction_filter.setToolTip(
+                _direction_hint(items) if items
+                else "Направления доступны после входа в общую базу")
+
+        run_task(directory.directions, on_result=fill, on_error=lambda _: fill([]))
+
     def _fill_filter_lists(self, known: dict[str, list[str]]) -> None:
         for box, key, label in (
             (self.responsible_filter, "responsible", "Все ответственные"),
@@ -1582,6 +1628,7 @@ class PaymentsPage(QWidget):
         if self._loaded:
             return
         self._connect()
+        self._load_directions()
         self.reload()
         self._remind_import()
 
@@ -1824,7 +1871,26 @@ def _load_all(
     """Читает выборку, справочные списки и пересчитывает просрочку."""
     overdue = store.refresh_overdue()
     rows = store.list_payments(selection, order="pay_date DESC, id DESC")
+    if selection.direction:
+        # Направления поставщиков — только на сервере, поэтому отбор идёт по
+        # прочитанным строкам и одинаково для общей и для локальной базы.
+        rows = by_direction(rows, selection.direction, directory.direction_keys())
     return rows, store.known_values(), overdue
+
+
+def _direction_hint(items: list) -> str:
+    """Подсказка списка направлений: по какому правилу оплата попадает в отдел."""
+    lines: list[str] = []
+    for item in items:
+        # Написание с потерянной буквой — для сравнения с выгрузкой, а не
+        # для показа: второй раз то же имя в подсказке только сбивает.
+        people = [name for name, code in RESPONSIBLE_DIRECTIONS.items()
+                  if code == item.code and "?" not in name]
+        lines.append(
+            f"{item.title} — оплаты, оформленные: {', '.join(people)}" if people
+            else f"{item.title} — оплаты поставщикам этого направления")
+    lines.append("Остальные — всё, что не попало ни в одно направление")
+    return "\n".join(lines)
 
 
 def _done_text(row: PlanFact) -> str:

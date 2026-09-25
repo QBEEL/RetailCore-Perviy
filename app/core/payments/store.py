@@ -93,6 +93,10 @@ class Filter:
     suppliers_only: bool = False
     # Платежи без даты в календарь не попадают, а в таблице должны быть видны.
     dated_only: bool = False
+    # Код направления или `directions.NO_DIRECTION`. В условие запроса не
+    # входит: направления живут на сервере, а оплаты бывают и локальными, —
+    # отбирает `directions.by_direction` уже прочитанные строки.
+    direction: str = ""
 
     @property
     def active(self) -> bool:
@@ -101,7 +105,7 @@ class Filter:
             or self.supplier_id
             or self.recipient or self.amount_from is not None or self.amount_to is not None
             or self.responsible or self.operation or self.over_limit is not None
-            or self.suppliers_only
+            or self.suppliers_only or self.direction
         )
 
     def where(self) -> tuple[str, list[Any]]:

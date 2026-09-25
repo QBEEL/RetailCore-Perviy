@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from urllib.parse import quote
 
 from ..payments import transport
 
@@ -126,6 +127,31 @@ def directions() -> list[Direction]:
             for row in transport.get("/api/suppliers/directions")]
 
 
+def direction_keys() -> dict[str, tuple[str, ...]]:
+    """Ключ получателя → его направления, только у кого они есть.
+
+    Нужно отбору оплат по направлению. Список собирается из той же страницы
+    поставщиков, что показывает вкладка «Поставщики», — правило, по которому
+    поставщик попадает в направление, остаётся одно, на сервере. Без входа
+    направлений нет, и словарь пуст.
+    """
+    if not online():
+        return {}
+    found: dict[str, tuple[str, ...]] = {}
+    size = 500
+    for item in directions():
+        page = 1
+        while True:
+            answer = suppliers(direction=item.code, sort="name", order="asc",
+                               page=page, page_size=size)
+            for entry in answer.items:
+                found[entry.recipient_key] = tuple(entry.directions)
+            if not answer.items or page * size >= answer.total:
+                break
+            page += 1
+    return found
+
+
 def managers() -> list[tuple[int, str]]:
     """Менеджеры для фильтра: только те, за кем что-то закреплено."""
     if not online():
@@ -207,9 +233,15 @@ def unassign(keys: list[str], user_ids: list[int] | None = None) -> Result:
 
 
 def set_directions(recipient_key: str, codes: list[str]) -> list[str]:
-    """Задать направления вручную. Пустой список вернёт автоматический расчёт."""
-    return list(transport.patch(f"/api/suppliers/{recipient_key}/directions",
-                                {"codes": codes}))
+    """Задать направления вручную. Пустой список вернёт автоматический расчёт.
+
+    Ключ кодируется целиком: в нём кириллица и пробелы, а в именах бывают
+    «/» и «?» — без кодирования запрос ушёл бы не по тому адресу или не ушёл
+    бы вовсе.
+    """
+    return list(transport.patch(
+        f"/api/suppliers/{quote(recipient_key, safe='')}/directions",
+        {"codes": codes}))
 
 
 def _page(answer: dict) -> Page:
