@@ -77,8 +77,35 @@ def test_справочник_отдаёт_списки_для_выпадающ�
     names = [row[0] for row in sheet.iter_rows(min_row=2, max_col=1, values_only=True) if row[0]]
     managers = [row[0] for row in sheet.iter_rows(min_row=2, min_col=2, max_col=2,
                                                   values_only=True) if row[0]]
-    assert names == SUPPLIERS
+    assert names == sorted(SUPPLIERS, key=str.lower)
     assert managers == MANAGERS
+    workbook.close()
+
+
+def test_список_поставщиков_сужается_по_вписанному(template):
+    """Поставщиков сотни: вписанное начало названия оставляет в списке подходящих."""
+    workbook = openpyxl.load_workbook(template)
+    sheet = workbook[plan.TEMPLATE_SHEET]
+    rule = next(rule for rule in sheet.data_validations.dataValidation
+                if "B7" in str(rule.sqref))
+    source = rule.formula1
+    # Ссылка на ячейку относительная — Excel сдвигает её для каждой строки.
+    assert 'MATCH(B7&"*"' in source and "$B$7" not in source
+    assert "OFFSET(" in source and "COUNTIF(" in source
+    # Проверка данных в Excel не принимает формулу длиннее 255 символов.
+    long = plan._narrowing_list("B7", plan.DIRECTORY_ROWS)
+    assert len(long) <= 255
+    workbook.close()
+
+
+def test_справочник_отсортирован_для_сужения(tmp_path):
+    """Сужение берёт сплошной кусок списка — без сортировки он был бы чужим."""
+    destination = str(tmp_path / "Шаблон.xlsx")
+    plan.write_template(destination, suppliers=["нева ООО", "Альфа", "НЕВАЛАЙН", "Бета"])
+    workbook = openpyxl.load_workbook(destination)
+    sheet = workbook[plan.DIRECTORY_SHEET]
+    names = [row[0] for row in sheet.iter_rows(min_row=2, max_col=1, values_only=True) if row[0]]
+    assert names == ["Альфа", "Бета", "нева ООО", "НЕВАЛАЙН"]
     workbook.close()
 
 

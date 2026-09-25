@@ -218,6 +218,8 @@ def write_template(
     moment = date.today()
     year = year or moment.year
     month = month or moment.month
+    # Порядок — не красота: на нём держится сужение списка (`_narrowing_list`).
+    suppliers = sorted(suppliers, key=str.lower)
     workbook = openpyxl.Workbook()
     try:
         sheet = workbook.active
@@ -277,14 +279,16 @@ def _fill_template(
     for cell in ("A2", "A3"):
         sheet[cell].font = Font(bold=True)
     sheet["A4"] = (
-        "Заполните строки ниже: дата оплаты, поставщик и сумма. Пустая ставка "
+        "Заполните строки ниже: дата оплаты, поставщик и сумма. Поставщика "
+        "проще искать так: впишите начало названия, нажмите Enter и откройте "
+        "список — в нём останутся только подходящие. Пустая ставка "
         "НДС читается как 22 %. Строки без даты, поставщика или суммы "
         "пропускаются. Файл заменяет ваш план целиком за те месяцы, что в нём "
         "встретились, — уже оплаченное не затрагивается.")
     sheet["A4"].font = Font(italic=True, size=10)
     sheet["A4"].alignment = Alignment(wrap_text=True, vertical="top")
     sheet.merge_cells("A4:E4")
-    sheet.row_dimensions[4].height = 44
+    sheet.row_dimensions[4].height = 60
 
     head = 6
     fill = PatternFill("solid", fgColor="EEF2FF")
@@ -304,14 +308,37 @@ def _fill_template(
         sheet.cell(row=row, column=3).number_format = "# ##0.00"
 
     _validate(sheet, f"B{first}:B{last}",
-              f"'{DIRECTORY_SHEET}'!$A$2:$A${max(suppliers, 1) + 1}",
-              "Поставщик", "Выберите из списка или впишите своего.")
+              _narrowing_list(f"B{first}", max(suppliers, 1)),
+              "Поставщик",
+              "Впишите начало названия и нажмите Enter — список сузится до "
+              "подходящих. Нового поставщика впишите целиком.")
     _validate(sheet, f"D{first}:D{last}",
               f"'{DIRECTORY_SHEET}'!$C$2:$C${len(vat.RATES) + 1}",
               "Ставка НДС", "Пустая ячейка читается как 22 %.")
     if managers:
         _validate(sheet, "B2", f"'{DIRECTORY_SHEET}'!$B$2:$B${managers + 1}",
                   "Менеджер", "Тот, чей это план.")
+
+
+def _narrowing_list(cell: str, count: int) -> str:
+    """Список поставщиков, сужающийся до тех, что начинаются с вписанного.
+
+    Поставщиков сотни, и листать их все ради одного — то, на что жалуются.
+    Поиск в самом списке есть только в свежем Excel 365, поэтому сужение
+    собрано формулами, которые понимает любой Excel: вписанное в ячейку
+    становится префиксом, и список показывает только совпавший кусок
+    справочника. Кусок сплошной, потому что справочник отсортирован без учёта
+    регистра — как сравнивают MATCH и COUNTIF. Пустая ячейка даёт «*», то есть
+    весь справочник; ничего не совпало — тоже весь, а не пустой список.
+
+    Ссылка на ячейку относительная: Excel сдвигает её для каждой строки
+    диапазона проверки, и каждая строка сужает список по своему тексту.
+    """
+    names = f"'{DIRECTORY_SHEET}'!$A$2:$A${count + 1}"
+    prefix = f'{cell}&"*"'
+    return (f"IF(COUNTIF({names},{prefix}),"
+            f"OFFSET('{DIRECTORY_SHEET}'!$A$1,MATCH({prefix},{names},0),0,"
+            f"COUNTIF({names},{prefix}),1),{names})")
 
 
 def _validate(sheet: Any, cells: str, source: str, title: str, prompt: str) -> None:
