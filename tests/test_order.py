@@ -388,3 +388,17 @@ def test_added_position_is_written_to_form(marked_form: str) -> None:
     assert line.method == "LIMITED"
     assert order.build_updates([line], target) == [(6, 4, 4)]
     assert order.summarize([line])["добавлено"] == 1
+
+
+def test_invoice_as_source_takes_quantity_column(tmp_path) -> None:
+    """В счёте поставщика колонки «Заказ» нет — количество берётся из «Кол-во»."""
+    book = openpyxl.Workbook()
+    book.active.append(["№", "Артикул", "Товары", "Кол-во", "Ед.", "Цена", "Сумма"])
+    book.active.append([1, "0022", "Крем 50мл", 3, "шт", 1586.0, 4758.0])
+    path = tmp_path / "счёт.xlsx"
+    book.save(path)
+
+    source = order.detect_source(str(path))
+    assert source.title_of(source.quantity) == "Кол-во"
+    # Бланку запасная колонка не положена: «Количество» там — не заказ.
+    assert order.detect_target(str(path)).quantity is None

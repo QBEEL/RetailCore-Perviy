@@ -18,6 +18,11 @@ from .workbook import list_sheets, read_raw
 
 # Заголовки, по которым распознаются колонки.
 _ORDER_WORDS = ("заказ", "к заказу", "order")
+# Запасные — только для выгрузки: в счёте поставщика колонки «Заказ» нет, есть
+# «Кол-во». У бланка так нельзя: «Количество» там бывает остатком или
+# кратностью, и заказ записался бы поверх них. Слова — уже после normalize_text:
+# «Кол-во» там становится «кол во». Голое «кол» не годится — оно есть в «колонке».
+_QUANTITY_WORDS = ("кол во", "количество", "qty", "quantity")
 _ARTICLE_WORDS = ("артикул", "article")
 _EAN_WORDS = ("штрихкод", "штрих код", "ean", "barcode", "gtin")
 _NAME_WORDS = ("номенклатура", "наименование", "товар", "продукт", "name")
@@ -371,7 +376,7 @@ def _count_values(rows: Sequence[Sequence[Any]], column: int, start: int) -> int
     )
 
 
-def parse_sheet(path: str, sheet: str | None = None) -> OrderSheet:
+def parse_sheet(path: str, sheet: str | None = None, *, source: bool = False) -> OrderSheet:
     """Читает лист и определяет нужные колонки, сверяя заголовки с данными."""
     rows, resolved = read_raw(path, sheet)
     header = _header_row(rows)
@@ -391,9 +396,12 @@ def parse_sheet(path: str, sheet: str | None = None) -> OrderSheet:
         width = len(titles)
         parsed.ean = _best(list(range(width)), rows, start, _count_codes)
 
+    candidates = _match_header(titles, _ORDER_WORDS)
+    if not candidates and source:
+        candidates = _match_header(titles, _QUANTITY_WORDS)
     parsed.options = [
         ColumnOption(index, titles[index] or f"Колонка {index + 1}", _count_numeric(rows, index, start))
-        for index in _match_header(titles, _ORDER_WORDS)
+        for index in candidates
     ]
     # Из нескольких колонок «Заказ» (в 1С они есть у каждого магазина) берётся
     # та, где реально есть числа. Если чисел нет нигде — та, чей заголовок про
@@ -417,7 +425,7 @@ def detect_source(path: str) -> OrderSheet:
     """Лист выгрузки, где колонка заказа действительно заполнена."""
     best: OrderSheet | None = None
     for sheet in list_sheets(path):
-        parsed = parse_sheet(path, sheet)
+        parsed = parse_sheet(path, sheet, source=True)
         filled = parsed.options[0].filled if parsed.options else 0
         if best is None or filled > (best.options[0].filled if best.options else 0):
             best = parsed
@@ -442,7 +450,7 @@ def detect_target(path: str) -> OrderSheet:
 def open_sheet(path: str, sheet: str | None = None, *, source: bool) -> OrderSheet:
     """Явно выбранный лист, а если не выбран — определённый автоматически."""
     if sheet:
-        return parse_sheet(path, sheet)
+        return parse_sheet(path, sheet, source=source)
     return detect_source(path) if source else detect_target(path)
 
 
