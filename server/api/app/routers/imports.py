@@ -76,6 +76,9 @@ class ExistingRow(BaseModel):
     # нужно, а лишние мегабайты по сети — нужны ещё меньше.
     manual: bool
     values: dict[str, Any]
+    # Сумма до ручной правки. Клиенту нужна для предпросмотра: пока 1С
+    # присылает её же, правка человека остаётся, и строка не «изменится».
+    amount_before: float | None = None
 
 
 class ImportPayment(BaseModel):
@@ -128,7 +131,7 @@ def existing_index(user: User = Depends(security.admin_only)) -> list[ExistingRo
     names = ", ".join(IMPORTED_FIELDS)
     rows = db.fetch_all(
         f"SELECT id, doc_number, request_date, origin, status,"
-        f"       (comment <> '') AS manual, {names}"
+        f"       (comment <> '') AS manual, amount_before, {names}"
         " FROM payment WHERE doc_number <> ''")
     return [
         ExistingRow(
@@ -136,6 +139,8 @@ def existing_index(user: User = Depends(security.admin_only)) -> list[ExistingRo
             request_date=row["request_date"], origin=row["origin"],
             status=row["status"], manual=row["manual"],
             values={name: row[name] for name in IMPORTED_FIELDS},
+            amount_before=(float(row["amount_before"])
+                           if row["amount_before"] is not None else None),
         )
         for row in rows
     ]
@@ -164,11 +169,14 @@ def apply_import(form: ImportApply,
                 [[*_row(item, INSERT_FIELDS), user.id] for item in form.created])
 
         if form.changed:
-            assignments = ", ".join(f"{name} = %s" for name in IMPORTED_FIELDS)
+            assignments = ", ".join(
+                [f"{name} = %({name})s" for name in IMPORTED_FIELDS
+                 if name != "amount"] + [IMPORTED_AMOUNT])
             handle.executemany(
                 f"UPDATE payment SET {assignments}, updated_at = now(),"
-                " updated_by = %s WHERE id = %s",
-                [[*_row(item.payment, IMPORTED_FIELDS), user.id, item.id]
+                " updated_by = %(user)s WHERE id = %(id)s",
+                [{**dict(zip(IMPORTED_FIELDS, _row(item.payment, IMPORTED_FIELDS))),
+                  "user": user.id, "id": item.id}
                  for item in form.changed])
 
         # Одна запись на прогон, а не на строку: семь тысяч одинаковых строк
@@ -181,6 +189,21 @@ def apply_import(form: ImportApply,
                                   "изменено": len(form.changed)})))
 
     return ImportResult(new=len(form.created), updated=len(form.changed))
+
+
+# Сумма из 1С и ручная правка. Решает сервер, а не клиент: импорт из старой
+# версии приложения иначе молча стёр бы правку человека.
+# · в 1С всё та же сумма, что была до правки, — правка остаётся;
+# · 1С прислала сумму, равную исправленной, — 1С догнала, пометка остаётся;
+# · 1С прислала другую — она новее правки: сумма из 1С, пометка снимается.
+_KEEP = "amount_before IS NOT NULL AND abs(amount_before - %(amount)s::numeric) < 0.005"
+_SAME = "abs(amount - %(amount)s::numeric) < 0.005"
+IMPORTED_AMOUNT = (
+    f"amount = CASE WHEN {_KEEP} THEN amount ELSE %(amount)s END,"
+    f" amount_before = CASE WHEN {_KEEP} OR {_SAME} THEN amount_before END,"
+    f" amount_changed_by = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_by END,"
+    f" amount_changed_at = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_at END"
+)
 
 
 def _row(item: ImportPayment, fields: tuple[str, ...]) -> list[Any]:

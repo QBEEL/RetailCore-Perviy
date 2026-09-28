@@ -326,3 +326,72 @@ def test_без_сервера_вкладка_открывается_и_закр
 
     assert not page.claim_button.isEnabled()
     assert not page.withdraw_button.isEnabled()
+
+
+# --- ручное направление ------------------------------------------------------------
+
+def test_направление_вручную_скрыто_от_менеджера(application, stub):
+    page = _page(application)
+    assert not page.direction_button.isVisibleTo(page)
+
+
+def test_администратор_задаёт_направление_выделенным(application, stub, monkeypatch):
+    """Отмечено общее для выделенных; сохранение уходит каждому из них."""
+    from app.ui import suppliers_page as module
+
+    monkeypatch.setattr(transport.session, "is_admin", True)
+    sent: list[tuple[list[str], list[str]]] = []
+    monkeypatch.setattr(directory, "set_directions_many",
+                        lambda keys, codes: sent.append((keys, codes)) or len(keys))
+    seen: dict = {}
+
+    class Dialog:
+        def __init__(self, names, directions, chosen, parent):
+            seen.update(names=names, chosen=chosen,
+                        codes=[d.code for d in directions])
+
+        def exec(self):
+            return True
+
+        def codes(self):
+            return ["rent"]
+
+    monkeypatch.setattr(module, "DirectionDialog", Dialog)
+    page = _page(application)
+    page.table.selectAll()
+    _settle(application)
+    assert page.direction_button.isVisibleTo(page)
+    assert page.direction_button.isEnabled()
+
+    page.set_direction_selected()
+    _settle(application)
+
+    assert seen["codes"] == ["beauty", "fashion"]
+    # У «Мода Хаус» направления нет — общего у троих выделенных тоже нет.
+    assert seen["chosen"] == set()
+    assert sent == [(["superkosmetiks", "nevalain", "modahouse"], ["rent"])]
+
+
+def test_окно_направления_делит_отдел_и_расход(application):
+    from app.ui.widgets.direction_dialog import DirectionDialog
+
+    directions = [
+        directory.Direction(code="beauty", title="Beauty", sort_order=1),
+        directory.Direction(code="rent", title="Аренда", sort_order=5, for_people=False),
+    ]
+    dialog = DirectionDialog(["Арендодатель ООО"], directions, {"beauty"})
+    assert dialog.codes() == ["beauty"]
+    assert dialog.save.isEnabled()
+
+    for code, box in dialog.boxes:
+        box.setChecked(code == "rent")
+    assert dialog.codes() == ["rent"]
+
+    # Пустой выбор этой кнопкой не сохраняется: для возврата к закреплению
+    # есть своя, и снятые по ошибке флажки молча его не сделают.
+    for _, box in dialog.boxes:
+        box.setChecked(False)
+    assert not dialog.save.isEnabled()
+
+    dialog._reset()
+    assert dialog.codes() == []

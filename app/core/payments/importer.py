@@ -30,6 +30,7 @@ from typing import Callable, Iterable, Sequence
 
 from ..normalize import normalize_text
 from .models import (
+    AMOUNT_EPSILON,
     ImportReport,
     Payment,
     PaymentOrigin,
@@ -337,6 +338,23 @@ def _differs(payment: Payment, existing: object) -> bool:
     return False
 
 
+def _keep_manual_amount(payment: Payment, found: object) -> None:
+    """Сумма, поправленная человеком, переживает импорт — пока 1С её не сменила.
+
+    В 1С всё та же сумма, что была до правки, — значит, правка новее выгрузки,
+    и перезаписать её означало бы молча откатить решение человека каждым
+    понедельничным импортом. Пришла другая сумма — она новее правки и
+    берётся как есть. Сервер применяет то же правило сам; здесь оно нужно,
+    чтобы предпросмотр не обещал изменить то, что не изменится.
+    """
+    before = getattr(found, "amount_before", None)
+    if before is None or abs(float(before) - payment.amount) >= AMOUNT_EPSILON:
+        return
+    stored = getattr(found, "values", {}).get("amount")
+    if stored is not None:
+        payment.amount = float(stored)
+
+
 def split_changes(
     report: ImportReport,
     existing: dict[tuple[str, str], object],
@@ -360,6 +378,7 @@ def split_changes(
             continue
         if getattr(found, "origin", "") != PaymentOrigin.IMPORT.value:
             continue
+        _keep_manual_amount(payment, found)
         if _differs(payment, found):
             changed.append((int(getattr(found, "id", 0)), payment))
     return created, changed

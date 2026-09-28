@@ -90,6 +90,11 @@ class PaymentOut(BaseModel):
     # Может ли текущий пользователь править эту запись. Считается на сервере,
     # чтобы клиент не повторял правило и не разошёлся с ним при изменении.
     editable: bool = False
+    # Сумма до ручной правки, кто и когда правил. Пусто — сумму не трогали
+    # или вернули к прежней.
+    amount_before: float | None = None
+    amount_changed_by: str = ""
+    amount_changed_at: datetime | None = None
 
 
 class PaymentPatch(BaseModel):
@@ -271,6 +276,9 @@ class DirectionOut(BaseModel):
     title: str
     sort_order: int = 0
     is_active: bool = True
+    # Можно ли назначить направление учётке. Нет — у направлений расхода
+    # (маркетинг, налоги, аренда): это не отдел, и поставщиков по ним не ведут.
+    for_people: bool = True
 
 
 class AssignedManager(BaseModel):

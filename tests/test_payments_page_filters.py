@@ -369,7 +369,8 @@ def test_повторное_открытие_не_плодит_окна(page):
 def _directions():
     from app.core.suppliers.directory import Direction
     return [Direction(code="beauty", title="Beauty", sort_order=1),
-            Direction(code="fashion", title="Fashion", sort_order=2)]
+            Direction(code="fashion", title="Fashion", sort_order=2),
+            Direction(code="rent", title="Аренда", sort_order=5, for_people=False)]
 
 
 def test_без_входа_направление_недоступно(page):
@@ -383,7 +384,7 @@ def test_направление_уходит_в_условия(page, monkeypatch
                         lambda fn, *a, on_result, on_error=None: on_result(_directions()))
     page._load_directions()
     titles = [page.direction_filter.itemText(i) for i in range(page.direction_filter.count())]
-    assert titles == ["Все направления", "Beauty", "Fashion", "Остальные"]
+    assert titles == ["Все направления", "Beauty", "Fashion", "Аренда", "Остальные"]
 
     page.direction_filter.setCurrentIndex(page.direction_filter.findData("fashion"))
     assert page.current_filter().direction == "fashion"
@@ -392,6 +393,8 @@ def test_направление_уходит_в_условия(page, monkeypatch
     hint = page.direction_filter.toolTip()
     assert "Баранова Олеся" in hint
     assert "Лёвкина София" in hint and "Л?вкина" not in hint
+    assert "«Оплата арендодателю»" in hint
+    assert "Статья расхода важнее отдела" in hint
 
     page.reset_filters()
     assert page.current_filter().direction == ""
@@ -402,13 +405,16 @@ def test_выборка_отбирается_по_направлению(monkeyp
     from app.ui import payments_page as module
     rows = [Payment(amount=1.0, recipient="Суперкосметикс ООО", responsible="Когай Анна"),
             Payment(amount=2.0, recipient="Суперкосметикс ООО", responsible="Баранова Олеся"),
-            Payment(amount=3.0, recipient="Ростелеком ПАО", responsible="Когай Анна")]
+            Payment(amount=3.0, recipient="Ростелеком ПАО", responsible="Когай Анна"),
+            Payment(amount=4.0, recipient="Европлан ПАО", responsible="Баранова Олеся",
+                    operation="Оплата арендодателю")]
     monkeypatch.setattr(data, "online", lambda: False)
     monkeypatch.setattr(store, "refresh_overdue", lambda *a, **k: 0)
     monkeypatch.setattr(store, "list_payments", lambda *a, **k: list(rows))
     monkeypatch.setattr(store, "known_values", lambda *a, **k: {})
+    monkeypatch.setattr(module.directory, "directions", _directions)
     monkeypatch.setattr(module.directory, "direction_keys",
-                        lambda: {"суперкосметикс": ("beauty",)})
+                        lambda known=None: {"суперкосметикс": ("beauty",)})
 
     picked, _, _ = module._load_all(Filter(direction="beauty"))
     assert [p.amount for p in picked] == [1.0]
@@ -416,3 +422,6 @@ def test_выборка_отбирается_по_направлению(monkeyp
     assert [p.amount for p in picked] == [2.0]
     picked, _, _ = module._load_all(Filter(direction="none"))
     assert [p.amount for p in picked] == [3.0]
+    # Аренда по операции 1С — важнее того, что её оформила Баранова.
+    picked, _, _ = module._load_all(Filter(direction="rent"))
+    assert [p.amount for p in picked] == [4.0]

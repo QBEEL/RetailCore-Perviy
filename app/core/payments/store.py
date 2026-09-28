@@ -21,6 +21,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from .. import appdata
 from .models import (
+    AMOUNT_EPSILON,
     Budget,
     Payment,
     PaymentFile,
@@ -200,6 +201,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
     values = _values(payment)
     with connect(path) as connection:
         if payment.id:
+            values.update(_amount_marks(connection, payment.id, payment.amount, now))
             assignments = ", ".join(f"{name} = ?" for name in values)
             connection.execute(
                 f"UPDATE payment SET {assignments}, updated_at = ? WHERE id = ?",
@@ -213,6 +215,26 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             payment.id = int(cursor.lastrowid)
         connection.commit()
     return payment
+
+
+def _amount_marks(connection: sqlite3.Connection, payment_id: int,
+                  amount: float, now: str) -> dict[str, Any]:
+    """Пометка о ручной правке суммы — то же правило, что на сервере.
+
+    Сумма не изменилась — пометка какая была. Вернули к сумме до правки —
+    снимается. Иначе запоминается сумма до первой правки, а кто и когда —
+    последние: важно, от чего ушли, а не предпоследний шаг.
+    """
+    row = connection.execute(
+        "SELECT amount, amount_before, amount_changed_by, amount_changed_at"
+        " FROM payment WHERE id = ?", (payment_id,)).fetchone()
+    if row is None or abs(float(row["amount"]) - amount) < AMOUNT_EPSILON:
+        return {}
+    before = row["amount_before"] if row["amount_before"] is not None else row["amount"]
+    if abs(float(before) - amount) < AMOUNT_EPSILON:
+        return {"amount_before": None, "amount_changed_by": "", "amount_changed_at": ""}
+    return {"amount_before": float(before), "amount_changed_by": current_user(),
+            "amount_changed_at": now}
 
 
 def delete_payment(payment_id: int, path: str | None = None) -> bool:
@@ -317,6 +339,8 @@ class Existing:
     values: dict[str, Any] = field(default_factory=dict)
     status: str = ""
     manual: bool = False
+    # Сумма до ручной правки: пока 1С присылает её же, правка человека живёт.
+    amount_before: float | None = None
 
 
 def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
@@ -328,7 +352,8 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
     names = ", ".join(IMPORTED_FIELDS)
     with connect(path) as connection:
         rows = connection.execute(
-            f"SELECT id, doc_number, request_date, origin, status, comment, {names}"
+            f"SELECT id, doc_number, request_date, origin, status, comment,"
+            f" amount_before, {names}"
             " FROM payment WHERE doc_number <> ''").fetchall()
     index: dict[tuple[str, str], Existing] = {}
     for row in rows:
@@ -338,6 +363,7 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
             values={name: row[name] for name in IMPORTED_FIELDS},
             status=row["status"],
             manual=bool(row["comment"]),
+            amount_before=row["amount_before"],
         )
     return index
 
@@ -363,10 +389,22 @@ def apply_import(
                 f"INSERT INTO payment ({names}) VALUES ({marks})",
                 [[*row.values(), now, now] for row in new_rows])
         if updates:
+            # Сумму, которую человек поправил и 1С не меняла, разбор уже
+            # оставил прежней (`importer.split_changes`). Если же сумма всё-таки
+            # меняется, она пришла из 1С новой — пометка о правке снимается.
+            # SQLite, как и Postgres, считает правую часть по строке до UPDATE.
             assignments = ", ".join(f"{name} = ?" for name in updates[0][1])
+            same = "ABS(amount - ?) < 0.005"
+            marks = (f"amount_before = CASE WHEN {same} THEN amount_before END,"
+                     f" amount_changed_by = CASE WHEN {same} THEN amount_changed_by"
+                     " ELSE '' END,"
+                     f" amount_changed_at = CASE WHEN {same} THEN amount_changed_at"
+                     " ELSE '' END")
             connection.executemany(
-                f"UPDATE payment SET {assignments}, updated_at = ? WHERE id = ?",
-                [[*row.values(), now, payment_id] for payment_id, row in updates])
+                f"UPDATE payment SET {marks}, {assignments}, updated_at = ?"
+                " WHERE id = ?",
+                [[*[row["amount"]] * 3, *row.values(), now, payment_id]
+                 for payment_id, row in updates])
         connection.commit()
     return len(new_rows), len(updates)
 
@@ -698,6 +736,9 @@ def _payment(row: sqlite3.Row) -> Payment:
         created_at=_moment(row["created_at"]),
         updated_at=_moment(row["updated_at"]),
         files=int(row["files"]) if "files" in keys else 0,
+        amount_before=row["amount_before"],
+        amount_changed_by=row["amount_changed_by"],
+        amount_changed_at=_moment(row["amount_changed_at"]),
     )
 
 

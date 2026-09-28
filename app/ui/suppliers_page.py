@@ -52,6 +52,7 @@ from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
+from .widgets.direction_dialog import DirectionDialog
 from .widgets.common import (
     Badge,
     Card,
@@ -186,6 +187,8 @@ class SuppliersPage(QWidget):
         # запрос уходит на сервер, и собирать его из полудюжины полей на каждом
         # обращении — верный способ разойтись с тем, что видит человек.
         self._direction = ""
+        # Справочник направлений целиком — для ручной разметки администратором.
+        self._directions: list[directory.Direction] = []
         self._manager = 0
         # Чьи справочники сейчас в фильтрах. Страница строится при запуске
         # приложения, а вход в общую базу человек выполняет позже, открыв
@@ -378,6 +381,13 @@ class SuppliersPage(QWidget):
         self.fix_button.setToolTip("Подтвердить заявки выделенных поставщиков")
         self.fix_button.clicked.connect(self.fix_selected)
         row.addWidget(self.fix_button)
+
+        self.direction_button = QPushButton("Направление…", card)
+        self.direction_button.setToolTip(
+            "Задать направление выделенным поставщикам вручную: отдел или "
+            "статья расхода — маркетинг, налоги, аренда")
+        self.direction_button.clicked.connect(self.set_direction_selected)
+        row.addWidget(self.direction_button)
         row.addStretch(1)
 
         add = QPushButton("Карточка", card)
@@ -610,6 +620,7 @@ class SuppliersPage(QWidget):
                                            list[tuple[int, str]]]) -> None:
         directions, managers = payload
         self._filters_for = transport.session.user_id
+        self._directions = list(directions)
         _DIRECTION_TITLES.update({d.code: d.title for d in directions})
 
         # Кнопки пересобираются целиком: вход мог смениться, а вместе с ним и
@@ -814,6 +825,8 @@ class SuppliersPage(QWidget):
         self.fix_button.setVisible(transport.session.is_admin)
         self.fix_button.setEnabled(bool(
             online and any(row.entry.has_draft for row in rows)))
+        self.direction_button.setVisible(transport.session.is_admin)
+        self.direction_button.setEnabled(bool(online and rows and self._directions))
 
     def _selected_rows(self) -> list[Row]:
         return [row for row in self.table.selected_items() if isinstance(row, Row)]
@@ -902,6 +915,41 @@ class SuppliersPage(QWidget):
         self._run_directory(
             lambda: directory.fix(keys),
             lambda result: f"Зафиксировано закреплений: {result.changed}")
+
+    def set_direction_selected(self) -> None:
+        """Ручное направление выделенным поставщикам. Только администратор.
+
+        Отмеченным в окне оказывается то, что уже стоит у всех выделенных:
+        общее для пачки — единственное, что честно показать, не выдумывая.
+        """
+        rows = self._selected_rows()
+        if not rows or not self._directions:
+            return
+        common = set(rows[0].entry.directions)
+        for row in rows[1:]:
+            common &= set(row.entry.directions)
+        dialog = DirectionDialog([row.name for row in rows], self._directions,
+                                 common, self)
+        if not dialog.exec():
+            return
+        codes = dialog.codes()
+        keys = [row.key for row in rows]
+        titles = [_DIRECTION_TITLES.get(code, code) for code in codes]
+
+        def done(count: int) -> None:
+            what = " · ".join(titles) if titles else "по закреплению"
+            self.notify(f"Направление «{what}»: поставщиков {count}",
+                        ToastKind.SUCCESS)
+            self.reload()
+
+        def failed(error: str) -> None:
+            # Запись идёт по одному поставщику, и часть могла уже пройти:
+            # перечитать список, чтобы на экране было то, что на сервере.
+            self.notify(f"Не удалось задать направление: {error}", ToastKind.ERROR)
+            self.reload()
+
+        run_task(lambda: directory.set_directions_many(keys, codes),
+                 on_result=done, on_error=failed)
 
     def _run_directory(self, action: Callable[[], directory.Result],
                        message: Callable[[directory.Result], str]) -> None:

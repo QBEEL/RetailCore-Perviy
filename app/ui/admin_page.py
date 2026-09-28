@@ -470,7 +470,9 @@ def _load_all() -> tuple:
     запросов из интерфейса — это шесть поводов подождать.
     """
     known = data.known_values().get("responsible", [])
-    directions = [(item.code, item.title) for item in directory.directions()]
+    # В учётку — только отделы: расход («Налоги») человеку не назначают.
+    directions = [(item.code, item.title) for item in directory.directions()
+                  if item.for_people]
     claims = directory.pending_claims().items
     return (admin.accounts(), admin.journal(), known, directions, claims,
             admin.scope())

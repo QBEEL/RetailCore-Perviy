@@ -37,7 +37,33 @@ COLUMNS = (
     " p.source_status, p.paid_flag, p.operation, p.over_limit, p.priority,"
     " p.edo_state, p.responsible, p.author, p.comment, p.had_files,"
     " p.origin, p.origin_ref, p.created_at, p.updated_at,"
-    " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files"
+    " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
+    " p.amount_before, p.amount_changed_at,"
+    " COALESCE((SELECT u.full_name FROM app_user u"
+    "           WHERE u.id = p.amount_changed_by), '') AS amount_changed_by"
+)
+
+# Пометка о ручной правке суммы. Все ветки сравнивают с прежними значениями
+# строки — в UPDATE правая часть видит строку до изменения:
+# · сумма не изменилась — пометка какая была;
+# · вернули к сумме до правки — пометка снимается;
+# · иначе запоминается сумма до первой правки, и кто с когда — последние.
+AMOUNT_MARKS = (
+    "amount_before = CASE"
+    "  WHEN abs(amount - %(amount)s::numeric) < 0.005 THEN amount_before"
+    "  WHEN abs(COALESCE(amount_before, amount) - %(amount)s::numeric) < 0.005"
+    "    THEN NULL"
+    "  ELSE COALESCE(amount_before, amount) END,"
+    " amount_changed_by = CASE"
+    "  WHEN abs(amount - %(amount)s::numeric) < 0.005 THEN amount_changed_by"
+    "  WHEN abs(COALESCE(amount_before, amount) - %(amount)s::numeric) < 0.005"
+    "    THEN NULL"
+    "  ELSE %(user)s END,"
+    " amount_changed_at = CASE"
+    "  WHEN abs(amount - %(amount)s::numeric) < 0.005 THEN amount_changed_at"
+    "  WHEN abs(COALESCE(amount_before, amount) - %(amount)s::numeric) < 0.005"
+    "    THEN NULL"
+    "  ELSE now() END"
 )
 
 # Правки, разрешённые обычному пользователю. Поля из выгрузки 1С сюда не входят:
@@ -105,6 +131,8 @@ def _out(row: dict, user: User) -> PaymentOut:
     row = dict(row)
     row["amount"] = float(row["amount"])
     row["vat"] = float(row["vat"])
+    if row.get("amount_before") is not None:
+        row["amount_before"] = float(row["amount_before"])
     row["editable"] = user.may_edit(row["responsible"])
     return PaymentOut(**row)
 
@@ -305,7 +333,7 @@ def _record(user: User, entity: str, entity_id: int, action: str,
               summary="Изменить оплату")
 def patch_payment(payment_id: int, form: PaymentPatch,
                   user: User = Depends(security.current_user)) -> PaymentOut:
-    owner = db.fetch_one("SELECT responsible FROM payment WHERE id = %s",
+    owner = db.fetch_one("SELECT responsible, amount FROM payment WHERE id = %s",
                          (payment_id,))
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
@@ -323,12 +351,32 @@ def patch_payment(payment_id: int, form: PaymentPatch,
     # Имена столбцов берутся из EDITABLE и paid_flag — литералов этого файла,
     # а не из запроса, поэтому подстановка их в текст SQL безопасна. Значения,
     # как и везде, уходят параметрами.
-    assignments = ", ".join(f"{name} = %s" for name in values)
-    db.execute(
-        f"UPDATE payment SET {assignments}, updated_at = now(), updated_by = %s"
-        " WHERE id = %s", [*values.values(), user.id, payment_id])
-    _record(user, "payment", payment_id, "update", values)
+    sql, params = _update(values, user)
+    db.execute(f"{sql} WHERE id = %(id)s", {**params, "id": payment_id})
+    changes = dict(values)
+    if "amount" in values and abs(float(owner["amount"]) - values["amount"]) >= 0.005:
+        # Журнал хранит новые значения, но у суммы важно и прежнее: без него
+        # «кто поменял сумму и на сколько» из журнала не восстановить.
+        changes["amount_was"] = float(owner["amount"])
+    _record(user, "payment", payment_id, "update", changes)
     return get_payment(payment_id, user)
+
+
+def _update(values: dict[str, Any], user: User) -> tuple[str, dict[str, Any]]:
+    """UPDATE по правке: поля, отметка о правке суммы, кто и когда.
+
+    Именованные параметры, потому что сумма в пометке участвует шесть раз.
+    Имена полей — из EDITABLE и paid_flag, литералов этого файла, поэтому
+    подстановка их в текст SQL безопасна.
+    """
+    params = {f"v_{name}": value for name, value in values.items()}
+    assignments = [f"{name} = %(v_{name})s" for name in values]
+    if "amount" in values:
+        assignments.append(AMOUNT_MARKS)
+        params["amount"] = values["amount"]
+    params["user"] = user.id
+    return (f"UPDATE payment SET {', '.join(assignments)},"
+            " updated_at = now(), updated_by = %(user)s"), params
 
 
 @router.patch("", response_model=BulkResult, summary="Изменить несколько оплат")
@@ -345,10 +393,8 @@ def patch_many(form: BulkPatch,
     if not allowed:
         return BulkResult(changed=0, denied=denied)
 
-    assignments = ", ".join(f"{name} = %s" for name in values)
-    changed = db.execute(
-        f"UPDATE payment SET {assignments}, updated_at = now(), updated_by = %s"
-        " WHERE id = ANY(%s)", [*values.values(), user.id, allowed])
+    sql, params = _update(values, user)
+    changed = db.execute(f"{sql} WHERE id = ANY(%(ids)s)", {**params, "ids": allowed})
     _record(user, "payment", 0, "update_many",
             {"ids": len(allowed), **{k: str(v) for k, v in values.items()}})
     return BulkResult(changed=changed, denied=denied)

@@ -98,6 +98,11 @@ def _payment(row: dict) -> Payment:
         created_at=_moment(row["created_at"]),
         updated_at=_moment(row["updated_at"]),
         files=int(row.get("files", 0)),
+        # Сервер до пометок правки суммы этих полей не присылает.
+        amount_before=(float(row["amount_before"])
+                       if row.get("amount_before") is not None else None),
+        amount_changed_by=row.get("amount_changed_by") or "",
+        amount_changed_at=_moment(row.get("amount_changed_at")),
     )
     # Право на правку не входит в dataclass: он общий с локальным режимом.
     # Хранится рядом, читается через may_edit().
@@ -356,6 +361,8 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Any]:
             values=_comparable(row["values"]),
             status=row["status"],
             manual=bool(row["manual"]),
+            amount_before=(float(row["amount_before"])
+                           if row.get("amount_before") is not None else None),
         )
     return index
 

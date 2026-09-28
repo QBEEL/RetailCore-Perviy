@@ -214,6 +214,14 @@ class PaymentDialog(QDialog):
         self.amount.setSuffix(" ₽")
         form.addRow("Сумма", self.amount)
 
+        # Кто и с какой суммы её поменял. Сама пометка ставится при
+        # сохранении хранилищем, здесь — только показ: иначе её можно было бы
+        # стереть, просто пересохранив карточку.
+        self.amount_hint = Hint("", self)
+        self.amount_hint.setStyleSheet(f"color: {Palette.WARNING}; font-size: 12px;")
+        self.amount_hint.hide()
+        form.addRow("", self.amount_hint)
+
         vat_row = QHBoxLayout()
         vat_row.setSpacing(8)
 
@@ -495,6 +503,10 @@ class PaymentDialog(QDialog):
         self.vat.setValue(payment.vat)
         self.amount.blockSignals(False)
         self.vat.blockSignals(False)
+        if payment.amount_changed:
+            self.amount_hint.setText(
+                f"Сумма изменена вручную: {payment.amount_change_text}")
+            self.amount_hint.show()
         # Ставка выводится из уже записанных суммы и налога, а не наоборот:
         # сохранённые цифры менять при простом открытии карточки нельзя.
         self._adopt_vat()

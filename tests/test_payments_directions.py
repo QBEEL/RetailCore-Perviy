@@ -25,8 +25,10 @@ SUPPLIERS = {
 }
 
 
-def _payment(recipient: str, responsible: str = "Когай Анна", amount: float = 1.0) -> Payment:
-    return Payment(recipient=recipient, responsible=responsible, amount=amount)
+def _payment(recipient: str, responsible: str = "Когай Анна", amount: float = 1.0,
+             operation: str = "Оплата поставщику") -> Payment:
+    return Payment(recipient=recipient, responsible=responsible, amount=amount,
+                   operation=operation)
 
 
 def test_поставщик_даёт_направление():
@@ -81,3 +83,52 @@ def test_направления_не_пересекаются_и_складыв�
 def test_пустое_направление_не_отбирает():
     rows = [_payment("Суперкосметикс ООО"), _payment("Ростелеком ПАО")]
     assert by_direction(rows, "", SUPPLIERS) == rows
+
+
+# --- статьи расхода -------------------------------------------------------------------
+
+EXPENSE = frozenset({"marketing", "taxes", "rent"})
+WITH_EXPENSE = {
+    **SUPPLIERS,
+    "арендодатель": ("rent",),
+    "агентство": ("beauty", "marketing"),
+}
+
+
+def test_расход_поставщика_важнее_ответственного():
+    """Аренду магазина Fashion оформила Баранова — это всё равно аренда."""
+    payment = _payment("Арендодатель ООО", responsible="Баранова Олеся")
+    assert direction_of(payment, WITH_EXPENSE, EXPENSE) == "rent"
+
+
+def test_расход_важнее_отдела_у_того_же_поставщика():
+    assert direction_of(_payment("Агентство ООО"), WITH_EXPENSE, EXPENSE) == "marketing"
+
+
+def test_налоги_и_аренда_по_операции_1с():
+    tax = _payment("УФК по Приморскому краю", operation="Перечисление налогов и взносов")
+    lease = _payment("Европлан ПАО", responsible="Баранова Олеся",
+                     operation="Оплата арендодателю")
+    assert direction_of(tax, WITH_EXPENSE, EXPENSE) == "taxes"
+    assert direction_of(lease, WITH_EXPENSE, EXPENSE) == "rent"
+
+
+def test_операция_без_направления_на_сервере_не_уводит_из_остальных():
+    """Сервер без «Налогов» — оплата остаётся там, где её видно."""
+    tax = _payment("УФК по Приморскому краю", operation="Перечисление налогов и взносов")
+    assert direction_of(tax, WITH_EXPENSE, frozenset()) == NO_DIRECTION
+
+
+def test_с_расходами_суммы_всё_равно_складываются():
+    rows = [
+        _payment("Суперкосметикс ООО", amount=100),
+        _payment("Арендодатель ООО", responsible="Баранова Олеся", amount=30),
+        _payment("УФК", operation="Перечисление налогов и взносов", amount=20),
+        _payment("ООО Фурла", amount=70),
+        _payment("Ростелеком ПАО", amount=5),
+    ]
+    codes = ("beauty", "fashion", "marketing", "taxes", "rent", NO_DIRECTION)
+    parts = {code: by_direction(rows, code, WITH_EXPENSE, EXPENSE) for code in codes}
+    assert sum(len(v) for v in parts.values()) == len(rows)
+    assert [p.amount for p in parts["rent"]] == [30]
+    assert [p.amount for p in parts["taxes"]] == [20]

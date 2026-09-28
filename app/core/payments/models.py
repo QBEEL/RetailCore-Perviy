@@ -117,6 +117,29 @@ class Payment:
     # Заполняется при чтении списка — только для показа.
     files: int = 0
     supplier_name: str = ""
+    # Ручная правка суммы: сумма до первой правки, кто и когда правил. Ставит
+    # хранилище при сохранении, а не карточка — иначе пометку можно было бы
+    # выставить или стереть, просто пересохранив запись.
+    amount_before: float | None = None
+    amount_changed_by: str = ""
+    amount_changed_at: datetime | None = None
+
+    @property
+    def amount_changed(self) -> bool:
+        """Сумму поменял человек, и она не совпадает с прежней."""
+        return (self.amount_before is not None
+                and abs(self.amount_before - self.amount) >= AMOUNT_EPSILON)
+
+    @property
+    def amount_change_text(self) -> str:
+        """«было 120 000 ₽ · Иванов Евгений, 25.09» — для подсказок и списка дня."""
+        if not self.amount_changed:
+            return ""
+        before = f"{self.amount_before:,.0f}".replace(",", " ")
+        who = ", ".join(part for part in (
+            self.amount_changed_by,
+            f"{self.amount_changed_at:%d.%m}" if self.amount_changed_at else "") if part)
+        return f"было {before} ₽" + (f" · {who}" if who else "")
 
     @property
     def key(self) -> tuple[str, str]:
@@ -354,6 +377,11 @@ class Day:
     @property
     def overdue(self) -> int:
         return sum(1 for p in self.payments if p.status is PaymentStatus.OVERDUE)
+
+    @property
+    def amount_changed(self) -> int:
+        """Сколько оплат дня с суммой, поправленной человеком."""
+        return sum(1 for p in self.payments if p.amount_changed)
 
     @property
     def weekend(self) -> bool:

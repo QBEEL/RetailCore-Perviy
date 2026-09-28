@@ -167,6 +167,16 @@ class DayCell(QFrame):
             f"background: {Palette.DANGER}; border-radius: 3px;")
         self.alert.hide()
         head.addWidget(self.alert)
+
+        # Правка суммы человеком — своей точкой, не красной: это не ошибка, а
+        # повод присмотреться. День стал тяжелее или легче не потому, что так
+        # пришло из 1С, и это должно быть видно, не открывая каждую оплату.
+        self.changed = QLabel("", self)
+        self.changed.setFixedSize(6, 6)
+        self.changed.setStyleSheet(
+            f"background: {Palette.WARNING}; border-radius: 3px;")
+        self.changed.hide()
+        head.addWidget(self.changed)
         head.addStretch(1)
 
         self.total = QLabel("", self)
@@ -195,6 +205,7 @@ class DayCell(QFrame):
             self.total.setText("")
             self.detail.setText("")
             self.alert.hide()
+            self.changed.hide()
             self._style = "QFrame#DayCell { background: transparent; }"
             self.setStyleSheet(self._style)
             self.setToolTip("")
@@ -229,6 +240,7 @@ class DayCell(QFrame):
                 " background: transparent;")
 
         self.alert.setVisible(bool(data is not None and data.overdue and not muted))
+        self.changed.setVisible(bool(data is not None and data.amount_changed and not muted))
 
         if data is None or not data.count:
             self.total.setText("")
@@ -253,9 +265,14 @@ class DayCell(QFrame):
         ]
         if data.overdue:
             lines.append(f"просрочено: {data.overdue}")
+        if data.amount_changed:
+            lines.append(f"сумма изменена вручную: {data.amount_changed}")
         lines.append("")
         for payment in data.payments[:8]:
-            lines.append(f"{money(payment.amount)} ₽ — {payment.title} ({payment.status.title})")
+            line = f"{money(payment.amount)} ₽ — {payment.title} ({payment.status.title})"
+            if payment.amount_changed:
+                line += f" · {payment.amount_change_text}"
+            lines.append(line)
         if data.count > 8:
             lines.append(f"…ещё {data.count - 8}")
         return "\n".join(lines)
@@ -441,7 +458,19 @@ class LevelLegend(QWidget):
             label.setStyleSheet("font-size: 11px;")
             self._layout.addWidget(label, 0, index)
             self._labels.append(label)
-        self._layout.setColumnStretch(4, 1)
+        # Точки в клетке — тоже часть шкалы: без подписи жёлтую точку правки
+        # легко принять за ещё один уровень суммы.
+        for index, (colour, caption, hint) in enumerate((
+            (Palette.DANGER, "просрочка", "В дне есть просроченная оплата"),
+            (Palette.WARNING, "сумма изменена",
+             "Сумму оплаты поменял менеджер или администратор — "
+             "прежняя видна в подсказке дня и в таблице"),
+        ), start=4):
+            mark = QLabel(f"• {caption}", self)
+            mark.setStyleSheet(f"font-size: 11px; color: {colour};")
+            mark.setToolTip(hint)
+            self._layout.addWidget(mark, 0, index)
+        self._layout.setColumnStretch(6, 1)
 
     def show_levels(self, levels: tuple[float, float, float]) -> None:
         low, middle, high = levels

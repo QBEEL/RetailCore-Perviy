@@ -39,9 +39,13 @@ def _save_directions(user_id: int, codes: list[str]) -> None:
     """
     db.execute("DELETE FROM user_direction WHERE user_id = %s", (user_id,))
     for code in codes:
+        # Направления расхода учётке не назначаются: пересчёт закреплений
+        # разнёс бы «Налоги» по всем поставщикам человека. Молча, а не
+        # отказом: приложение 3.6.3 покажет их флажками в учётке, и отказ
+        # сохранить всю учётку из-за одной лишней галочки был бы непонятен.
         db.execute(
             "INSERT INTO user_direction (user_id, direction_id)"
-            " SELECT %s, id FROM direction WHERE code = %s"
+            " SELECT %s, id FROM direction WHERE code = %s AND for_people"
             " ON CONFLICT DO NOTHING", (user_id, code))
 
 

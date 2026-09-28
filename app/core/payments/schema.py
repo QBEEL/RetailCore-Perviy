@@ -108,7 +108,23 @@ def _step_1(connection: sqlite3.Connection) -> None:
     connection.executescript(_V1)
 
 
-_MIGRATIONS = (_step_1,)
+def _step_2(connection: sqlite3.Connection) -> None:
+    """Пометка о ручной правке суммы — как на сервере, миграция 007.
+
+    Колонки добавляются по одной с проверкой: ALTER TABLE в SQLite не знает
+    IF NOT EXISTS, а прерванный на середине шаг иначе не докатить.
+    """
+    have = {row[1] for row in connection.execute("PRAGMA table_info(payment)")}
+    for name, kind in (
+        ("amount_before", "REAL"),
+        ("amount_changed_by", "TEXT NOT NULL DEFAULT ''"),
+        ("amount_changed_at", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in have:
+            connection.execute(f"ALTER TABLE payment ADD COLUMN {name} {kind}")
+
+
+_MIGRATIONS = (_step_1, _step_2)
 VERSION = len(_MIGRATIONS)
 
 

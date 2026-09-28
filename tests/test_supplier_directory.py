@@ -335,3 +335,26 @@ def test_ключ_с_кириллицей_кодируется_в_адресе(c
     directory.set_directions("сафило снг", ["fashion"])
     _, path, _ = log[0]
     assert path == "/api/suppliers/%D1%81%D0%B0%D1%84%D0%B8%D0%BB%D0%BE%20%D1%81%D0%BD%D0%B3/directions"
+
+
+def test_направления_расхода_помечены_не_для_людей(calls):
+    log, answers = calls
+    answers["/api/suppliers/directions"] = [
+        {"id": 1, "code": "beauty", "title": "Beauty", "sort_order": 1, "for_people": True},
+        {"id": 5, "code": "rent", "title": "Аренда", "sort_order": 5, "for_people": False},
+    ]
+    found = {item.code: item.for_people for item in directory.directions()}
+    assert found == {"beauty": True, "rent": False}
+
+
+def test_старый_сервер_без_признака_считает_всё_отделами(calls):
+    log, answers = calls
+    answers["/api/suppliers/directions"] = [
+        {"id": 1, "code": "beauty", "title": "Beauty", "sort_order": 1}]
+    assert directory.directions()[0].for_people is True
+
+
+def test_направление_многим_поставщикам(calls):
+    log, _ = calls
+    assert directory.set_directions_many(["аренда один", "аренда два"], ["rent"]) == 2
+    assert [(m, body) for m, _, body in log] == [("PATCH", {"codes": ["rent"]})] * 2

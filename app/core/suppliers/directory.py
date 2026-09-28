@@ -26,12 +26,15 @@ FIXED = "fixed"
 
 @dataclass(slots=True)
 class Direction:
-    """Направление отдела: Beauty, Fashion."""
+    """Направление: отдел (Beauty, Fashion) или расход (маркетинг, налоги, аренда)."""
 
     code: str = ""
     title: str = ""
     id: int = 0
     sort_order: int = 0
+    # Отдел — можно назначить учётке. Расход — только поставщику: это не те,
+    # кто ведёт поставщиков, а то, на что ушли деньги.
+    for_people: bool = True
 
 
 @dataclass(slots=True)
@@ -122,24 +125,30 @@ def online() -> bool:
 def directions() -> list[Direction]:
     if not online():
         return []
+    # Сервер до направлений расхода признака не присылает — там все отделы.
     return [Direction(id=row["id"], code=row["code"], title=row["title"],
-                      sort_order=row["sort_order"])
+                      sort_order=row["sort_order"],
+                      for_people=bool(row.get("for_people", True)))
             for row in transport.get("/api/suppliers/directions")]
 
 
-def direction_keys() -> dict[str, tuple[str, ...]]:
+def direction_keys(
+    known: list[Direction] | None = None,
+) -> dict[str, tuple[str, ...]]:
     """Ключ получателя → его направления, только у кого они есть.
 
     Нужно отбору оплат по направлению. Список собирается из той же страницы
     поставщиков, что показывает вкладка «Поставщики», — правило, по которому
     поставщик попадает в направление, остаётся одно, на сервере. Без входа
     направлений нет, и словарь пуст.
+
+    `known` — уже прочитанный справочник, чтобы не спрашивать его дважды.
     """
     if not online():
         return {}
     found: dict[str, tuple[str, ...]] = {}
     size = 500
-    for item in directions():
+    for item in directions() if known is None else known:
         page = 1
         while True:
             answer = suppliers(direction=item.code, sort="name", order="asc",
@@ -230,6 +239,18 @@ def unassign(keys: list[str], user_ids: list[int] | None = None) -> Result:
     """Снять закрепление, в том числе зафиксированное. Только администратор."""
     return _result(transport.post("/api/suppliers/assignments/unassign",
                                   {"keys": keys, "user_ids": user_ids or []}))
+
+
+def set_directions_many(keys: list[str], codes: list[str]) -> int:
+    """Одни и те же направления нескольким поставщикам. Только администратор.
+
+    По одному запросу на поставщика: сервер умеет править одного, а разметка
+    идёт десятками, не тысячами, — отдельный пакетный вызов ради неё не нужен.
+    Возвращает, скольким поставщикам направление записано.
+    """
+    for key in keys:
+        set_directions(key, codes)
+    return len(keys)
 
 
 def set_directions(recipient_key: str, codes: list[str]) -> list[str]:

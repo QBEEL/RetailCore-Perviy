@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from .. import db, security
 from ..schemas import Origin, Status
 from ..security import User
+from .payments import AMOUNT_MARKS
 
 router = APIRouter(prefix="/api/sync", tags=["Выгрузка"])
 
@@ -111,11 +112,17 @@ def upload(form: SyncUpload,
                 [[*_row(item, FIELDS), user.id] for item in form.created])
 
         if form.changed:
-            assignments = ", ".join(f"{name} = %s" for name in FIELDS)
+            # Расхождение решается в пользу локальной записи — то есть другая
+            # сумма здесь и есть правка администратора. Помечается так же,
+            # как правка в карточке, иначе после выгрузки календарь показал
+            # бы изменённую сумму без отметки.
+            assignments = ", ".join(
+                [f"{name} = %({name})s" for name in FIELDS] + [AMOUNT_MARKS])
             handle.executemany(
                 f"UPDATE payment SET {assignments}, updated_at = now(),"
-                " updated_by = %s WHERE id = %s",
-                [[*_row(item.payment, FIELDS), user.id, item.id]
+                " updated_by = %(user)s WHERE id = %(id)s",
+                [{**dict(zip(FIELDS, _row(item.payment, FIELDS))),
+                  "user": user.id, "id": item.id}
                  for item in form.changed])
 
         if form.budgets:

@@ -58,6 +58,7 @@ from ..core.payments import (
 )
 from ..core.payments.directions import (
     NO_DIRECTION,
+    OPERATION_DIRECTIONS,
     RESPONSIBLE_DIRECTIONS,
     by_direction,
 )
@@ -544,9 +545,13 @@ class PaymentsPage(QWidget):
         self.day_summary.setText(" · ".join(parts))
         self.day_list.clear()
         for payment in day.payments:
-            item = QListWidgetItem(
-                f"{money(payment.amount)} ₽   {payment.title}\n{payment.status.title}"
-                + (f" · {payment.responsible}" if payment.responsible else ""))
+            text = (f"{money(payment.amount)} ₽   {payment.title}\n{payment.status.title}"
+                    + (f" · {payment.responsible}" if payment.responsible else ""))
+            if payment.amount_changed:
+                # Отдельной строкой: сумма, которую поменял человек, — повод
+                # присмотреться, и прятать её в конец второй строки не стоит.
+                text += f"\n• сумма изменена: {payment.amount_change_text}"
+            item = QListWidgetItem(text)
             item.setForeground(QColor(STATUS_COLORS[payment.status]))
             self.day_list.addItem(self.day_list.mark(item, payment))
 
@@ -733,7 +738,15 @@ class PaymentsPage(QWidget):
             Column("Поставщик", lambda p: p.title, width=250, highlight=True),
             Column("Сумма, ₽", lambda p: money(p.amount), width=130,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   color=lambda p: QColor(Palette.WARNING) if p.amount_changed else None,
                    sort_key=lambda p: p.amount),
+            # Прежняя сумма — своей колонкой: сортировкой по ней собираются
+            # все поправленные оплаты разом, а подсказка ячейки показывает,
+            # кто и когда правил.
+            Column("Было, ₽", _before_text, width=210,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   color=lambda p: QColor(Palette.WARNING),
+                   sort_key=lambda p: p.amount_before if p.amount_changed else -1.0),
             Column("Статус", lambda p: p.status.title, width=126,
                    color=lambda p: QColor(STATUS_COLORS[p.status]),
                    sort_key=lambda p: STATUS_ORDER.index(p.status)),
@@ -875,11 +888,15 @@ class PaymentsPage(QWidget):
         values = [[column.getter(payment) for column in self.table.model_.columns]
                   for payment in shown]
         # Суммы выгружаются числами, иначе в Excel по ним не посчитать итог.
-        money_columns = {index for index, column in enumerate(titles)
-                         if column in ("Сумма, ₽", "НДС, ₽")}
+        numbers = {
+            "Сумма, ₽": lambda p: p.amount,
+            "НДС, ₽": lambda p: p.vat,
+            "Было, ₽": lambda p: p.amount_before if p.amount_changed else None,
+        }
         for row, payment in zip(values, shown):
-            for index in money_columns:
-                row[index] = payment.amount if titles[index] == "Сумма, ₽" else payment.vat
+            for index, title in enumerate(titles):
+                if title in numbers:
+                    row[index] = numbers[title](payment)
         run_task(
             write_sheet, path, "Оплаты", titles, values,
             on_result=lambda _: self.notify(
@@ -1874,7 +1891,10 @@ def _load_all(
     if selection.direction:
         # Направления поставщиков — только на сервере, поэтому отбор идёт по
         # прочитанным строкам и одинаково для общей и для локальной базы.
-        rows = by_direction(rows, selection.direction, directory.direction_keys())
+        known = directory.directions()
+        rows = by_direction(
+            rows, selection.direction, directory.direction_keys(known),
+            {item.code for item in known if not item.for_people})
     return rows, store.known_values(), overdue
 
 
@@ -1886,9 +1906,17 @@ def _direction_hint(items: list) -> str:
         # для показа: второй раз то же имя в подсказке только сбивает.
         people = [name for name, code in RESPONSIBLE_DIRECTIONS.items()
                   if code == item.code and "?" not in name]
-        lines.append(
-            f"{item.title} — оплаты, оформленные: {', '.join(people)}" if people
-            else f"{item.title} — оплаты поставщикам этого направления")
+        operations = [f"«{name}»" for name, code in OPERATION_DIRECTIONS.items()
+                      if code == item.code]
+        text = f"{item.title} — оплаты поставщикам этого направления"
+        if operations:
+            text += f" и операции 1С {', '.join(operations)}"
+        if people:
+            text += f", а также всё, что оформили: {', '.join(people)}"
+        lines.append(text)
+    if any(not item.for_people for item in items):
+        lines.append("Статья расхода важнее отдела: аренда магазина Fashion — "
+                     "в «Аренде», а не в Fashion")
     lines.append("Остальные — всё, что не попало ни в одно направление")
     return "\n".join(lines)
 
@@ -1912,6 +1940,17 @@ def _terms_days(payment: Payment) -> int:
 def _terms_text(payment: Payment) -> str:
     days = _terms_days(payment)
     return f"{days} дн" if days >= 0 else ""
+
+
+def _before_text(payment: Payment) -> str:
+    """Прежняя сумма и кто её поменял — пусто, если сумму не трогали."""
+    if not payment.amount_changed:
+        return ""
+    who = ", ".join(part for part in (
+        payment.amount_changed_by,
+        f"{payment.amount_changed_at:%d.%m}" if payment.amount_changed_at else "")
+        if part)
+    return money(payment.amount_before or 0.0) + (f" · {who}" if who else "")
 
 
 def _files_text(payment: Payment) -> str:

@@ -174,7 +174,7 @@ def _filters(search: str, direction: str, manager: int, state: str,
             summary="Справочник направлений")
 def directions(user: User = Depends(security.current_user)) -> list[DirectionOut]:
     return [DirectionOut(**row) for row in db.fetch_all(
-        "SELECT id, code, title, sort_order, is_active FROM direction"
+        "SELECT id, code, title, sort_order, is_active, for_people FROM direction"
         " WHERE is_active ORDER BY sort_order, title")]
 
 
