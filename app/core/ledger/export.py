@@ -14,25 +14,16 @@ import os
 from datetime import date
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.worksheet import Worksheet
 
+from ..sheets import FONT, GRID, HEAD_FILL, SUB_FILL
+from ..sheets import head as _head
+from ..sheets import note as _note
+from ..sheets import row as _row
+from ..sheets import title as _title
+from ..sheets import widths as _widths
 from .analysis import Line, Report
-
-FONT = "Calibri"
-HEAD_FILL = PatternFill("solid", fgColor="1F3864")
-SUB_FILL = PatternFill("solid", fgColor="DCE3F0")
-WARN_FILL = PatternFill("solid", fgColor="FCE4E4")
-STRIPE = PatternFill("solid", fgColor="F4F6FB")
-
-HAIR = Side(style="hair", color="B4BFD4")
-GRID = Border(left=HAIR, right=HAIR, top=HAIR, bottom=HAIR)
-
-QTY = "#,##0"
-SHARE = "0.0%"
-
-MIN_WIDTH, MAX_WIDTH = 9, 56
 
 
 def save(report: Report, destination: str) -> str:
@@ -51,74 +42,9 @@ def default_name(folder: str) -> str:
     return os.path.join(folder, f"Ведомость — разбор {date.today():%Y-%m-%d}.xlsx")
 
 
-# --- оформление ----------------------------------------------------------------
-
 def _share(report: Report, value: float) -> float | None:
     """Доля «ушло от запаса» — пусто, если запас в выгрузке неполный."""
     return value if report.shares else None
-
-
-def _title(sheet: Worksheet, row: int, text: str, width: int) -> int:
-    cell = sheet.cell(row, 1, text)
-    cell.font = Font(FONT, size=13, bold=True, color="1F3864")
-    sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=width)
-    return row + 1
-
-
-def _note(sheet: Worksheet, row: int, text: str, width: int) -> int:
-    cell = sheet.cell(row, 1, text)
-    cell.font = Font(FONT, size=9, italic=True, color="5A6A85")
-    cell.alignment = Alignment(wrap_text=True, vertical="top")
-    sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=width)
-    sheet.row_dimensions[row].height = 26
-    return row + 1
-
-
-def _head(sheet: Worksheet, row: int, titles: list[str]) -> int:
-    for column, text in enumerate(titles, 1):
-        cell = sheet.cell(row, column, text)
-        cell.font = Font(FONT, size=10, bold=True, color="FFFFFF")
-        cell.fill = HEAD_FILL
-        cell.border = GRID
-        cell.alignment = Alignment(horizontal="center", vertical="center",
-                                   wrap_text=True)
-    sheet.row_dimensions[row].height = 30
-    sheet.freeze_panes = sheet.cell(row + 1, 1)
-    return row + 1
-
-
-def _row(sheet: Worksheet, row: int, values: list, *, formats: str = "",
-         stripe: bool = False, warn: bool = False) -> None:
-    for column, value in enumerate(values, 1):
-        cell = sheet.cell(row, column, value)
-        cell.font = Font(FONT, size=10)
-        cell.border = GRID
-        kind = formats[column - 1] if column - 1 < len(formats) else "t"
-        if kind == "n":
-            cell.number_format = QTY
-            cell.alignment = Alignment(horizontal="right")
-        elif kind == "%":
-            cell.number_format = SHARE
-            cell.alignment = Alignment(horizontal="right")
-        else:
-            cell.alignment = Alignment(vertical="center", wrap_text=False)
-        if warn:
-            cell.fill = WARN_FILL
-        elif stripe:
-            cell.fill = STRIPE
-
-
-def _widths(sheet: Worksheet, head_row: int) -> None:
-    for column in range(1, sheet.max_column + 1):
-        longest = 0
-        for row in range(head_row, sheet.max_row + 1):
-            value = sheet.cell(row, column).value
-            if value is None:
-                continue
-            longest = max(longest, len(str(value)) if isinstance(value, str)
-                          else len(f"{value:,.0f}"))
-        sheet.column_dimensions[get_column_letter(column)].width = min(
-            MAX_WIDTH, max(MIN_WIDTH, longest + 2))
 
 
 # --- листы ---------------------------------------------------------------------

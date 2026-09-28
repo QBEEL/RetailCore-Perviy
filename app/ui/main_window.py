@@ -339,6 +339,7 @@ class MainWindow(QMainWindow):
                 continue
             if button := self._nav_group.button(index):
                 button.setVisible(transport.session.may_open(page.code))
+        self.reports_page.apply_access()
         if not self._page_allowed(self.pages.currentIndex()):
             # Без уведомления: при запуске человек ничего не нажимал, а
             # объяснять закрытый раздел тому, кто его и не открывал, незачем.

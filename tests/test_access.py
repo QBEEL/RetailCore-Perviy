@@ -183,3 +183,133 @@ def test_в_таблице_видно_что_закрыто():
     # Обычная учётка не должна нести в таблице ни слова: строк два десятка, и
     # «доступны все разделы» в каждой — это шум ради исключений.
     assert pages.describe([]) == ""
+
+
+# --- отдельные отчёты ---------------------------------------------------------------
+
+def _reports(window) -> dict[str, bool]:
+    """Отчёт → открыт ли он. Закрытый остаётся вкладкой, но под затемнением."""
+    tabs = window.reports_page.tabs
+    return {tabs.tabText(i): not window.reports_page.locks[i].locked
+            for i in range(tabs.count())}
+
+
+@pytest.mark.parametrize("closed", [("reports.receipts",)], indirect=True)
+def test_закрытый_отчёт_затемнён_а_не_спрятан(application, closed):
+    """Отчёт, о котором рассказали коллеги, человек должен найти и понять, почему нельзя."""
+    window = _window(application)
+    page = window.reports_page
+
+    assert _reports(window) == {"Отчёт поставщику": True,
+                                "Ведомость по складам": True,
+                                "Аналитика по чекам": False}
+    lock = page.locks[2]
+    assert page.tabs.isTabVisible(2)
+    assert not lock.content.isEnabled(), "кнопки под затемнением недоступны"
+    assert "обратитесь к администратору" in lock.overlay.message.text()
+    assert lock.overlay.movie.isValid(), "анимация должна загрузиться из сборки"
+    assert not window._nav_group.button(index_of("reports")).isHidden()
+
+
+@pytest.mark.parametrize(
+    "closed", [("reports.supplier", "reports.ledger", "reports.receipts")], indirect=True)
+def test_раздел_с_закрытыми_отчётами_остаётся_в_меню(application, closed):
+    """Закрыть «Отчётность» из меню — это снять весь раздел, а не все три отчёта."""
+    window = _window(application)
+
+    assert not window._nav_group.button(index_of("reports")).isHidden()
+    assert not any(_reports(window).values())
+
+
+@pytest.mark.parametrize("closed", [("reports.supplier",)], indirect=True)
+def test_открывается_первый_доступный_отчёт(application, closed):
+    window = _window(application)
+
+    assert window.reports_page.tabs.currentIndex() == 1
+
+
+def test_смена_входа_снимает_затемнение(application):
+    """Страница строится до входа: права применяются заново при каждой смене."""
+    transport.session.clear()
+    transport.session.denied_pages = ("reports.receipts",)
+    try:
+        window = _window(application)
+        assert _reports(window)["Аналитика по чекам"] is False
+        transport.session.denied_pages = ()
+        window._sync_page_access()
+        assert _reports(window)["Аналитика по чекам"] is True
+        assert window.reports_page.locks[2].content.isEnabled()
+    finally:
+        transport.session.clear()
+
+
+def test_карточка_учётки_закрывает_отдельный_отчёт(application):
+    from app.core.payments.admin import Account
+    from app.ui.widgets.account_dialogs import AccountDialog
+
+    dialog = AccountDialog(Account(login="k.valeva", full_name="Валева Карина"),
+                           known_responsible=[])
+    boxes = dict(dialog.pages)
+    assert {"reports.supplier", "reports.ledger", "reports.receipts"} <= set(boxes)
+
+    boxes["reports.receipts"].setChecked(False)
+    assert dialog.result_account().denied_pages == ["reports.receipts"]
+
+
+def test_флажки_отчётов_гаснут_с_разделом(application):
+    """Закрытый раздел закрывает и отчёты, но их отметки сохраняются."""
+    from app.core.payments.admin import Account
+    from app.ui.widgets.account_dialogs import AccountDialog
+
+    account = Account(login="k.valeva", full_name="Валева Карина",
+                      denied_pages=["reports.receipts"])
+    dialog = AccountDialog(account, known_responsible=[])
+    boxes = dict(dialog.pages)
+
+    boxes["reports"].setChecked(False)
+    assert not boxes["reports.ledger"].isEnabled()
+    boxes["reports"].setChecked(True)
+    assert boxes["reports.ledger"].isEnabled()
+    assert boxes["reports.receipts"].isChecked() is False
+
+
+def test_в_таблице_видно_закрытый_отчёт():
+    assert pages.describe(["reports.receipts"]) == "закрыто: Аналитика по чекам"
+    # Закрыт весь раздел — его отчёты не перечисляются второй раз.
+    assert pages.describe(["reports", "reports.receipts"]) == "закрыто: Отчётность"
+
+
+def test_анимация_обновления_только_на_время_загрузки(application, monkeypatch):
+    from app.ui.update_check import UpdateChecker
+    from app.ui.widgets import update_dialog as module
+    from app.core import updater
+
+    dialog = module.UpdateDialog(AppSettings(), UpdateChecker())
+    assert dialog._movie.isValid(), "анимация должна загрузиться из сборки"
+    assert dialog._animation.isHidden()
+
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.setattr(dialog.checker, "download", lambda manifest: None)
+    manifest = updater.ReleaseManifest(version="9.9.9", exe_url="")
+    dialog._manifest = manifest
+    dialog._start_update(manifest)
+    assert not dialog._animation.isHidden()
+
+    dialog._on_error("сеть пропала")
+    assert dialog._animation.isHidden(), "после ошибки анимация не нужна"
+
+
+def test_анимация_и_при_автозагрузке(application, monkeypatch):
+    """Обновление, которое качается само, — тоже загрузка, и тоже с анимацией."""
+    from app.ui.update_check import UpdateChecker
+    from app.ui.widgets import update_dialog as module
+    from app.core import updater
+
+    settings = AppSettings()
+    settings.update_download_auto = True
+    dialog = module.UpdateDialog(settings, UpdateChecker())
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.setattr(dialog.checker, "download", lambda manifest: None)
+    monkeypatch.setattr(dialog, "_is_snoozed", lambda: False)
+    dialog._on_found(updater.ReleaseManifest(version="9.9.9", exe_url=""))
+    assert not dialog._animation.isHidden()

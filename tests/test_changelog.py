@@ -36,3 +36,59 @@ def test_seen_version_survives_save(tmp_path: Path) -> None:
     settings.seen_version = "3.4.2"
     settings.save()
     assert AppSettings.load(path).seen_version == "3.4.2"
+
+
+# --- журнал изменений в настройках ---------------------------------------------------
+
+SAMPLE = """# Что нового в RetailCore
+
+Пункты каждого раздела попадают в окно обновления.
+
+## 3.6.5
+
+- Аналитика по чекам
+- Закрытый отчёт затемнён: сумма < 0 и Z&R экранируются
+
+## Черновик
+
+- это не версия, в журнал не идёт
+
+## v3.6.4
+
+- Направления расходов
+"""
+
+
+def test_журнал_собирает_все_версии_по_порядку() -> None:
+    found = changelog.releases(SAMPLE)
+    assert [release.version for release in found] == ["3.6.5", "3.6.4"]
+    assert found[0].lines == ("Аналитика по чекам",
+                              "Закрытый отчёт затемнён: сумма < 0 и Z&R экранируются")
+    assert found[1].lines == ("Направления расходов",)
+
+
+def test_вшитый_журнал_знает_текущую_версию() -> None:
+    """Первой она может и не стоять: описание следующей версии пишется до
+    того, как ей присвоят номер."""
+    assert __version__ in [release.version for release in changelog.bundled_releases()]
+
+
+def test_журнал_в_настройках() -> None:
+    import os
+
+    import pytest
+
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    from app.ui.settings_page import SettingsPage, _changelog_html
+
+    page = SettingsPage(AppSettings(), lambda *_: None)
+    text = page.changelog_view.toPlainText()
+    assert f"Версия {__version__} · установлена" in text
+
+    html = _changelog_html(changelog.releases(SAMPLE), "3.6.4")
+    assert "сумма &lt; 0 и Z&amp;R" in html
+    assert html.index("3.6.5") < html.index("3.6.4 <span")

@@ -1,6 +1,7 @@
 """Настройки поиска, сопоставления и сохранения. Изменения применяются сразу."""
 from __future__ import annotations
 
+from html import escape
 from typing import Callable
 
 from PySide6.QtCore import Qt, QUrl
@@ -12,12 +13,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
-from ..core import appdata, snapshots
+from ..core import appdata, changelog, snapshots
 from ..core.models import DEFAULT_SEARCH_ROLES, DEFAULT_WEIGHTS, FieldRole, Sheet
 from ..core.payments import LEVEL_PRESETS
 from ..core.settings import DEFAULT_FILL_ROLES, AppSettings
@@ -83,6 +85,7 @@ class SettingsPage(QWidget):
         self._body.addWidget(self._payments_card())
         self._body.addWidget(self._history_card())
         self._body.addWidget(self._updates_card())
+        self._body.addWidget(self._changelog_card())
         self._body.addStretch(1)
 
         scroll.setWidget(content)
@@ -418,6 +421,28 @@ class SettingsPage(QWidget):
             body.addWidget(check_now, 0, Qt.AlignmentFlag.AlignLeft)
         return card
 
+    def _changelog_card(self) -> Card:
+        """Журнал изменений: что выходило в каждой версии.
+
+        Окно «Что нового» показывается один раз, при первом запуске версии, и
+        закрывается не читая. Потом вопрос «а когда появилась аналитика по
+        чекам» задать было некому — теперь его можно прочитать здесь.
+        """
+        card = Card(self)
+        body = card.body()
+        body.addWidget(SectionTitle("Журнал изменений", card))
+        found = changelog.bundled_releases()
+        body.addWidget(Hint(
+            f"Что выходило в каждой версии, от новой к старой. Версий в журнале: "
+            f"{len(found)}." if found else "Журнал изменений в этой сборке не найден.",
+            card))
+        self.changelog_view = QTextBrowser(card)
+        self.changelog_view.setOpenLinks(False)
+        self.changelog_view.setMinimumHeight(380)
+        self.changelog_view.setHtml(_changelog_html(found, __version__))
+        body.addWidget(self.changelog_view)
+        return card
+
     def show_mapping(self, sheet: Sheet) -> None:
         """Показывает распознанные колонки активного файла и позволяет их поправить."""
         self._mapping_sheet = sheet
@@ -579,3 +604,24 @@ def _column_label(text: str, parent: QWidget) -> QLabel:
     label.setStyleSheet(f"color: {Palette.TEXT_FAINT}; font-size: 11px; font-weight: 600;")
     label.setAlignment(Qt.AlignmentFlag.AlignLeft)
     return label
+
+
+def _changelog_html(found: list[changelog.Release], current: str) -> str:
+    """Журнал для показа: версия заголовком, пункты списком.
+
+    Текст пунктов экранируется: в описаниях встречаются «<» и «&» — «сумма
+    < 0», «Z&R», — и без экранирования они съели бы часть строки как разметку.
+    """
+    if not found:
+        return ""
+    parts = []
+    for release in found:
+        mark = (f' <span style="color:{Palette.SUCCESS}; font-weight:600;">'
+                "· установлена</span>" if release.version == current else "")
+        items = "".join(f"<li style='margin-bottom:4px;'>{escape(line)}</li>"
+                        for line in release.lines)
+        parts.append(
+            f"<h3 style='color:{Palette.PRIMARY}; margin:14px 0 6px 0;'>"
+            f"Версия {escape(release.version)}{mark}</h3>"
+            f"<ul style='margin-top:0; color:{Palette.TEXT};'>{items}</ul>")
+    return "".join(parts)

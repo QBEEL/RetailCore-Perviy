@@ -36,10 +36,13 @@ from ..core.reports import DEFAULT_FOLDER, ReportProfile, SOURCE_EXTENSIONS, Sto
 from ..core.reports import default_profile, pivot, service, store_from_name
 from ..core.settings import AppSettings
 from . import icons
+from .pages import parts_of
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title, fade_in
 from .widgets.ledger_tab import LedgerTab
+from .widgets.locked import Lockable
+from .widgets.receipts_tab import ReceiptsTab
 from .widgets.report_dialogs import ProfileDialog, StoreRulesDialog
 from .widgets.toast import ToastKind
 
@@ -88,11 +91,42 @@ class ReportsPage(QWidget):
         # разбирает ведомость для себя. Держать их на одной странице подряд —
         # значит заставлять пролистывать чужую работу до своей.
         self.tabs = QTabWidget(self)
-        self.tabs.addTab(self._supplier_tab(), "Отчёт поставщику")
-        self.tabs.addTab(LedgerTab(self.settings, self.notify, self),
-                         "Ведомость по складам")
+        # Каждый отчёт — в обёртке, которая умеет его закрыть: затемнить,
+        # выключить кнопки и объяснить, к кому идти. Спрятать вкладку было бы
+        # проще, но тогда человек ищет отчёт, о котором ему рассказали, и
+        # решает, что у него старая версия программы.
+        self.locks = [
+            Lockable(self._supplier_tab(), self),
+            Lockable(LedgerTab(self.settings, self.notify, self), self),
+            Lockable(ReceiptsTab(self.settings, self.notify, self), self),
+        ]
+        for lock, title in zip(self.locks, ("Отчёт поставщику", "Ведомость по складам",
+                                            "Аналитика по чекам")):
+            self.tabs.addTab(lock, title)
+        # Вкладки и права на них описаны в одном порядке: по номеру вкладки
+        # находится её код. Разойдись они — закрытая вкладка осталась бы на
+        # виду, а открытая спряталась, и заметить это было бы нечем.
+        self._parts = parts_of("reports")
+        assert len(self._parts) == self.tabs.count(), "вкладки и права разошлись"
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
+        self.apply_access()
+
+    def apply_access(self) -> None:
+        """Закрывает отчёты, закрытые администратором этой учётке.
+
+        Вызывается при каждой смене входа: страница строится до того, как
+        человек вошёл, и тогда закрытого ещё не знает. При открытии раздела
+        первой показывается доступная вкладка, если такая есть: начинать с
+        затемнения, когда рядом открытый отчёт, незачем.
+        """
+        for lock, part in zip(self.locks, self._parts):
+            lock.set_locked(not transport.session.may_open(part.code))
+        if self.locks[self.tabs.currentIndex()].locked:
+            for index, lock in enumerate(self.locks):
+                if not lock.locked:
+                    self.tabs.setCurrentIndex(index)
+                    break
 
     def _supplier_tab(self) -> QWidget:
         page = QWidget(self)
@@ -106,13 +140,16 @@ class ReportsPage(QWidget):
 
     def _on_tab_changed(self, index: int) -> None:
         """Подзаголовок описывает открытую вкладку, а не страницу целиком."""
-        self.subtitle.setText(
+        texts = (
             "Отчёт по акциям для поставщика собирается из выгрузок продаж: "
             "фильтр, сводная и оформление берутся из профиля, а продажи "
-            "объединённых магазинов складываются по общим правилам."
-            if index == 0 else
+            "объединённых магазинов складываются по общим правилам.",
             "Ведомость по товарам на складах из 1С — в читаемый вид: чего не "
-            "хватило, что расходится, как дела по каждому магазину.")
+            "хватило, что расходится, как дела по каждому магазину.",
+            "Аналитика по чекам из 1С за период выгрузки: выручка, прибыль, "
+            "средний чек и срезы по магазинам, брендам, товарам и продавцам.",
+        )
+        self.subtitle.setText(texts[index] if 0 <= index < len(texts) else texts[0])
 
     def _profile_card(self) -> Card:
         card = Card(self)

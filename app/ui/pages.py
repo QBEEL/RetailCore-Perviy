@@ -65,6 +65,33 @@ PAGES = (
 MANAGED = tuple(page for page in PAGES if page.managed)
 
 
+@dataclass(frozen=True, slots=True)
+class Part:
+    """Вкладка внутри раздела, которую можно закрыть отдельно от него.
+
+    Нужна там, где в одном разделе собраны отчёты для разных людей: аналитику
+    по чекам с выручкой и прибылью видеть всем незачем, а отчёт поставщику в
+    том же разделе нужен каждому менеджеру. Закрыть раздел целиком значило бы
+    отнять и то, и другое.
+    """
+
+    code: str
+    title: str
+    page: str
+
+
+# Порядок — как вкладки стоят в разделе: по нему они и прячутся.
+PARTS = (
+    Part("reports.supplier", "Отчёт поставщику", "reports"),
+    Part("reports.ledger", "Ведомость по складам", "reports"),
+    Part("reports.receipts", "Аналитика по чекам", "reports"),
+)
+
+
+def parts_of(page: str) -> tuple[Part, ...]:
+    return tuple(part for part in PARTS if part.page == page)
+
+
 def index_of(code: str) -> int:
     """Номер раздела в стопке страниц. Порядок здесь и там один."""
     for index, page in enumerate(PAGES):
@@ -81,4 +108,8 @@ def describe(denied: Iterable[str]) -> str:
     """
     closed = set(denied)
     titles = [page.title for page in MANAGED if page.code in closed]
+    # Вкладки закрытого раздела не перечисляются: они и так закрыты вместе с
+    # ним, а список ради них вырос бы втрое.
+    titles += [part.title for part in PARTS
+               if part.code in closed and part.page not in closed]
     return "закрыто: " + ", ".join(titles) if titles else ""

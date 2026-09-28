@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.payments.admin import Account
-from ..pages import MANAGED
+from ..pages import MANAGED, parts_of
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
 
@@ -203,12 +203,43 @@ class AccountDialog(QDialog):
         grid.setHorizontalSpacing(Metrics.GAP)
         grid.setVerticalSpacing(4)
         closed = set(self.account.denied_pages)
+        parents: dict[str, QCheckBox] = {}
         for number, page in enumerate(MANAGED):
             box = QCheckBox(page.title, self)
             box.setChecked(page.code not in closed)
             grid.addWidget(box, number // 3, number % 3)
             self.pages.append((page.code, box))
+            parents[page.code] = box
         root.addLayout(grid)
+
+        # Отчёты — отдельными флажками: в одном разделе лежат отчёт
+        # поставщику, нужный каждому менеджеру, и аналитика с выручкой и
+        # прибылью, которую видеть всем незачем.
+        for code, parent in parents.items():
+            parts = parts_of(code)
+            if not parts:
+                continue
+            row = QHBoxLayout()
+            row.setSpacing(Metrics.GAP)
+            row.addWidget(QLabel(f"{parent.text()}:", self))
+            boxes = []
+            for part in parts:
+                box = QCheckBox(part.title, self)
+                box.setChecked(part.code not in closed)
+                row.addWidget(box)
+                self.pages.append((part.code, box))
+                boxes.append(box)
+            row.addStretch(1)
+            root.addLayout(row)
+
+            # Закрытый раздел закрывает и свои отчёты — флажки гаснут, но
+            # отметки сохраняют: откроют раздел — вернутся прежние.
+            def follow(opened: bool, boxes: list[QCheckBox] = boxes) -> None:
+                for box in boxes:
+                    box.setEnabled(opened)
+
+            parent.toggled.connect(follow)
+            follow(parent.isChecked())
 
     def _accept(self) -> None:
         login = self.login.text().strip().lower()
