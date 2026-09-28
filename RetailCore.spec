@@ -32,7 +32,9 @@ from PyInstaller.utils.hooks import collect_data_files
 # CHANGELOG вшивается в сборку: новая версия при первом запуске сама
 # показывает, что в ней поменялось.
 DATAS = ([("app/ui/assets", "app/ui/assets"), ("CHANGELOG.md", ".")]
-         + collect_data_files("qtawesome"))
+         + collect_data_files("qtawesome")
+         # Таблицы кодировок шрифтов: без них pdfminer не прочтёт часть счетов.
+         + collect_data_files("pdfminer"))
 
 a = Analysis(
     ["run.py"],

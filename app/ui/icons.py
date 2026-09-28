@@ -45,6 +45,7 @@ NAMES = {
     "chevron": "mdi6.chevron-right",
     "chevron-left": "mdi6.chevron-left",
     "export": "mdi6.file-export-outline",
+    "download": "mdi6.download",
     "aliases": "mdi6.bookmark-multiple-outline",
     "star": "mdi6.star-outline",
     "update": "mdi6.arrow-up-bold-circle-outline",

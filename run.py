@@ -48,6 +48,7 @@ def selftest(argv: list[str]) -> int:
 
     ok &= _check_charts(report)
     ok &= _check_payments(report)
+    ok &= _check_pdf(report)
 
     report.append("РЕЗУЛЬТАТ: " + ("успешно" if ok else "есть ошибки"))
     text = "\n".join(report)
@@ -188,6 +189,24 @@ def _check_payments(report: list[str]) -> bool:
     except Exception as error:  # noqa: BLE001 — отчёт важнее аккуратного типа
         report.append(f"оплаты: ОШИБКА — {error}")
         return False
+
+
+def _check_pdf(report: list[str]) -> bool:
+    """Счета PDF читает pdfminer, а его таблицы кодировок — отдельные файлы.
+
+    Без них модуль импортируется, и проверка «import прошёл» ничего бы не
+    поймала: счёт с японским или китайским шрифтом упал бы уже у человека.
+    """
+    try:
+        from pdfminer.cmapdb import CMapDB
+        from pdfminer.high_level import extract_pages  # noqa: F401
+
+        CMapDB.get_cmap("UniJIS-UTF32-V")
+    except Exception as error:  # noqa: BLE001 — отчёт важнее аккуратного типа
+        report.append(f"счета PDF: ОШИБКА — {error}")
+        return False
+    report.append("счета PDF: pdfminer и таблицы кодировок на месте")
+    return True
 
 
 if __name__ == "__main__":

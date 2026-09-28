@@ -2,26 +2,36 @@
 from __future__ import annotations
 
 import os
+import shutil
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+from ...core import pdf_invoice
 from .. import icons
 from ..theme import Metrics, Palette
 from .inputs import SelectBox
+from .toast import ToastKind
 
 EXCEL_FILTER = "Excel (*.xlsx *.xlsm *.xls);;Все файлы (*.*)"
+# Поле открытия принимает и счёт поставщика в PDF: он переводится в Excel рядом
+# с собой. Для сохранения остаётся EXCEL_FILTER — писать в PDF нечего.
+OPEN_FILTER = ("Excel или счёт PDF (*.xlsx *.xlsm *.xls *.pdf);;"
+               "Excel (*.xlsx *.xlsm *.xls);;Счёт PDF (*.pdf);;Все файлы (*.*)")
+_EXCEL = (".xlsx", ".xlsm", ".xls")
 CSV_FILTER = "Выгрузка 1С (*.csv *.txt);;Все файлы (*.*)"
 
 
@@ -36,15 +46,17 @@ class FilePicker(QFrame):
         label: str,
         hint: str = "",
         parent: QWidget | None = None,
-        file_filter: str = EXCEL_FILTER,
+        file_filter: str = OPEN_FILTER,
     ) -> None:
         super().__init__(parent)
         self._filter = file_filter
+        self._accepts_pdf = "*.pdf" in file_filter
         self.setAcceptDrops(True)
         # Поля выбора файла не сжимаются: при нехватке места уступает таблица,
         # у которой есть прокрутка, а не элементы управления.
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._path = ""
+        self._pdf_source = ""
         self._recent: list[str] = []
 
         root = QVBoxLayout(self)
@@ -81,6 +93,16 @@ class FilePicker(QFrame):
         browse.setIcon(icons.icon("open"))
         browse.clicked.connect(self.browse)
         row.addWidget(browse)
+
+        # Книга из PDF создаётся рядом с ним, а PDF часто открыт прямо из
+        # почты — из временной папки, которую никто потом не найдёт. Поэтому
+        # переведённый счёт можно сохранить туда, куда нужно человеку.
+        self.download_button = QPushButton("Скачать Excel", self)
+        self.download_button.setIcon(icons.icon("download"))
+        self.download_button.setToolTip("Сохранить счёт, переведённый из PDF, как книгу Excel")
+        self.download_button.clicked.connect(self.download_excel)
+        self.download_button.setVisible(False)
+        row.addWidget(self.download_button)
         root.addLayout(row)
 
         sheet_row = QHBoxLayout()
@@ -134,11 +156,82 @@ class FilePicker(QFrame):
     def set_path(self, path: str, notify: bool = True) -> None:
         if not path:
             return
+        source = ""
+        if self._accepts_pdf and path.lower().endswith(".pdf"):
+            source, path = path, self._from_pdf(path)
+            if not path:
+                return
+        self._pdf_source = source
+        self.download_button.setVisible(bool(source))
         self._path = path
         self.field.setText(path)
         self.field.setToolTip(path)
         if notify:
             self.file_selected.emit(path)
+
+    def _from_pdf(self, pdf_path: str) -> str:
+        """Счёт PDF → книга Excel рядом с ним. Пусто — не получилось.
+
+        Дальше страница работает с книгой, как с любым Excel-файлом: колонки
+        находятся сами, а «Сохранить бланк» пишет в xlsx, а не в PDF. Книга,
+        которая новее PDF, не перезаписывается — её могли поправить руками.
+        """
+        target = pdf_invoice.excel_path_for(pdf_path)
+        if os.path.exists(target) and os.path.getmtime(target) >= os.path.getmtime(pdf_path):
+            self._announce(f"Счёт уже переведён в Excel — открыт {os.path.basename(target)}",
+                           ToastKind.INFO)
+            return target
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            target, invoice = pdf_invoice.convert(pdf_path, target)
+        except pdf_invoice.PdfProblem as problem:
+            QApplication.restoreOverrideCursor()
+            self.set_status("PDF не разобран", Palette.DANGER)
+            QMessageBox.warning(self, "Счёт PDF", str(problem))
+            return ""
+        QApplication.restoreOverrideCursor()
+
+        if invoice.warnings:
+            QMessageBox.warning(
+                self, "Счёт PDF",
+                f"Счёт переведён в {os.path.basename(target)}, но есть расхождения:\n\n"
+                + "\n".join(f"• {text}" for text in invoice.warnings))
+        else:
+            self._announce(f"Счёт переведён в Excel: {os.path.basename(target)} · "
+                           f"{len(invoice.rows)} строк", ToastKind.SUCCESS)
+        return target
+
+    def download_excel(self) -> None:
+        """Копия переведённой книги — по умолчанию в «Загрузки»."""
+        if not self._pdf_source or not os.path.exists(self._path):
+            return
+        folder = (QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+                  or os.path.dirname(self._path))
+        suggested = os.path.join(folder, os.path.basename(self._path))
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить счёт в Excel", suggested, "Excel (*.xlsx)")
+        if not target:
+            return
+        if not target.lower().endswith(".xlsx"):
+            target += ".xlsx"
+        try:
+            if os.path.normcase(os.path.abspath(target)) != os.path.normcase(
+                    os.path.abspath(self._path)):
+                shutil.copyfile(self._path, target)
+        except OSError as error:
+            QMessageBox.warning(
+                self, "Счёт PDF",
+                f"Не удалось сохранить {os.path.basename(target)}: {error}\n\n"
+                "Если файл с таким именем открыт в Excel, закройте его.")
+            return
+        self._announce(f"Счёт сохранён: {target}", ToastKind.SUCCESS)
+
+    def _announce(self, text: str, kind: ToastKind) -> None:
+        # Подпись над полем страница сразу перепишет своим «чтение файла…»,
+        # поэтому о переводе сообщает всплывающее уведомление главного окна.
+        if notify := getattr(self.window(), "notify", None):
+            notify(text, kind)
 
     def browse(self) -> None:
         start = os.path.dirname(self._path) if self._path else ""
@@ -188,13 +281,13 @@ class FilePicker(QFrame):
             self.set_path(path)
             event.acceptProposedAction()
 
-    @staticmethod
-    def _url_from(event) -> str | None:
+    def _url_from(self, event) -> str | None:
         data = event.mimeData()
         if not data.hasUrls():
             return None
+        accepted = _EXCEL + ((".pdf",) if self._accepts_pdf else ())
         for url in data.urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".xlsx", ".xlsm", ".xls")):
+            if path.lower().endswith(accepted):
                 return path
         return None
