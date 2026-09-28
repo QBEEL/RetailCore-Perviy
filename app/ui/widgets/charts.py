@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import QMargins, QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QPainter
+from PySide6.QtGui import QColor, QCursor, QPainter
 from PySide6.QtWidgets import (
     QLabel,
     QSizePolicy,
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Palette
+from ..theme import Palette, small_font
 
 try:
     from PySide6.QtCharts import (
@@ -212,13 +212,13 @@ class ChartBox(QWidget):
     def _value_axis(self, top: float, divisor: float, unit: str) -> "QValueAxis":
         axis = QValueAxis()
         axis.setRange(0, (top / divisor) * 1.08 if top else 1.0)
-        axis.setLabelsFont(QFont("Segoe UI", 8))
+        axis.setLabelsFont(small_font())
         axis.setLabelsColor(QColor(Palette.TEXT_MUTED))
         axis.setGridLineColor(QColor(Palette.BORDER))
         axis.setTickCount(5)
         axis.setLabelFormat("%.1f" if divisor > 1 else "%d")
         axis.setTitleText(unit)
-        axis.setTitleFont(QFont("Segoe UI", 8))
+        axis.setTitleFont(small_font())
         axis.setTitleBrush(QColor(Palette.TEXT_FAINT))
         return axis
 
@@ -240,7 +240,7 @@ class ChartBox(QWidget):
         """
         axis = QBarCategoryAxis()
         axis.append(list(labels))
-        axis.setLabelsFont(QFont("Segoe UI", 8))
+        axis.setLabelsFont(small_font())
         axis.setLabelsColor(QColor(Palette.TEXT_MUTED))
         axis.setGridLineVisible(False)
         axis.setLabelsVisible(visible)
@@ -375,7 +375,7 @@ class ChartBox(QWidget):
         legend = self.chart.legend()
         legend.setVisible(True)
         legend.setAlignment(Qt.AlignmentFlag.AlignBottom)
-        legend.setFont(QFont("Segoe UI", 8))
+        legend.setFont(small_font())
         legend.setLabelColor(QColor(Palette.TEXT_MUTED))
         legend.setMarkerShape(legend.MarkerShape.MarkerShapeCircle)
 
@@ -410,7 +410,7 @@ class ChartBox(QWidget):
         bars.setBorderColor(QColor(color))
         bars.setSelectedColor(_darken(color))
         bars.setLabelColor(QColor(Palette.TEXT))
-        bars.setLabelFont(QFont("Segoe UI", 8))
+        bars.setLabelFont(small_font())
         series = QHorizontalBarSeries()
         series.append(bars)
         series.setBarWidth(0.72)
@@ -472,7 +472,7 @@ class ChartBox(QWidget):
         legend = self.chart.legend()
         legend.setVisible(True)
         legend.setAlignment(Qt.AlignmentFlag.AlignRight)
-        legend.setFont(QFont("Segoe UI", 8))
+        legend.setFont(small_font())
         legend.setLabelColor(QColor(Palette.TEXT_MUTED))
         legend.setMarkerShape(legend.MarkerShape.MarkerShapeCircle)
 

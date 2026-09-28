@@ -11,6 +11,10 @@
 """
 
 import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+from tools.make_version_json import app_version
 
 # Модули Qt, которые приложение не использует.
 EXCLUDED = [
@@ -88,8 +92,14 @@ app = BUNDLE(
     bundle_identifier="ru.qbeely.retailcore",
     info_plist={
         "CFBundleDisplayName": "RetailCore",
-        "CFBundleShortVersionString": "3.2.1",
+        # Версия из кода: зашитая строка отставала, и «О программе» в Finder
+        # показывало 3.2.1 на любой сборке.
+        "CFBundleShortVersionString": app_version(),
+        "CFBundleVersion": app_version(),
         "NSHighResolutionCapable": True,
+        # Окно рисуется светлым с первого кадра, до того как Qt выставит свою
+        # схему: оформление приложения тёмной темы не предусматривает.
+        "NSRequiresAquaSystemAppearance": True,
         "LSMinimumSystemVersion": "12.0",
     },
 )

@@ -11,7 +11,7 @@ from .core import appdata, updater
 from .core.settings import AppSettings
 from .ui import icons
 from .ui.main_window import MainWindow
-from .ui.theme import STYLESHEET
+from .ui.theme import STYLESHEET, light_palette
 
 
 def _set_taskbar_identity() -> None:
@@ -38,7 +38,13 @@ def main() -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationName("RetailCore")
     app.setWindowIcon(icons.app_icon())
+    # Оформление у приложения одно — светлое. Тёмная тема системы до него не
+    # доходит: иначе Qt подставляет тёмную палитру, и всё, что таблица стилей
+    # не закрашивает явно, темнеет (так было на Mac). Схема задаётся до
+    # палитры: она же переключает на светлые системные окна выбора файла.
+    app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     app.setStyle("Fusion")
+    app.setPalette(light_palette())
     app.setStyleSheet(STYLESHEET)
 
     settings = AppSettings.load()

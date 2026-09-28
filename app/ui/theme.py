@@ -1,7 +1,9 @@
 """Дизайн-токены и таблица стилей. Светлая тема, единая для всего приложения."""
 from __future__ import annotations
 
-from PySide6.QtGui import QColor
+import sys
+
+from PySide6.QtGui import QColor, QFont, QPalette
 
 from .resources import asset_url
 
@@ -72,9 +74,65 @@ def score_color(score: float) -> QColor:
     return QColor(Palette.DANGER)
 
 
+# Шрифты своей системы. Segoe на macOS нет, и Qt на каждое отсутствующее имя
+# перебирает все установленные семейства в поисках замены — старт медленнее,
+# а подобранная замена не всегда та, что нужна.
+if sys.platform == "darwin":
+    UI_FONT = ".AppleSystemUIFont"
+    _UI_FONTS = '".AppleSystemUIFont", "Helvetica Neue", sans-serif'
+    _MONO_FONTS = 'Menlo, Monaco, monospace'
+else:
+    UI_FONT = "Segoe UI"
+    _UI_FONTS = '"Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif'
+    _MONO_FONTS = '"Cascadia Mono", Consolas, monospace'
+
+
+def small_font() -> QFont:
+    """Шрифт подписей графиков."""
+    return QFont(UI_FONT, 8)
+
+
+def light_palette() -> QPalette:
+    """Палитра из тех же токенов, что и таблица стилей.
+
+    Таблица стилей закрашивает не всё: страницы вкладок, области прокрутки и
+    виджеты, которые рисуются сами, берут фон из палитры. Без своей палитры Qt
+    отдаёт системную, и на Mac с тёмным оформлением «Календарь» и «Таблица»
+    становились чёрными с тёмным текстом поверх.
+    """
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: Palette.BG,
+        QPalette.ColorRole.WindowText: Palette.TEXT,
+        QPalette.ColorRole.Base: Palette.SURFACE,
+        QPalette.ColorRole.AlternateBase: Palette.SURFACE_ALT,
+        QPalette.ColorRole.Text: Palette.TEXT,
+        QPalette.ColorRole.PlaceholderText: Palette.TEXT_FAINT,
+        QPalette.ColorRole.Button: Palette.SURFACE,
+        QPalette.ColorRole.ButtonText: Palette.TEXT,
+        QPalette.ColorRole.BrightText: Palette.TEXT_ON_PRIMARY,
+        QPalette.ColorRole.ToolTipBase: Palette.TEXT,
+        QPalette.ColorRole.ToolTipText: Palette.SURFACE,
+        QPalette.ColorRole.Highlight: Palette.SELECTION,
+        QPalette.ColorRole.HighlightedText: Palette.TEXT,
+        QPalette.ColorRole.Link: Palette.PRIMARY,
+        QPalette.ColorRole.Light: Palette.SURFACE,
+        QPalette.ColorRole.Midlight: Palette.SURFACE_ALT,
+        QPalette.ColorRole.Mid: Palette.BORDER_STRONG,
+        QPalette.ColorRole.Dark: Palette.TEXT_FAINT,
+        QPalette.ColorRole.Shadow: Palette.TEXT_MUTED,
+    }
+    for role, color in roles.items():
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                 QPalette.ColorRole.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(Palette.TEXT_FAINT))
+    return palette
+
+
 STYLESHEET = f"""
 * {{
-    font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif;
+    font-family: {_UI_FONTS};
     font-size: 13px;
     color: {Palette.TEXT};
 }}
@@ -189,7 +247,7 @@ QDoubleSpinBox:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
     color: {Palette.TEXT_FAINT};
     border-color: {Palette.BORDER};
 }}
-QLineEdit#Path {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }}
+QLineEdit#Path {{ font-family: {_MONO_FONTS}; font-size: 12px; }}
 
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{

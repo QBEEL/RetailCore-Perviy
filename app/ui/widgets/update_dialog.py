@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QSize, QUrl, Qt
+from PySide6.QtCore import QSize, QTimer, QUrl, Qt
 from PySide6.QtGui import QDesktopServices, QMovie
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
@@ -279,6 +279,13 @@ class UpdateDialog(QWidget):
         self.checker.download(manifest)
 
     def _restart(self) -> None:
+        # На macOS установка — монтирование образа и копирование бандла — идёт
+        # несколько секунд в потоке интерфейса. Без смены состояния окно
+        # замирало так, будто нажатие не сработало. Пауза даёт его перерисовать.
+        self._show_checking(f"Устанавливается версия {self._manifest.version}…")
+        QTimer.singleShot(50, self._install)
+
+    def _install(self) -> None:
         """Ставит обновление. Молчать при отказе нельзя.
 
         Исключение из слота Qt приложение не роняет — оно лишь печатает след в
@@ -301,8 +308,28 @@ class UpdateDialog(QWidget):
                              "Обновление не установилось")
             self.show()
             return
+        except Exception as failure:  # noqa: BLE001 — любой отказ человек должен увидеть
+            updater.log_event(f"Update failed: {failure!r}")
+            self._show_error(f"Не удалось установить обновление: {failure}",
+                             "Обновление не установилось")
+            self.show()
+            return
         updater.log_event("Update successful")
-        QApplication.instance().quit()
+        self._quit_for_update()
+
+    def _quit_for_update(self) -> None:
+        """Закрывает эту копию, чтобы место заняла новая.
+
+        `quit()` на macOS идёт через `[NSApp terminate:]`, и Cocoa вправе
+        отменить выход — тогда новая версия уже установлена и запущена, а старое
+        окно остаётся как ни в чём не бывало. `exit()` просто останавливает цикл
+        событий. Главное окно закрывается раньше: настройки оно сохраняет при
+        закрытии, а `exit()` его не закрывает.
+        """
+        window = self.parentWidget()
+        if window is not None:
+            window.close()
+        QApplication.exit(0)
 
     def _remind_later(self, manifest: updater.ReleaseManifest) -> None:
         self.settings.update_remind_after = (datetime.now() + _SNOOZE).isoformat()
