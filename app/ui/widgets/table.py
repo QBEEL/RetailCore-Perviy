@@ -43,8 +43,12 @@ class Column:
         align: Qt.AlignmentFlag = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
         color: Callable[[Any], QColor | None] | None = None,
         highlight: bool = False,
+        tip: str = "",
     ) -> None:
         self.title = title
+        # Подсказка к заголовку и имя в меню колонок — для коротких заголовков
+        # вроде «Δ %», которые рядом повторяются и без подсказки неразличимы.
+        self.tip = tip
         self.getter = getter
         self.width = width
         self.sort_key = sort_key or getter
@@ -66,6 +70,11 @@ class ObjectTableModel(QAbstractTableModel):
     def set_items(self, items: Sequence[Any]) -> None:
         self.beginResetModel()
         self._items = list(items)
+        self.endResetModel()
+
+    def set_columns(self, columns: Sequence[Column]) -> None:
+        self.beginResetModel()
+        self._columns = list(columns)
         self.endResetModel()
 
     def set_terms(self, terms: Sequence[str]) -> None:
@@ -123,6 +132,8 @@ class ObjectTableModel(QAbstractTableModel):
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if role == Qt.ItemDataRole.ToolTipRole and orientation == Qt.Orientation.Horizontal:
+            return self._columns[section].tip or None
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
@@ -262,9 +273,7 @@ class DataTable(QTableView):
         header.setStretchLastSection(True)
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         header.customContextMenuRequested.connect(self._column_menu)
-        for index, column in enumerate(columns):
-            header.resizeSection(index, column.width)
-            header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
+        self._size_columns()
 
         self.doubleClicked.connect(self._emit_activated)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -277,6 +286,23 @@ class DataTable(QTableView):
 
     def set_items(self, items: Sequence[Any]) -> None:
         self.model_.set_items(items)
+
+    def set_columns(self, columns: Sequence[Column]) -> None:
+        """Новый набор колонок — когда он известен только после загрузки данных.
+
+        Скрытые колонки показываются снова: номер колонки после замены набора
+        указывает уже на другую, и скрыть её значило бы потерять не то.
+        """
+        self.model_.set_columns(columns)
+        for index in range(len(columns)):
+            self.setColumnHidden(index, False)
+        self._size_columns()
+
+    def _size_columns(self) -> None:
+        header = self.horizontalHeader()
+        for index, column in enumerate(self.model_.columns):
+            header.resizeSection(index, column.width)
+            header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
 
     def current_item(self) -> Any:
         index = self.currentIndex()
@@ -316,7 +342,7 @@ class DataTable(QTableView):
         menu.addAction("Подогнать по содержимому", self.resizeColumnsToContents)
         menu.addSeparator()
         for index, column in enumerate(self.model_.columns):
-            action = menu.addAction(column.title)
+            action = menu.addAction(column.tip or column.title)
             action.setCheckable(True)
             action.setChecked(not self.isColumnHidden(index))
             action.toggled.connect(lambda visible, i=index: self.setColumnHidden(i, not visible))

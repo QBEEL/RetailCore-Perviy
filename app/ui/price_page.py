@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import os
-from typing import Callable
+from typing import Callable, Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -34,9 +34,11 @@ from ..core.models import FieldRole
 from ..core.pricing import (
     ComparisonResult,
     OneCTemplate,
+    PriceCell,
     PriceLine,
     PriceStats,
     PriceStatus,
+    PriceType,
     SupplierPrice,
 )
 from ..core.settings import AppSettings
@@ -78,6 +80,7 @@ class PricePage(QWidget):
         self._keys: list[LinkKey] = []
         self._mapping_boxes: list[tuple[str, SelectBox]] = []
         self._choices: list = []
+        self._price_names: list[str] = []
         self._busy = False
         self._build()
 
@@ -259,25 +262,19 @@ class PricePage(QWidget):
         body.addWidget(self.table, 1)
         return card
 
-    def _columns(self) -> list[Column]:
+    def _columns(self, types: Sequence[PriceType] = ()) -> list[Column]:
         return [
             Column("Статус", lambda l: l.status.title, 150,
                    sort_key=lambda l: l.status.value,
                    color=lambda l: QColor(STATUS_COLORS[
                        pricing.PRICE_STATUS_TONES[l.status]][0])),
             Column("Артикул 1С", lambda l: l.article, 170, highlight=True),
-            Column("Товар", lambda l: l.name, 300, highlight=True),
+            Column("Товар", lambda l: l.name, 260, highlight=True),
+            # Цены — сразу за товаром: ради них таблицу и смотрят, и до
+            # розничной не должно быть нужно листать вправо.
+            *[column for index, price_type in enumerate(types)
+              for column in _price_columns(index, price_type.name)],
             Column("Артикул поставщика", lambda l: l.supplier_article, 150, highlight=True),
-            Column("Старая цена", lambda l: _money(_first(l, "old")), 100,
-                   sort_key=lambda l: _first(l, "old") or 0,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            Column("Новая цена", lambda l: _money(_first(l, "new")), 100,
-                   sort_key=lambda l: _first(l, "new") or 0,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            Column("Δ %", _percent_text, 78,
-                   sort_key=lambda l: _first_percent(l) or 0,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                   color=_percent_color),
             Column("Способ", _method_text, 150,
                    sort_key=lambda l: l.method,
                    color=lambda l: QColor(Palette.WARNING) if l.link_warning
@@ -517,6 +514,7 @@ class PricePage(QWidget):
         self._set_busy(False)
         self.result = result
         self._keys = suppliers.keys_for(self.template, result.lines)
+        self._show_price_columns(result.types)
         self.table.set_items(result.lines)
         self._show_stats(result.stats)
         fade_in(self.table)
@@ -544,6 +542,19 @@ class PricePage(QWidget):
                 f"У {warnings} сохранённых привязок разошлись названия — "
                 "проверьте, не сменился ли товар за артикулом",
                 ToastKind.WARNING)
+
+    def _show_price_columns(self, types: Sequence[PriceType]) -> None:
+        """Колонки под виды цен шаблона — они известны только после сравнения.
+
+        Раньше в таблице стояла одна цена — первого вида, обычно
+        себестоимости, — и чтобы увидеть, как изменилась РРЦ, приходилось
+        открывать каждую строку. Набор меняется, только если поменялись сами
+        виды: иначе повторное сравнение сбрасывало бы подогнанные ширины.
+        """
+        names = [price_type.name for price_type in types]
+        if names != self._price_names:
+            self._price_names = names
+            self.table.set_columns(self._columns(types))
 
     def _remember_session(self) -> None:
         """Запоминает поставщика и структуру его прайса после успешного сравнения."""
@@ -812,23 +823,43 @@ class PricePage(QWidget):
         )
 
 
-def _first(line: PriceLine, field: str) -> float | None:
-    """Цена первого заполняемого вида — она показывается в таблице.
-
-    Виды цен могут различаться, поэтому полный список остаётся в правой панели,
-    а в таблице стоит та цена, которую пользователь смотрит чаще всего.
-    """
-    for cell in line.cells:
-        value = getattr(cell, field)
-        if value is not None:
-            return value
-    return None
+_RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
 
 
-def _first_percent(line: PriceLine) -> float | None:
-    for cell in line.cells:
-        if (percent := cell.percent) is not None:
-            return percent
+def _price_columns(index: int, name: str) -> list[Column]:
+    """Две колонки на вид цены: «было → стало» и изменение в процентах."""
+    return [
+        Column(name, lambda l: _price_text(l.cell(index)), max(130, 8 * len(name)),
+               sort_key=lambda l: _price_sort(l.cell(index)),
+               align=_RIGHT,
+               color=lambda l: _price_color(l.cell(index))),
+        Column("Δ %", lambda l: _percent_text(l.cell(index)), 78,
+               sort_key=lambda l: _percent_sort(l.cell(index)),
+               align=_RIGHT,
+               color=lambda l: _percent_color(l.cell(index)),
+               tip=f"Δ % {name}"),
+    ]
+
+
+def _price_text(cell: PriceCell | None) -> str:
+    """«1 200 → 1 350», если цена меняется; одна цена — если нет."""
+    if cell is None:
+        return "—"
+    if cell.changed:
+        return f"{_money(cell.old)} → {_money(cell.new)}"
+    return _money(cell.new if cell.new is not None else cell.old)
+
+
+def _price_sort(cell: PriceCell | None) -> float:
+    if cell is None:
+        return 0.0
+    return next((v for v in (cell.new, cell.old) if v is not None), 0.0)
+
+
+def _price_color(cell: PriceCell | None) -> QColor | None:
+    # Цены, которые поставщик не прислал, останутся прежними — бледные.
+    if cell is not None and cell.new is None:
+        return QColor(Palette.TEXT_FAINT)
     return None
 
 
@@ -837,13 +868,21 @@ def _method_text(line: PriceLine) -> str:
     return f"{line.method} ⚠" if line.link_warning else line.method
 
 
-def _percent_text(line: PriceLine) -> str:
-    percent = _first_percent(line)
-    return "" if percent is None else f"{percent:+.1f} %"
+def _percent_sort(cell: PriceCell | None) -> float:
+    percent = cell.percent if cell is not None else None
+    return 0.0 if percent is None else percent
 
 
-def _percent_color(line: PriceLine) -> QColor | None:
-    percent = _first_percent(line)
+def _percent_text(cell: PriceCell | None) -> str:
+    # «+0.0 %» у каждой неизменной цены в нескольких колонках — только шум:
+    # процент виден там, где цена правда меняется.
+    if cell is None or not cell.changed or cell.percent is None:
+        return ""
+    return f"{cell.percent:+.1f} %"
+
+
+def _percent_color(cell: PriceCell | None) -> QColor | None:
+    percent = cell.percent if cell is not None else None
     if percent is None or abs(percent) < 0.05:
         return None
     return QColor(Palette.DANGER if percent > 0 else Palette.SUCCESS)
