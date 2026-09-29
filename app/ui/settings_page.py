@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QTextBrowser,
@@ -23,7 +24,13 @@ from ..core import appdata, changelog, snapshots
 from ..core.models import DEFAULT_SEARCH_ROLES, DEFAULT_WEIGHTS, FieldRole, Sheet
 from ..core.payments import LEVEL_PRESETS
 from ..core.settings import DEFAULT_FILL_ROLES, AppSettings
+from ..core.vpn import (
+    VlessError, VpnManager, load_link, load_subscription, save_link, save_subscription,
+    subscription,
+)
+from ..core.vpn import parse as parse_vless
 from . import icons
+from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Divider, Hint, SectionTitle, Subtitle, Title
 from .widgets.inputs import DecimalInput, NumberInput, SelectBox
@@ -50,11 +57,15 @@ class SettingsPage(QWidget):
         notify: Callable[[str, ToastKind], None],
         parent: QWidget | None = None,
         check_updates: Callable[[], None] | None = None,
+        vpn: VpnManager | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.notify = notify
         self._check_updates = check_updates
+        self._vpn = vpn
+        self._vpn_servers: list = []
+        self._vpn_servers_for = ""
         self._role_boxes: dict[FieldRole, QCheckBox] = {}
         self._weight_boxes: dict[FieldRole, DecimalInput] = {}
         self._fill_boxes: dict[FieldRole, QCheckBox] = {}
@@ -84,6 +95,8 @@ class SettingsPage(QWidget):
         self._body.addWidget(self._mapping_card())
         self._body.addWidget(self._payments_card())
         self._body.addWidget(self._history_card())
+        if vpn_card := self._vpn_card():
+            self._body.addWidget(vpn_card)
         self._body.addWidget(self._updates_card())
         self._body.addWidget(self._changelog_card())
         self._body.addStretch(1)
@@ -393,6 +406,204 @@ class SettingsPage(QWidget):
 
     def _open_data_dir(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(appdata.data_dir()))
+
+    def _vpn_card(self) -> Card | None:
+        """Туннель через свой сервер: сайты в браузере открываются с его адреса.
+
+        Карточки нет там, где туннель невозможен (не Windows), и когда
+        менеджера не передали, — как в проверках, которым он не нужен.
+        """
+        vpn = self._vpn
+        if vpn is None or not vpn.supported:
+            return None
+        card = Card(self)
+        body = card.body()
+        body.addWidget(SectionTitle("Доступ через Финляндию", card))
+        body.addWidget(Hint(
+            "Сайты в браузере открываются через ваш сервер. Права администратора не "
+            "нужны: программа пропишет системный прокси только для вашей учётной записи "
+            "и вернёт прежний при выключении. Российские сайты, сервер оплат и «Честный "
+            "ЗНАК» идут напрямую. Программы, которые не читают системный прокси, "
+            "туннелем не пользуются.", card))
+
+        row = QHBoxLayout()
+        row.setSpacing(9)
+        self.vpn_link = QLineEdit(card)
+        # Ссылка равносильна ключу к серверу: по умолчанию она скрыта, как токен
+        # в разделе маркировки.
+        self.vpn_link.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vpn_link.setPlaceholderText("Ссылка подписки https://… или ссылка сервера vless://…")
+        self.vpn_link.setText(load_subscription() or load_link())
+        row.addWidget(self.vpn_link, 1)
+        shown = QCheckBox("Показать", card)
+        shown.toggled.connect(lambda on: self.vpn_link.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        row.addWidget(shown)
+        body.addLayout(row)
+
+        # Список серверов подписки. Пуст, пока подписку не загрузили.
+        self.vpn_server = SelectBox(card)
+        self.vpn_server.currentIndexChanged.connect(self._vpn_server_chosen)
+        self.vpn_server.hide()
+        body.addWidget(self.vpn_server)
+
+        buttons = QHBoxLayout()
+        self.vpn_toggle = QPushButton("Включить", card)
+        self.vpn_toggle.clicked.connect(self._toggle_vpn)
+        buttons.addWidget(self.vpn_toggle)
+        self.vpn_reload = QPushButton("Обновить список", card)
+        self.vpn_reload.clicked.connect(self._reload_vpn_servers)
+        buttons.addWidget(self.vpn_reload)
+        self.vpn_check = QPushButton("Проверить адрес", card)
+        self.vpn_check.clicked.connect(self._check_vpn_address)
+        buttons.addWidget(self.vpn_check)
+        buttons.addStretch(1)
+        body.addLayout(buttons)
+
+        self.vpn_status = Hint("", card)
+        body.addWidget(self.vpn_status)
+        self.refresh_vpn()
+        return card
+
+    def refresh_vpn(self) -> None:
+        """Приводит кнопки и строку состояния в соответствие с туннелем."""
+        vpn = self._vpn
+        if vpn is None or not hasattr(self, "vpn_toggle"):
+            return
+        active = vpn.active
+        self.vpn_toggle.setEnabled(True)
+        self.vpn_toggle.setText("Выключить" if active else "Включить")
+        self.vpn_check.setEnabled(active)
+        self.vpn_reload.setEnabled(not active)
+        self.vpn_link.setEnabled(not active)
+        self.vpn_server.setEnabled(not active)
+        self.vpn_server.setVisible(bool(self._vpn_servers))
+        if active:
+            name = self._vpn_active_name()
+            self.vpn_status.setText(
+                f"Работает{f' через «{name}»' if name else ''}, локальный прокси {vpn.proxy_address}.")
+        elif vpn.last_error:
+            self.vpn_status.setText(f"Выключен. {vpn.last_error}")
+        else:
+            self.vpn_status.setText("Выключен.")
+
+    def _vpn_active_name(self) -> str:
+        """Название сервера, с которым работает туннель.
+
+        Туннель мог подняться при запуске приложения, до открытия этой
+        страницы, поэтому имя берётся из сохранённой ссылки, а не из памяти.
+        """
+        try:
+            return parse_vless(load_link()).name
+        except VlessError:
+            return ""
+
+    def _toggle_vpn(self) -> None:
+        vpn = self._vpn
+        if vpn is None:
+            return
+        if vpn.active:
+            self.settings.vpn_enabled = False
+            self._save()
+            self._vpn_busy("Выключение…")
+            run_task(vpn.stop, on_result=lambda _: self.refresh_vpn(),
+                     on_error=self._vpn_failed)
+            return
+        text = self.vpn_link.text().strip()
+        if subscription.is_subscription(text):
+            if self._vpn_servers and self._vpn_servers_for == text:
+                self._vpn_begin(self._vpn_servers[self.vpn_server.currentIndex()], text)
+                return
+            self._vpn_busy("Загрузка подписки…")
+            run_task(subscription.fetch, text,
+                     on_result=lambda links: self._vpn_subscription_loaded(text, links, connect=True),
+                     on_error=self._vpn_failed)
+            return
+        try:
+            link = parse_vless(text)
+        except VlessError as error:
+            vpn.last_error = str(error)
+            self.refresh_vpn()
+            self.notify(str(error), ToastKind.ERROR)
+            return
+        self._vpn_begin(link, "")
+
+    def _reload_vpn_servers(self) -> None:
+        text = self.vpn_link.text().strip()
+        if not subscription.is_subscription(text):
+            self.notify("Вставьте ссылку подписки — она начинается с https://", ToastKind.WARNING)
+            return
+        self._vpn_busy("Загрузка подписки…")
+        run_task(subscription.fetch, text,
+                 on_result=lambda links: self._vpn_subscription_loaded(text, links, connect=False),
+                 on_error=self._vpn_failed)
+
+    def _vpn_subscription_loaded(self, url: str, links: list, connect: bool) -> None:
+        """Заполняет список серверов; при включении сразу поднимает выбранный."""
+        self._vpn_servers, self._vpn_servers_for = links, url
+        chosen = subscription.preferred(links, self.settings.vpn_server)
+        self.vpn_server.blockSignals(True)
+        self.vpn_server.clear()
+        for link in links:
+            self.vpn_server.addItem(link.name or f"{link.host}:{link.port}")
+        self.vpn_server.setCurrentIndex(links.index(chosen))
+        self.vpn_server.blockSignals(False)
+        if connect:
+            self._vpn_begin(chosen, url)
+            return
+        self.refresh_vpn()
+        self.vpn_status.setText(f"Серверов в подписке: {len(links)}. Выберите нужный и нажмите «Включить».")
+
+    def _vpn_server_chosen(self, index: int) -> None:
+        if 0 <= index < len(self._vpn_servers):
+            self.settings.vpn_server = self._vpn_servers[index].name
+            self._save()
+
+    def _vpn_begin(self, link, subscription_url: str) -> None:
+        """Запоминает выбранный сервер и поднимает туннель в фоне.
+
+        В `link.txt` ложится ссылка именно этого сервера, а не подписки: при
+        запуске приложения туннель поднимается без обращения к сети.
+        """
+        save_link(link.raw)
+        save_subscription(subscription_url)
+        self.settings.vpn_server = link.name
+        self._vpn_busy("Подключение…")
+        run_task(self._vpn.start, link, on_result=self._vpn_started, on_error=self._vpn_failed)
+
+    def _vpn_started(self, _: object) -> None:
+        self.settings.vpn_enabled = True
+        self._save()
+        self.refresh_vpn()
+        self.notify("Туннель включён. Проверьте адрес кнопкой рядом.", ToastKind.SUCCESS)
+
+    def _vpn_failed(self, message: str) -> None:
+        if self._vpn is not None:
+            self._vpn.last_error = message
+        self.refresh_vpn()
+        self.notify(message, ToastKind.ERROR)
+
+    def _vpn_busy(self, text: str) -> None:
+        self.vpn_toggle.setEnabled(False)
+        self.vpn_reload.setEnabled(False)
+        self.vpn_check.setEnabled(False)
+        self.vpn_status.setText(text)
+
+    def _check_vpn_address(self) -> None:
+        vpn = self._vpn
+        if vpn is None or not vpn.active:
+            return
+        self.vpn_check.setEnabled(False)
+        self.vpn_status.setText("Проверка адреса…")
+        run_task(vpn.exit_ip, on_result=self._vpn_address_found, on_error=self._vpn_address_failed)
+
+    def _vpn_address_found(self, address: str) -> None:
+        self.refresh_vpn()
+        self.vpn_status.setText(f"Работает. Ваш внешний адрес через туннель: {address}.")
+
+    def _vpn_address_failed(self, message: str) -> None:
+        self.refresh_vpn()
+        self.vpn_status.setText(f"Работает, но адрес узнать не удалось. {message}")
 
     def _updates_card(self) -> Card:
         card = Card(self)

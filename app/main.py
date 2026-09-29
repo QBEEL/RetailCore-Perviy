@@ -9,6 +9,8 @@ from PySide6.QtWidgets import QApplication
 from . import APP_TITLE, __version__
 from .core import appdata, updater
 from .core.settings import AppSettings
+from .core.vpn import VlessError, VpnError, VpnManager, load_link
+from .core.vpn import parse as parse_vless
 from .ui import icons
 from .ui.main_window import MainWindow
 from .ui.theme import STYLESHEET, light_palette
@@ -50,18 +52,44 @@ def main() -> int:
     settings = AppSettings.load()
     _adopt_profiles(settings)
 
-    # Вход до главного окна: программа знает, кто правит общие оплаты и за кем
-    # закреплены поставщики, и «неизвестный пользователь» ей не подходит.
-    # Отказ от входа означает выход — окно даже не создаётся.
-    from .ui.widgets.login_dialog import Start, start_session
+    # Туннель поднимается до входа, но сервер оплат он не касается: адрес
+    # сервера стоит в исключениях системного прокси. Останавливается он в
+    # `finally`, а не по сигналу выхода из Qt: при отказе от входа цикл событий
+    # не запускается, и прокси остался бы прописанным в реестре.
+    vpn = VpnManager()
+    _start_vpn(vpn, settings)
+    try:
+        # Вход до главного окна: программа знает, кто правит общие оплаты и за
+        # кем закреплены поставщики, и «неизвестный пользователь» ей не подходит.
+        # Отказ от входа означает выход — окно даже не создаётся.
+        from .ui.widgets.login_dialog import Start, start_session
 
-    outcome = start_session(settings)
-    if outcome == Start.QUIT:
-        return 0
+        outcome = start_session(settings)
+        if outcome == Start.QUIT:
+            return 0
 
-    window = MainWindow(settings, offline=outcome == Start.OFFLINE)
-    window.show()
-    return app.exec()
+        window = MainWindow(settings, offline=outcome == Start.OFFLINE, vpn=vpn)
+        window.show()
+        return app.exec()
+    finally:
+        vpn.stop()
+
+
+def _start_vpn(vpn: VpnManager, settings: AppSettings) -> None:
+    """Возвращает настройки после сбоя и поднимает туннель, если он был включён.
+
+    Ошибка запуска не мешает работе: причина остаётся в `vpn.last_error`, и
+    главное окно покажет её, когда откроется.
+    """
+    if not vpn.supported:
+        return
+    vpn.recover()
+    if not settings.vpn_enabled:
+        return
+    try:
+        vpn.start(parse_vless(load_link()))
+    except (VlessError, VpnError) as error:
+        vpn.last_error = str(error)
 
 
 def _adopt_profiles(settings: AppSettings) -> None:

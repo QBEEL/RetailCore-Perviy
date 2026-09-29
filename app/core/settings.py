@@ -101,6 +101,12 @@ class AppSettings:
     # название для показа. Товар тот же самый от поставки к поставке, и второй
     # раз спрашивать о нём незачем.
     marking_onec_links: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Туннель через свой сервер включён и поднимается при запуске. Сама ссылка
+    # с идентификатором пользователя здесь не хранится: см. core/vpn/manager.py.
+    vpn_enabled: bool = False
+    # Название сервера, выбранного из подписки: по нему при обновлении списка
+    # находится тот же сервер. Название не секретно, в отличие от самой ссылки.
+    vpn_server: str = ""
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -299,6 +305,8 @@ class AppSettings:
             for key, item in (data.get("marking_onec_links") or {}).items()
             if isinstance(item, dict) and item.get("code")
         }
+        self.vpn_enabled = bool(data.get("vpn_enabled", False))
+        self.vpn_server = str(data.get("vpn_server", ""))
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -373,6 +381,8 @@ class AppSettings:
             "marking_reconcile_sound": self.marking_reconcile_sound,
             "marking_onec_catalog": self.marking_onec_catalog,
             "marking_onec_links": self.marking_onec_links,
+            "vpn_enabled": self.vpn_enabled,
+            "vpn_server": self.vpn_server,
         }
 
     def remember_payment_import(self, path: str) -> None:

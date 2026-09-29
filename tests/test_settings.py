@@ -132,3 +132,14 @@ def test_настройки_без_ключей_входа_читаются_с_�
     loaded = AppSettings.load(str(path))
     assert loaded.payment_login == ""
     assert loaded.payment_server == "https://retail.qbeely.ru"
+
+
+def test_туннель_по_умолчанию_выключен_и_переживает_перезапуск(settings):
+    """Включённый туннель поднимается при запуске, поэтому по умолчанию он
+    выключен: человек, не открывавший этот раздел, не получает прокси в реестре."""
+    assert settings.vpn_enabled is False
+
+    settings.vpn_enabled = True
+    settings.save()
+
+    assert AppSettings.load(settings._path).vpn_enabled is True

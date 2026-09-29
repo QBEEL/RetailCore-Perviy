@@ -26,6 +26,8 @@ EXCLUDED = [
     "numpy", "pandas", "matplotlib", "scipy", "PIL", "tkinter", "pytest", "PyQt5", "PyQt6",
 ]
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files
 
 # qtawesome тащит шрифты с иконками — без них интерфейс останется без значков.
@@ -35,6 +37,17 @@ DATAS = ([("app/ui/assets", "app/ui/assets"), ("CHANGELOG.md", ".")]
          + collect_data_files("qtawesome")
          # Таблицы кодировок шрифтов: без них pdfminer не прочтёт часть счетов.
          + collect_data_files("pdfminer"))
+
+# sing-box для «Доступа через Финляндию». Кладётся как данные, а не как
+# бинарник: PyInstaller не должен разбирать его зависимости. Скачивается
+# tools/fetch_singbox.py; без него сборка выходит, но раздел покажет, что
+# компонента нет.
+SING_BOX = "vendor/sing-box/sing-box.exe"
+if os.path.isfile(SING_BOX):
+    DATAS.append((SING_BOX, "vpn"))
+else:
+    print("ВНИМАНИЕ: vendor/sing-box/sing-box.exe не найден — запустите "
+          "tools/fetch_singbox.py, иначе туннель в сборке работать не будет.")
 
 a = Analysis(
     ["run.py"],

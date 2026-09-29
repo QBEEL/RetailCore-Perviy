@@ -55,6 +55,11 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # Версия и сумма sing-box закреплены в самом скрипте: файл запускается
+      # на машинах сотрудников, и подменить его при сборке нельзя.
+      - name: Fetch sing-box
+        run: python tools/fetch_singbox.py
+
       - name: Build .exe
         run: pyinstaller RetailCore.spec --noconfirm
 

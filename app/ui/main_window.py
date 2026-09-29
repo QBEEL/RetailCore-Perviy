@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from .. import APP_TITLE, __version__
 from ..core import changelog
 from ..core.settings import AppSettings
+from ..core.vpn import VpnManager
 from . import icons
 from .catalog_page import CatalogPage
 from .history_page import HistoryPage
@@ -86,9 +87,11 @@ def _page_of(widget: QWidget | None) -> QWidget | None:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: AppSettings, offline: bool = False) -> None:
+    def __init__(self, settings: AppSettings, offline: bool = False,
+                 vpn: VpnManager | None = None) -> None:
         super().__init__()
         self.settings = settings
+        self.vpn = vpn
         # Запуск без сервера: вход был раньше и льготный срок ещё не вышел.
         # Работа с файлами продолжается, разделы общей базы закрыты.
         self.offline = offline
@@ -120,7 +123,8 @@ class MainWindow(QMainWindow):
         self.reports_page = ReportsPage(settings, self.notify, self.pages)
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
-        self.settings_page = SettingsPage(settings, self.notify, self.pages, self._check_updates_now)
+        self.settings_page = SettingsPage(
+            settings, self.notify, self.pages, self._check_updates_now, vpn)
         self.admin_page = AdminPage(settings, self.notify, self.pages,
                                     self.payments_page.invalidate)
         self.profile_page = ProfilePage(settings, self.notify, self.pages,
@@ -155,6 +159,28 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, self._show_whats_new)
         if settings.update_check_auto:
             QTimer.singleShot(2000, self.update_dialog.run_silent)
+        if vpn is not None and vpn.supported:
+            self._watch_vpn(vpn)
+
+    def _watch_vpn(self, vpn: VpnManager) -> None:
+        """Следит за туннелем: упавший sing-box нужно заметить сразу.
+
+        Пока он не замечен, в реестре прописан адрес, по которому никто не
+        слушает, и у человека не открывается ни один сайт.
+        """
+        if vpn.last_error:
+            QTimer.singleShot(1000, lambda: self.notify(
+                f"Туннель не включился: {vpn.last_error}", ToastKind.WARNING))
+        self._vpn_timer = QTimer(self)
+        self._vpn_timer.setInterval(5000)
+        self._vpn_timer.timeout.connect(self._check_vpn)
+        self._vpn_timer.start()
+
+    def _check_vpn(self) -> None:
+        if self.vpn is None or not (problem := self.vpn.poll()):
+            return
+        self.notify(f"{problem} Системный прокси снят.", ToastKind.WARNING)
+        self.settings_page.refresh_vpn()
 
     def _show_whats_new(self) -> None:
         """После обновления — список изменений новой версии, один раз.
