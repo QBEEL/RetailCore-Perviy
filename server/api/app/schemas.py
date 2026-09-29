@@ -139,6 +139,10 @@ class BudgetOut(BudgetIn):
 class RecipientLinkIn(BaseModel):
     recipient: str
     supplier_id: int
+    # Ключ считает клиент, как и у оплаты (`PaymentIn.recipient_key`): иначе
+    # привязка «Суперкосметикс ООО» ложится на «суперкосметикс ооо» и не
+    # находит оплат из 1С, записанных под «суперкосметикс».
+    recipient_key: str = ""
 
 
 class RecipientLinkOut(BaseModel):

@@ -27,22 +27,24 @@ def list_links(user: User = Depends(security.current_user)
 @router.put("/links", response_model=RecipientLinkOut, summary="Привязать")
 def save_link(form: RecipientLinkIn,
               user: User = Depends(security.current_user)) -> RecipientLinkOut:
+    # Пустой ключ приходит от старого клиента — тогда как раньше.
+    key = form.recipient_key.strip() or form.recipient.strip().lower()
     row = db.fetch_one(
         "INSERT INTO recipient_link (recipient_key, recipient, supplier_id,"
         "                            linked_by)"
-        " VALUES (lower(btrim(%s)), %s, %s, 'manual')"
+        " VALUES (%s, %s, %s, 'manual')"
         " ON CONFLICT (recipient_key) DO UPDATE"
         " SET recipient = EXCLUDED.recipient,"
         "     supplier_id = EXCLUDED.supplier_id,"
         "     linked_by = 'manual', updated_at = now()"
         " RETURNING recipient_key, recipient, supplier_id, linked_by, updated_at",
-        (form.recipient, form.recipient, form.supplier_id))
+        (key, form.recipient, form.supplier_id))
     # Привязка меняет и сами оплаты: без этого календарь продолжил бы считать
     # получателя непривязанным до следующего импорта.
     db.execute(
         "UPDATE payment SET supplier_id = %s"
-        " WHERE recipient_key = lower(btrim(%s)) AND supplier_id <> %s",
-        (form.supplier_id, form.recipient, form.supplier_id))
+        " WHERE recipient_key = %s AND supplier_id <> %s",
+        (form.supplier_id, key, form.supplier_id))
     db.execute(
         "INSERT INTO audit_log (user_id, entity, action, changes)"
         " VALUES (%s, 'recipient_link', 'save',"

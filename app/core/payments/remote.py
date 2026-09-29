@@ -517,7 +517,8 @@ def save_recipient_link(recipient: str, supplier_id: int,
     if not recipient.strip():
         raise ValueError("Получателя нечем опознать")
     transport.put("/api/recipients/links",
-                  {"recipient": recipient, "supplier_id": supplier_id})
+                  {"recipient": recipient, "supplier_id": supplier_id,
+                   "recipient_key": recipient_key(recipient)})
     return 1
 
 
