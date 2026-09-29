@@ -18,6 +18,7 @@ from app.core.payments import (
     PaymentStatus,
     clean_name,
     importer,
+    plan,
     level_of,
     parse_amount,
     parse_date,
@@ -375,6 +376,85 @@ def test_импорт_не_трогает_созданное_вручную(tmp_
         service.analyze_import(path, today=TODAY, db_path=db), today=TODAY, db_path=db, link=False)
     kept = store.get_payment(manual.id, db)
     assert kept is not None and kept.amount == pytest.approx(500.0)
+
+
+def _planned(db, amount: float, recipient: str = "АСТЭРА ГК ООО",
+             pay: date = date(2026, 10, 13), **fields) -> Payment:
+    return store.save_payment(Payment(
+        amount=amount, recipient=recipient, pay_date=pay,
+        origin=fields.pop("origin", PaymentOrigin.MANUAL), **fields), db)
+
+
+def test_заявка_1с_занимает_ручную_оплату_того_же_дня(tmp_path, db):
+    """Оплату наметили в приложении, потом завели заявку в 1С — запись одна.
+
+    Так задвоились «АСТЭРА» на 13.10 и «Смарт Бьюти» на 10.11: ручная запись
+    осталась, а заявка из выгрузки легла рядом.
+    """
+    manual = _planned(db, 800_000.0, "Смарт Бьюти", pay=date(2026, 11, 10),
+                      comment="по счёту от 25.09")
+    path = _csv(tmp_path, _row("IP00-001625", "29.09.2026", "855 876,00",
+                              "Смарт Бьюти ООО", "10.11.2026", status="Не согласована"))
+    report = service.analyze_import(path, today=TODAY, db_path=db)
+    assert (report.new, report.adopted) == (0, 1)
+
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.count_payments(db) == 1
+    taken = store.get_payment(manual.id, db)
+    assert taken.doc_number == "IP00-001625"
+    assert taken.request_date == date(2026, 9, 29)
+    assert taken.origin is PaymentOrigin.IMPORT
+    assert taken.amount == pytest.approx(855_876.0)
+    assert taken.comment == "по счёту от 25.09"
+
+    again = service.analyze_import(path, today=TODAY, db_path=db)
+    assert (again.new, again.adopted, again.updated) == (0, 0, 0)
+
+
+def test_две_заявки_на_одну_ручную_оплату(tmp_path, db):
+    """Одну запись занимает ближайшая по сумме заявка, вторая ложится рядом."""
+    manual = _planned(db, 1_500_000.0, "Гранат ООО", pay=date(2026, 10, 9))
+    path = _csv(
+        tmp_path,
+        _row("IP00-001615", "28.09.2026", "1 154 350,00", "Гранат ООО", "09.10.2026"),
+        _row("IP00-001617", "28.09.2026", "513 000,00", "Гранат ООО", "09.10.2026"),
+    )
+    report = service.analyze_import(path, today=TODAY, db_path=db)
+    assert (report.new, report.adopted) == (1, 1)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.count_payments(db) == 2
+    assert store.get_payment(manual.id, db).doc_number == "IP00-001615"
+
+
+def test_заявка_не_занимает_оплату_другого_дня_или_оплаченную(tmp_path, db):
+    _planned(db, 220_849.0, pay=date(2026, 10, 14))
+    _planned(db, 220_849.0, status=PaymentStatus.PAID)
+    path = _csv(tmp_path, _row("IP00-001623", "28.09.2026", "220 849,00",
+                              "АСТЭРА ГК ООО", "13.10.2026"))
+    report = service.analyze_import(path, today=TODAY, db_path=db)
+    assert (report.new, report.adopted) == (1, 0)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.count_payments(db) == 3
+
+
+def test_занятая_строка_плана_не_возвращается_при_повторной_загрузке(tmp_path, db):
+    """Метка плана остаётся на записи: тот же файл плана не заведёт её заново."""
+    ref = plan.plan_ref("Когай Анна", 2026, 10)
+    row = _planned(db, 401_480.0, "АМАРИСТА ООО", pay=date(2026, 10, 14),
+                   origin=PaymentOrigin.PLAN, origin_ref=ref, responsible="Когай Анна")
+    path = _csv(tmp_path, _row("IP00-001618", "28.09.2026", "401 480,00",
+                              "АМАРИСТА ООО", "14.10.2026"))
+    service.apply_import(service.analyze_import(path, today=TODAY, db_path=db),
+                         today=TODAY, db_path=db, link=False)
+    taken = store.get_payment(row.id, db)
+    assert taken.origin_ref == ref and taken.doc_number == "IP00-001618"
+
+    file = plan.PlanFile(manager="Когай Анна", rows=[plan.PlanRow(
+        pay_date=date(2026, 10, 14), supplier="АМАРИСТА ООО", amount=401_480.0)])
+    current = plan.existing_of(store.list_payments(None, db), "Когай Анна", [(2026, 10)])
+    report = plan.compare(file, current)
+    assert not report.created and not report.removed and not report.updated
+    assert [p.id for p in report.paid] == [row.id]
 
 
 def test_строка_без_суммы_пропускается_с_объяснением(tmp_path, db):

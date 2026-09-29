@@ -707,6 +707,8 @@ class ImportDialog(QDialog):
         tiles = [
             ("Прочитано", report.rows, Palette.TEXT_MUTED),
             ("Новых", report.new, Palette.SUCCESS),
+            # Заявки, которые встанут на место ручной или плановой оплаты.
+            ("Заменят план", report.adopted, Palette.SUCCESS),
             ("Изменится", report.updated, Palette.WARNING),
             ("Без изменений", report.same, Palette.TEXT_FAINT),
             ("Сумма, ₽", money(report.total), Palette.PRIMARY),

@@ -243,6 +243,9 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "currency": payment.currency,
             "supplier_id": payment.supplier_id,
             "recipient": payment.recipient,
+            # Ключ считает приложение: сервер умеет только понизить регистр,
+            # и «АСТЭРА ГК ООО» из формы не сошлось бы с «АСТЭРА ГК» из 1С.
+            "recipient_key": recipient_key(payment.recipient),
             "status": payment.status.value,
             "comment": payment.comment,
             "responsible": payment.responsible,
@@ -395,17 +398,48 @@ def _for_server(payment: Payment) -> dict[str, Any]:
     }
 
 
-def apply_import(created: Any, changed: Any,
-                 path: str | None = None) -> tuple[int, int]:
+def adoption_candidates(path: str | None = None) -> list[Payment]:
+    """Открытые оплаты без номера 1С — те, что может занять новая заявка.
+
+    Сервер старее клиента такого запроса не знает. Тогда занимать нечего:
+    импорт пройдёт как раньше, а не упадёт.
+    """
+    try:
+        rows = transport.get("/api/imports/candidates")
+    except transport.ServerError as error:
+        if error.status == 404:
+            return []
+        raise
+    # Не через `_payment`: ответ урезан до нужного для сопоставления, а
+    # `_payment` ещё и запомнил бы право на правку, которого здесь нет.
+    return [
+        Payment(
+            id=int(row["id"]),
+            pay_date=_date(row["pay_date"]),
+            amount=float(row["amount"]),
+            recipient=row["recipient"],
+            status=_status(row["status"]),
+            origin=_origin(row["origin"]),
+            origin_ref=row.get("origin_ref", ""),
+        )
+        for row in rows
+    ]
+
+
+def apply_import(created: Any, changed: Any, path: str | None = None, *,
+                 adopted: Any = ()) -> tuple[int, int, int]:
     """Отправляет разобранную выгрузку. Сервер пишет её одной транзакцией."""
     new_rows = [_for_server(payment) for payment in created]
     updates = [{"id": int(payment_id), "payment": _for_server(payment)}
                for payment_id, payment in changed]
-    if not new_rows and not updates:
-        return 0, 0
+    takeovers = [{"id": int(payment_id), "payment": _for_server(payment)}
+                 for payment_id, payment in adopted]
+    if not new_rows and not updates and not takeovers:
+        return 0, 0, 0
     answer = transport.post("/api/imports/apply",
-                            {"created": new_rows, "changed": updates})
-    return int(answer["new"]), int(answer["updated"])
+                            {"created": new_rows, "changed": updates,
+                             "adopted": takeovers})
+    return int(answer["new"]), int(answer["updated"]), int(answer.get("adopted", 0))
 
 
 def upload(created: Any, changed: Any, budgets: Any = ()) -> dict[str, int]:

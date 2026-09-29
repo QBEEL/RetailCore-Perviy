@@ -565,6 +565,9 @@ class ImportReport:
     rows: int = 0
     new: int = 0
     updated: int = 0
+    # Новые заявки 1С, которые встанут на место уже заведённой ручной или
+    # плановой оплаты, а не лягут рядом с ней второй записью.
+    adopted: int = 0
     same: int = 0
     skipped: list[str] = field(default_factory=list)
     payments: list[Payment] = field(default_factory=list)
@@ -579,13 +582,15 @@ class ImportReport:
 
     @property
     def changes(self) -> int:
-        return self.new + self.updated
+        return self.new + self.updated + self.adopted
 
     @property
     def summary(self) -> str:
         parts = [f"прочитано {self.rows}"]
         if self.new:
             parts.append(f"новых {self.new}")
+        if self.adopted:
+            parts.append(f"заменят план {self.adopted}")
         if self.updated:
             parts.append(f"изменилось {self.updated}")
         if self.same:

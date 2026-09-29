@@ -284,7 +284,7 @@ class PlanImportDialog(QDialog):
             ("Новых", len(report.created), Palette.SUCCESS),
             ("Изменится", len(report.updated), Palette.WARNING),
             ("Исчезнет", len(report.removed), Palette.DANGER),
-            ("Оплачено", len(report.paid), Palette.TEXT_FAINT),
+            ("Оплачено или в 1С", len(report.paid), Palette.TEXT_FAINT),
             ("Сумма, ₽", money(report.total), Palette.PRIMARY),
         ]
         for index, (label, value, colour) in enumerate(tiles):
@@ -306,7 +306,7 @@ class PlanImportDialog(QDialog):
             ("Появится", report.created, Palette.SUCCESS),
             ("Изменится", report.updated, Palette.WARNING),
             ("Исчезнет из плана", report.removed, Palette.DANGER),
-            ("Уже оплачено — не трогаю", report.paid, Palette.TEXT_FAINT),
+            ("Оплачено или в 1С — не трогаю", report.paid, Palette.TEXT_FAINT),
         ]
         for title, payments, colour in groups:
             if not payments:

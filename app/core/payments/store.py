@@ -368,20 +368,52 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
     return index
 
 
+_OPEN: tuple[str, ...] = tuple(status.value for status in PaymentStatus if status.open)
+
+# Что заявка 1С приносит в занятую запись сверх обычных полей выгрузки.
+# Комментарий, вложения, карточка поставщика и метка плана остаются прежними.
+ADOPTED_FIELDS: tuple[str, ...] = ("doc_number", "request_date", "status", "origin",
+                                   *IMPORTED_FIELDS)
+
+
+def adoption_candidates(path: str | None = None) -> list[Payment]:
+    """Открытые оплаты без номера 1С — те, что может занять новая заявка."""
+    marks = ", ".join("?" for _ in _OPEN)
+    with connect(path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM payment WHERE doc_number = '' AND pay_date <> ''"
+            f" AND status IN ({marks})", _OPEN).fetchall()
+    return [_payment(row) for row in rows]
+
+
 def apply_import(
     created: Iterable[Payment],
     changed: Iterable[tuple[int, Payment]],
     path: str | None = None,
-) -> tuple[int, int]:
+    *,
+    adopted: Iterable[tuple[int, Payment]] = (),
+) -> tuple[int, int, int]:
     """Записывает разобранную выгрузку одной транзакцией.
 
     Изменившимся обновляются только поля из 1С: комментарий, вложения и
-    назначенный вручную статус остаются на месте.
+    назначенный вручную статус остаются на месте. Занятая заявкой запись
+    получает номер и статус из 1С — с этого момента это оплата из выгрузки.
     """
     now = _now()
     new_rows = [_values(payment) for payment in created]
     updates = [(payment_id, _values(payment, imported_only=True)) for payment_id, payment in changed]
+    takeovers = [(payment_id, _adopted_values(payment)) for payment_id, payment in adopted]
     with connect(path) as connection:
+        if takeovers:
+            # Сумма в занятой записи — из 1С, пометка о ручной правке к ней
+            # не относится. Условие на пустой номер — защита от гонки: запись
+            # могли занять между разбором и подтверждением.
+            assignments = ", ".join(f"{name} = ?" for name in takeovers[0][1])
+            connection.executemany(
+                f"UPDATE payment SET {assignments}, amount_before = NULL,"
+                " amount_changed_by = '', amount_changed_at = '', updated_at = ?"
+                " WHERE id = ? AND doc_number = ''",
+                [[*row.values(), now, payment_id] for payment_id, row in takeovers])
         if new_rows:
             names = ", ".join([*new_rows[0], "created_at", "updated_at"])
             marks = ", ".join("?" for _ in range(len(new_rows[0]) + 2))
@@ -406,7 +438,7 @@ def apply_import(
                 [[*[row["amount"]] * 3, *row.values(), now, payment_id]
                  for payment_id, row in updates])
         connection.commit()
-    return len(new_rows), len(updates)
+    return len(new_rows), len(updates), len(takeovers)
 
 
 def log_import(
@@ -706,6 +738,11 @@ def _values(payment: Payment, *, imported_only: bool = False) -> dict[str, Any]:
     if not imported_only:
         return everything
     return {name: everything[name] for name in IMPORTED_FIELDS}
+
+
+def _adopted_values(payment: Payment) -> dict[str, Any]:
+    everything = _values(payment)
+    return {name: everything[name] for name in ADOPTED_FIELDS}
 
 
 def _payment(row: sqlite3.Row) -> Payment:

@@ -297,10 +297,11 @@ def create_payment(form: PaymentIn,
         "INSERT INTO payment (pay_date, amount, vat, currency, supplier_id,"
         "  recipient, recipient_key, status, operation, priority, comment,"
         "  responsible, author, origin, origin_ref, updated_by)"
-        " VALUES (%s, %s, %s, %s, %s, %s, lower(btrim(%s)), %s, %s, %s, %s,"
-        "         %s, %s, %s, %s, %s) RETURNING id",
+        " VALUES (%s, %s, %s, %s, %s, %s, COALESCE(NULLIF(%s, ''), lower(btrim(%s))),"
+        "         %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (form.pay_date, form.amount, form.vat, form.currency, form.supplier_id,
-         form.recipient, form.recipient, form.status, form.operation,
+         form.recipient, form.recipient_key.strip(), form.recipient,
+         form.status, form.operation,
          form.priority, form.comment, responsible, user.full_name,
          form.origin, form.origin_ref, user.id))
     _record(user, "payment", created["id"], "create",

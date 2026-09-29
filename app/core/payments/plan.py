@@ -180,7 +180,7 @@ class PlanReport:
         if self.same:
             parts.append(f"без изменений {len(self.same)}")
         if self.paid:
-            parts.append(f"уже оплачено {len(self.paid)}")
+            parts.append(f"оплачено или в 1С {len(self.paid)}")
         if self.plan.skipped:
             parts.append(f"пропущено {len(self.plan.skipped)}")
         return " · ".join(parts)
@@ -525,9 +525,12 @@ def existing_of(
 
     Отбор по метке плана, а не по ответственному: оплаты, заведённые менеджером
     вручную или пришедшие из 1С, планом не считаются и заменой не затрагиваются.
+    Исключение — строка плана, которую заняла заявка 1С: метка на ней осталась,
+    и без неё повторная загрузка того же файла завела бы строку заново.
     """
     refs = {plan_ref(manager, year, month) for year, month in months}
-    return [p for p in payments if p.origin is PaymentOrigin.PLAN and p.origin_ref in refs]
+    return [p for p in payments if p.origin_ref in refs
+            and (p.origin is PaymentOrigin.PLAN or p.doc_number)]
 
 
 def compare(plan: PlanFile, existing: Sequence[Payment]) -> PlanReport:
@@ -545,7 +548,7 @@ def compare(plan: PlanFile, existing: Sequence[Payment]) -> PlanReport:
     for group in buckets.values():
         # Открытые вперёд: если на день пришлись план и уже оплаченная строка,
         # менять надо план, а оплаченное оставить нетронутым.
-        group.sort(key=lambda p: (not p.status.open, p.id))
+        group.sort(key=lambda p: (_fulfilled(p), p.id))
 
     for wanted in payments_of(plan):
         group = buckets.get((recipient_key(wanted.recipient), wanted.pay_date))
@@ -553,9 +556,9 @@ def compare(plan: PlanFile, existing: Sequence[Payment]) -> PlanReport:
         if current is None:
             report.created.append(wanted)
             continue
-        if not current.status.open:
-            # Оплаченное не переписывается и не задваивается: строка плана
-            # считается исполненной.
+        if _fulfilled(current):
+            # Оплаченное и ставшее заявкой 1С не переписывается и не
+            # задваивается: строка плана считается исполненной.
             report.paid.append(current)
             continue
         if _differs(current, wanted):
@@ -565,8 +568,13 @@ def compare(plan: PlanFile, existing: Sequence[Payment]) -> PlanReport:
 
     for group in buckets.values():
         for leftover in group:
-            (report.removed if leftover.status.open else report.paid).append(leftover)
+            (report.paid if _fulfilled(leftover) else report.removed).append(leftover)
     return report
+
+
+def _fulfilled(payment: Payment) -> bool:
+    """Строка плана уже не план: оплачена, отменена или по ней есть заявка 1С."""
+    return not payment.status.open or bool(payment.doc_number)
 
 
 def _differs(current: Payment, wanted: Payment) -> bool:

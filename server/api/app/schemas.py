@@ -49,6 +49,10 @@ class PaymentIn(BaseModel):
     currency: str = "руб."
     supplier_id: int = 0
     recipient: str = ""
+    # Ключ получателя считает клиент — той же функцией, что и при импорте 1С:
+    # без формы собственности, «АСТЭРА ГК ООО» → «астэра гк». Пустой ключ
+    # от старого клиента заменяется понижением регистра, как было раньше.
+    recipient_key: str = ""
     status: Status = "planned"
     comment: str = ""
     responsible: str = ""

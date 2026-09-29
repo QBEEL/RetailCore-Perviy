@@ -60,7 +60,7 @@ def test_отчёт_показывает_все_группы_построчно(
     assert any("Появится (1)" in line for line in lines)
     assert any("Изменится (1)" in line for line in lines)
     assert any("Исчезнет из плана (1)" in line for line in lines)
-    assert any("Уже оплачено" in line for line in lines)
+    assert any("Оплачено или в 1С" in line for line in lines)
     assert any("Мода Хаус" in line for line in lines)
     assert any("пропущено: строка 9" in line for line in lines)
     assert any("Без карточки поставщика: 1" in line for line in lines)

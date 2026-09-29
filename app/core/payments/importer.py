@@ -288,6 +288,7 @@ def analyze(
     path: str,
     existing: dict[tuple[str, str], object],
     *,
+    candidates: Sequence[Payment] = (),
     today: date | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> ImportReport:
@@ -299,6 +300,7 @@ def analyze(
     payments, skipped = parse(path, today=today, progress=progress)
     report = ImportReport(path=path, rows=len(payments) + len(skipped), skipped=skipped)
     seen: set[tuple[str, str]] = set()
+    fresh: list[Payment] = []
     for payment in payments:
         key = payment.key
         if key in seen:
@@ -309,12 +311,14 @@ def analyze(
         seen.add(key)
         found = existing.get(key)
         if found is None:
-            report.new += 1
+            fresh.append(payment)
         elif _differs(payment, found):
             report.updated += 1
         else:
             report.same += 1
         report.payments.append(payment)
+    report.adopted = len(adoptions(fresh, candidates))
+    report.new = len(fresh) - report.adopted
     dates = [p.pay_date for p in report.payments if p.pay_date]
     report.first_pay = min(dates) if dates else None
     report.last_pay = max(dates) if dates else None
@@ -355,14 +359,54 @@ def _keep_manual_amount(payment: Payment, found: object) -> None:
         payment.amount = float(stored)
 
 
+def adoptions(
+    fresh: Sequence[Payment],
+    candidates: Sequence[Payment],
+) -> dict[int, Payment]:
+    """Какие новые заявки 1С встают на место заведённых в приложении оплат.
+
+    Оплату сначала намечают в приложении — вручную или планом менеджера, — а
+    через день-другой по ней же заводят заявку в 1С. Без сопоставления импорт
+    клал бы заявку рядом, и бюджет дня считал бы одни деньги дважды.
+
+    Своя запись узнаётся по получателю и дате платежа. Сумма в условие не
+    входит: в плане она обычно круглая («800 000»), а в заявке — по счёту
+    («855 876»). Если на день у получателя несколько открытых записей, заявке
+    достаётся ближайшая по сумме. Заявка без пары остаётся новой: сумма из 1С
+    всё равно главнее, и терять её нельзя.
+
+    Возвращает номер записи в базе → заявку, которая её заменит.
+    """
+    buckets: dict[tuple[str, date], list[Payment]] = {}
+    for candidate in candidates:
+        if candidate.doc_number or candidate.pay_date is None or not candidate.status.open:
+            continue
+        buckets.setdefault(
+            (recipient_key(candidate.recipient), candidate.pay_date), []).append(candidate)
+    found: dict[int, Payment] = {}
+    for payment in fresh:
+        if payment.pay_date is None:
+            continue
+        group = buckets.get((recipient_key(payment.recipient), payment.pay_date))
+        if not group:
+            continue
+        nearest = min(group, key=lambda c: (abs(c.amount - payment.amount), c.id))
+        group.remove(nearest)
+        found[nearest.id] = payment
+    return found
+
+
 def split_changes(
     report: ImportReport,
     existing: dict[tuple[str, str], object],
-) -> tuple[list[Payment], list[tuple[int, Payment]]]:
-    """Делит разобранное на создаваемое и обновляемое.
+    candidates: Sequence[Payment] = (),
+) -> tuple[list[Payment], list[tuple[int, Payment]], list[tuple[int, Payment]]]:
+    """Делит разобранное на создаваемое, обновляемое и занимающее своё место.
 
-    Записи, созданные в приложении, импорт не трогает: у них нет пары
-    «номер + дата заявки» из выгрузки, и совпадение было бы случайным.
+    Записи, созданные в приложении, по номеру заявки импорт не ищет: у них нет
+    пары «номер + дата заявки» из выгрузки. Но новая заявка на того же
+    получателя и тот же день забирает открытую ручную или плановую запись
+    (`adoptions`) — иначе одна оплата жила бы в базе дважды.
     """
     created: list[Payment] = []
     changed: list[tuple[int, Payment]] = []
@@ -381,4 +425,7 @@ def split_changes(
         _keep_manual_amount(payment, found)
         if _differs(payment, found):
             changed.append((int(getattr(found, "id", 0)), payment))
-    return created, changed
+    adopted = adoptions(created, candidates)
+    taken = {id(payment) for payment in adopted.values()}
+    created = [payment for payment in created if id(payment) not in taken]
+    return created, changed, list(adopted.items())

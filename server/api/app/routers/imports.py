@@ -118,11 +118,46 @@ class ImportApply(BaseModel):
     # случайно поданный не тот файл не превратился в бесконечную транзакцию.
     created: list[ImportPayment] = Field(default=[], max_length=20000)
     changed: list[ImportChange] = Field(default=[], max_length=20000)
+    # Новые заявки, занимающие место ручной или плановой оплаты того же
+    # получателя на тот же день. Пару подбирает клиент (`importer.adoptions`).
+    adopted: list[ImportChange] = Field(default=[], max_length=20000)
 
 
 class ImportResult(BaseModel):
     new: int
     updated: int
+    adopted: int = 0
+
+
+# Что заявка приносит в занятую запись сверх полей выгрузки. Комментарий,
+# вложения, карточка поставщика и метка плана остаются прежними.
+ADOPTED_FIELDS: tuple[str, ...] = (
+    "doc_number", "request_date", "status", "origin", *IMPORTED_FIELDS,
+)
+
+OPEN_STATUSES: tuple[str, ...] = ("planned", "overdue", "moved")
+
+
+class Candidate(BaseModel):
+    """Открытая оплата без номера 1С — её может занять новая заявка."""
+
+    id: int
+    pay_date: date
+    amount: float
+    recipient: str
+    status: Status
+    origin: str
+    origin_ref: str
+
+
+@router.get("/candidates", response_model=list[Candidate],
+            summary="Оплаты, которые может занять заявка 1С")
+def candidates(user: User = Depends(security.admin_only)) -> list[Candidate]:
+    rows = db.fetch_all(
+        "SELECT id, pay_date, amount, recipient, status, origin, origin_ref"
+        " FROM payment WHERE doc_number = '' AND pay_date IS NOT NULL"
+        " AND status = ANY(%s)", (list(OPEN_STATUSES),))
+    return [Candidate(**row) for row in rows]
 
 
 @router.get("/index", response_model=list[ExistingRow],
@@ -155,7 +190,23 @@ def apply_import(form: ImportApply,
     Изменившимся обновляются только поля из 1С — комментарий, вложения и
     назначенный вручную статус остаются на месте.
     """
+    adopted = 0
     with db.cursor() as handle:
+        if form.adopted:
+            # Сумма — из 1С, пометка о ручной правке к ней не относится.
+            # Пустой номер в условии — защита от гонки: запись могли занять
+            # между разбором и подтверждением.
+            assignments = ", ".join(f"{name} = %({name})s" for name in ADOPTED_FIELDS)
+            for item in form.adopted:
+                handle.execute(
+                    f"UPDATE payment SET {assignments}, amount_before = NULL,"
+                    " amount_changed_by = NULL, amount_changed_at = NULL,"
+                    " updated_at = now(), updated_by = %(user)s"
+                    " WHERE id = %(id)s AND doc_number = ''",
+                    {**dict(zip(ADOPTED_FIELDS, _row(item.payment, ADOPTED_FIELDS))),
+                     "user": user.id, "id": item.id})
+                adopted += handle.rowcount
+
         if form.created:
             columns = ", ".join(INSERT_FIELDS)
             marks = ", ".join(["%s"] * len(INSERT_FIELDS))
@@ -186,9 +237,11 @@ def apply_import(form: ImportApply,
             "INSERT INTO audit_log (user_id, entity, action, changes)"
             " VALUES (%s, 'payment', 'import', %s)",
             (user.id, json.dumps({"новых": len(form.created),
+                                  "заменили план": adopted,
                                   "изменено": len(form.changed)})))
 
-    return ImportResult(new=len(form.created), updated=len(form.changed))
+    return ImportResult(new=len(form.created), updated=len(form.changed),
+                        adopted=adopted)
 
 
 # Сумма из 1С и ручная правка. Решает сервер, а не клиент: импорт из старой

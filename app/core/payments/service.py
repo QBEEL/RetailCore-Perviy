@@ -84,7 +84,9 @@ def analyze_import(
     """Разбирает выгрузку и считает, что даст импорт. В базу ничего не пишет."""
     _may_import()
     existing = store.existing_index(db_path)
-    return importer.analyze(path_to_file, existing, today=today, progress=progress)
+    return importer.analyze(path_to_file, existing,
+                            candidates=store.adoption_candidates(db_path),
+                            today=today, progress=progress)
 
 
 def apply_import(
@@ -101,9 +103,10 @@ def apply_import(
     """
     _may_import()
     existing = store.existing_index(db_path)
-    created, changed = importer.split_changes(report, existing)
-    written, updated = store.apply_import(created, changed, db_path)
-    report.new, report.updated = written, updated
+    created, changed, adopted = importer.split_changes(
+        report, existing, store.adoption_candidates(db_path))
+    written, updated, taken = store.apply_import(created, changed, db_path, adopted=adopted)
+    report.new, report.updated, report.adopted = written, updated, taken
     report.applied = True
     if link:
         auto_link(db_path=db_path)
@@ -113,7 +116,9 @@ def apply_import(
         importer.file_hash(report.path),
         report.rows,
         written,
-        updated,
+        # В журнале прогонов отдельной колонки нет: занятая запись — тоже
+        # изменённая, а не новая.
+        updated + taken,
         report.same,
         len(report.skipped),
         path=db_path,
@@ -121,8 +126,9 @@ def apply_import(
     appdata.log_event(
         LOG_FILE,
         f"Импорт {report.path}\n"
-        f"  прочитано {report.rows}, новых {written}, изменено {updated}, "
-        f"без изменений {report.same}, пропущено {len(report.skipped)}",
+        f"  прочитано {report.rows}, новых {written}, заменили план {taken}, "
+        f"изменено {updated}, без изменений {report.same}, "
+        f"пропущено {len(report.skipped)}",
     )
     return report
 
