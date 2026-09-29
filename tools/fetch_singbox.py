@@ -25,7 +25,20 @@ TARGET = Path(__file__).resolve().parents[1] / "vendor" / "sing-box"
 WANTED = ("sing-box.exe", "LICENSE")
 
 
+def use_utf8_output() -> None:
+    """Печать не должна зависеть от кодировки консоли.
+
+    На windows-раннере GitHub Actions stdout — cp1252, и первая же русская
+    строка роняет скрипт UnicodeEncodeError: шаг сборки помечается упавшим,
+    релиз не выходит. Так упал выпуск 3.6.9.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    use_utf8_output()
     if (TARGET / "sing-box.exe").is_file() and (TARGET / "VERSION").read_text().strip() == VERSION:
         print(f"sing-box {VERSION} уже на месте: {TARGET}")
         return 0
