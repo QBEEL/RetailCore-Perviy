@@ -128,9 +128,31 @@ def apply_import(
         f"Импорт {report.path}\n"
         f"  прочитано {report.rows}, новых {written}, заменили план {taken}, "
         f"изменено {updated}, без изменений {report.same}, "
-        f"пропущено {len(report.skipped)}",
+        f"пропущено {len(report.skipped)}"
+        + _details_log(report),
     )
     return report
+
+
+# Сколько заявок разворачивать в журнале: полная первая выгрузка — семь тысяч
+# строк, и они заслонили бы то, ради чего журнал читают.
+LOG_DETAILS = 300
+
+
+def _details_log(report: ImportReport) -> str:
+    """Строки «заявка: было → стало» для журнала — след импорта, не только итоги."""
+    changed = [row for row in report.details if row.kind != "new"]
+    lines = []
+    for row in changed[:LOG_DETAILS]:
+        line = f"\n  · {row.kind_title}: {row.doc_number} {row.recipient}"
+        if row.amount_before is not None and row.delta:
+            line += f" · сумма {row.amount_before:,.2f} → {row.amount_after:,.2f} ({row.direction})"
+        if row.fields_text:
+            line += f" · {row.fields_text}"
+        lines.append(line)
+    if len(changed) > LOG_DETAILS:
+        lines.append(f"\n  …и ещё {len(changed) - LOG_DETAILS}")
+    return "".join(lines)
 
 
 def already_imported(path_to_file: str, db_path: str | None = None):

@@ -266,7 +266,7 @@ class DayCell(QFrame):
         if data.overdue:
             lines.append(f"просрочено: {data.overdue}")
         if data.amount_changed:
-            lines.append(f"сумма изменена вручную: {data.amount_changed}")
+            lines.append(f"сумма изменена: {data.amount_changed}")
         lines.append("")
         for payment in data.payments[:8]:
             line = f"{money(payment.amount)} ₽ — {payment.title} ({payment.status.title})"

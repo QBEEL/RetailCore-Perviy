@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
     QDialog,
+    QComboBox,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
@@ -52,12 +53,14 @@ from ...core.payments import (
 MANUAL_VAT = "Вручную"
 # Общая база, если выполнен вход, иначе своя локальная — см. core/payments/data.
 from ...core.payments import data as store
+from ...core.workbook import write_sheet
 from .. import icons
 from ..tasks import run_task
 from ..theme import Metrics, Palette
 from .calendar_grid import money
 from .common import Divider, Hint, SectionTitle
 from .file_picker import CSV_FILTER, FilePicker
+from .table import Column, DataTable
 from .inputs import DecimalInput, SelectBox
 
 STATUS_COLORS: dict[PaymentStatus, str] = {
@@ -504,8 +507,8 @@ class PaymentDialog(QDialog):
         self.amount.blockSignals(False)
         self.vat.blockSignals(False)
         if payment.amount_changed:
-            self.amount_hint.setText(
-                f"Сумма изменена вручную: {payment.amount_change_text}")
+            origin = "заменена из 1С" if payment.amount_by_import else "изменена вручную"
+            self.amount_hint.setText(f"Сумма {origin}: {payment.amount_change_text}")
             self.amount_hint.show()
         # Ставка выводится из уже записанных суммы и налога, а не наоборот:
         # сохранённые цифры менять при простом открытии карточки нельзя.
@@ -626,7 +629,8 @@ class ImportDialog(QDialog):
         self.db_path = db_path
         self.report: ImportReport | None = None
         self.setWindowTitle("Импорт оплат из 1С")
-        self.setMinimumWidth(660)
+        self.setMinimumWidth(920)
+        self.setMinimumHeight(640)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(Metrics.PAD + 4, Metrics.PAD, Metrics.PAD + 4, Metrics.PAD)
@@ -656,6 +660,51 @@ class ImportDialog(QDialog):
         self.numbers.setHorizontalSpacing(Metrics.GAP)
         root.addLayout(self.numbers)
 
+        self.direction = QLabel("", self)
+        self.direction.setWordWrap(True)
+        self.direction.setVisible(False)
+        root.addWidget(self.direction)
+
+        # Поимённый список: какие заявки и как изменятся — до записи в базу.
+        self.filter_row = QWidget(self)
+        bar = QHBoxLayout(self.filter_row)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.addWidget(QLabel("Показать:", self.filter_row))
+        self.kind_filter = QComboBox(self.filter_row)
+        for title, key in (("Всё", ""), ("Заменят план", "plan"), ("Изменятся", "changed"),
+                           ("Сумма изменилась", "amount"), ("Новые", "new")):
+            self.kind_filter.addItem(title, key)
+        self.kind_filter.currentIndexChanged.connect(self._show_details)
+        bar.addWidget(self.kind_filter)
+        bar.addStretch(1)
+        self.export_button = QPushButton("Сохранить список в Excel", self.filter_row)
+        self.export_button.clicked.connect(self._export_details)
+        bar.addWidget(self.export_button)
+        self.filter_row.setVisible(False)
+        root.addWidget(self.filter_row)
+
+        money_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        self.details = DataTable([
+            Column("Что", lambda r: r.kind_title, 124,
+                   color=lambda r: QColor({"new": Palette.SUCCESS, "plan": Palette.PRIMARY,
+                                           "changed": Palette.WARNING}[r.kind])),
+            Column("Заявка", lambda r: r.doc_number, 124),
+            Column("Получатель", lambda r: r.recipient, 200),
+            Column("Было, ₽", lambda r: money(r.amount_before)
+                   if r.amount_before is not None else "", 110, align=money_align,
+                   sort_key=lambda r: r.amount_before or 0.0),
+            Column("Стало, ₽", lambda r: money(r.amount_after), 110, align=money_align,
+                   sort_key=lambda r: r.amount_after),
+            Column("Изменение", lambda r: r.direction, 120, align=money_align,
+                   color=lambda r: (QColor(Palette.DANGER if r.delta > 0 else Palette.SUCCESS)
+                                    if r.delta else None),
+                   sort_key=lambda r: r.delta),
+            Column("Что ещё изменилось", lambda r: r.fields_text, 420),
+        ], self)
+        self.details.setMinimumHeight(220)
+        self.details.setVisible(False)
+        root.addWidget(self.details, 1)
+
         self.skipped = QListWidget(self)
         self.skipped.setMaximumHeight(96)
         self.skipped.setVisible(False)
@@ -679,6 +728,9 @@ class ImportDialog(QDialog):
         self.progress.setRange(0, 0)
         self.summary.setText("Читаю файл…")
         self.skipped.setVisible(False)
+        self.direction.setVisible(False)
+        self.filter_row.setVisible(False)
+        self.details.setVisible(False)
         _clear(self.numbers)
         if previous := service.already_imported(path, self.db_path):
             self.summary.setText(
@@ -720,6 +772,14 @@ class ImportDialog(QDialog):
             number.setStyleSheet(f"font-size: 17px; font-weight: 600; color: {colour};")
             self.numbers.addWidget(number, 0, index)
             self.numbers.addWidget(caption, 1, index)
+        if report.direction:
+            # Не только сколько записей изменится, но и куда уйдут суммы.
+            self.direction.setText(f"Суммы существующих оплат: {report.direction}")
+            self.direction.setVisible(True)
+        self.kind_filter.blockSignals(True)
+        self.kind_filter.setCurrentIndex(0)
+        self.kind_filter.blockSignals(False)
+        self._show_details()
         if report.skipped:
             self.skipped.clear()
             self.skipped.addItems(report.skipped[:200])
@@ -728,10 +788,49 @@ class ImportDialog(QDialog):
         if not report.changes:
             self.apply_button.setText("Изменений нет")
 
+    def _shown_details(self) -> list:
+        """Строки списка с учётом выбранного отбора."""
+        if self.report is None:
+            return []
+        key = self.kind_filter.currentData()
+        rows = self.report.details
+        if key == "amount":
+            return [row for row in rows if row.delta]
+        return [row for row in rows if not key or row.kind == key]
+
+    def _show_details(self) -> None:
+        rows = self._shown_details()
+        self.details.set_items(rows)
+        self.filter_row.setVisible(bool(self.report and self.report.details))
+        self.details.setVisible(bool(self.report and self.report.details))
+        self.export_button.setEnabled(bool(rows))
+
+    def _export_details(self) -> None:
+        rows = self._shown_details()
+        if not rows:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить список изменений", "Что изменится при импорте.xlsx",
+            "Excel (*.xlsx)")
+        if not path:
+            return
+        titles = ["Что", "Заявка", "Дата заявки", "Получатель", "Было, ₽", "Стало, ₽",
+                  "Изменение, ₽", "Что ещё изменилось"]
+        values = [[row.kind_title, row.doc_number,
+                   f"{row.request_date:%d.%m.%Y}" if row.request_date else "",
+                   row.recipient, row.amount_before, row.amount_after,
+                   row.delta or None, row.fields_text] for row in rows]
+        run_task(
+            write_sheet, path, "Изменения", titles, values,
+            on_result=lambda _: self.summary.setText(f"Сохранено строк: {len(rows)}"),
+            on_error=lambda message: self.summary.setText(message))
+
     def _failed(self, message: str) -> None:
         self.progress.setVisible(False)
         self.report = None
         self.apply_button.setEnabled(False)
+        self.filter_row.setVisible(False)
+        self.details.setVisible(False)
         self.summary.setText(message)
         self.summary.setStyleSheet(f"color: {Palette.DANGER};")
 

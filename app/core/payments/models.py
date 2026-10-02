@@ -85,6 +85,15 @@ SUPPLIER_OPERATION = "Оплата поставщику"
 # после float-разбора нельзя.
 AMOUNT_EPSILON = 0.005
 
+# Под этим именем в пометке о смене суммы значится выгрузка 1С: сумму изменил
+# не человек, а заявка, пришедшая на место плана или поправившая прежнюю.
+IMPORT_AUTHOR = "1С"
+
+
+def money_text(value: float) -> str:
+    """«120 000» — сумма без копеек, тысячи через пробел."""
+    return f"{abs(value):,.0f}".replace(",", " ")
+
 
 @dataclass(slots=True)
 class Payment:
@@ -117,7 +126,8 @@ class Payment:
     # Заполняется при чтении списка — только для показа.
     files: int = 0
     supplier_name: str = ""
-    # Ручная правка суммы: сумма до первой правки, кто и когда правил. Ставит
+    # Смена суммы — рукой или выгрузкой 1С (тогда «кто» — IMPORT_AUTHOR):
+    # сумма до первой правки, кто и когда правил. Ставит
     # хранилище при сохранении, а не карточка — иначе пометку можно было бы
     # выставить или стереть, просто пересохранив запись.
     amount_before: float | None = None
@@ -126,20 +136,40 @@ class Payment:
 
     @property
     def amount_changed(self) -> bool:
-        """Сумму поменял человек, и она не совпадает с прежней."""
+        """Сумму поменяли, и она не совпадает с прежней."""
         return (self.amount_before is not None
                 and abs(self.amount_before - self.amount) >= AMOUNT_EPSILON)
 
     @property
+    def amount_by_import(self) -> bool:
+        """Сумму поменяла выгрузка 1С, а не человек."""
+        return self.amount_changed and self.amount_changed_by == IMPORT_AUTHOR
+
+    @property
+    def amount_delta(self) -> float:
+        """На сколько сумма ушла от прежней: плюс — выросла, минус — снизилась."""
+        if not self.amount_changed:
+            return 0.0
+        return self.amount - (self.amount_before or 0.0)
+
+    @property
+    def amount_direction(self) -> str:
+        """«▲ +55 876 ₽» или «▼ −20 000 ₽» — в какую сторону ушла сумма."""
+        delta = self.amount_delta
+        if not delta:
+            return ""
+        return f"▲ +{money_text(delta)} ₽" if delta > 0 else f"▼ −{money_text(delta)} ₽"
+
+    @property
     def amount_change_text(self) -> str:
-        """«было 120 000 ₽ · Иванов Евгений, 25.09» — для подсказок и списка дня."""
+        """«было 120 000 ₽ ▲ +5 000 ₽ · 1С, 25.09» — для подсказок и списка дня."""
         if not self.amount_changed:
             return ""
-        before = f"{self.amount_before:,.0f}".replace(",", " ")
         who = ", ".join(part for part in (
             self.amount_changed_by,
             f"{self.amount_changed_at:%d.%m}" if self.amount_changed_at else "") if part)
-        return f"было {before} ₽" + (f" · {who}" if who else "")
+        return (f"было {money_text(self.amount_before or 0.0)} ₽ {self.amount_direction}"
+                + (f" · {who}" if who else ""))
 
     @property
     def key(self) -> tuple[str, str]:
@@ -380,7 +410,7 @@ class Day:
 
     @property
     def amount_changed(self) -> int:
-        """Сколько оплат дня с суммой, поправленной человеком."""
+        """Сколько оплат дня с изменённой суммой — рукой или выгрузкой 1С."""
         return sum(1 for p in self.payments if p.amount_changed)
 
     @property
@@ -558,6 +588,56 @@ class Suggestion:
 
 
 @dataclass(slots=True)
+class RowChange:
+    """Что импорт сделает с одной заявкой — строка предпросмотра.
+
+    Итоги («изменится 33») не отвечают на главный вопрос: какие именно заявки и
+    как. Эта запись хранит до и после по каждой, чтобы их можно было просмотреть
+    до записи и сохранить в Excel после.
+    """
+
+    kind: str                      # new · plan · changed
+    doc_number: str
+    request_date: date | None
+    recipient: str
+    amount_after: float
+    # Сумма в базе до импорта; у новой заявки её нет.
+    amount_before: float | None = None
+    # Прочие поля: (название, было, стало).
+    fields: list[tuple[str, str, str]] = field(default_factory=list)
+    note: str = ""
+
+    KINDS = {"new": "Новая", "plan": "Заменит план", "changed": "Изменится"}
+
+    @property
+    def kind_title(self) -> str:
+        return self.KINDS.get(self.kind, self.kind)
+
+    @property
+    def delta(self) -> float:
+        if self.amount_before is None:
+            return 0.0
+        change = self.amount_after - self.amount_before
+        return change if abs(change) >= AMOUNT_EPSILON else 0.0
+
+    @property
+    def direction(self) -> str:
+        """«▲ +55 876 ₽» — в какую сторону уйдёт сумма; у новой пусто."""
+        if not self.delta:
+            return ""
+        sign, arrow = ("+", "▲") if self.delta > 0 else ("−", "▼")
+        return f"{arrow} {sign}{money_text(self.delta)} ₽"
+
+    @property
+    def fields_text(self) -> str:
+        parts = [f"{name}: {before or '—'} → {after or '—'}"
+                 for name, before, after in self.fields]
+        if self.note:
+            parts.insert(0, self.note)
+        return "; ".join(parts)
+
+
+@dataclass(slots=True)
 class ImportReport:
     """Итог разбора выгрузки — показывается до записи в базу."""
 
@@ -569,6 +649,14 @@ class ImportReport:
     # плановой оплаты, а не лягут рядом с ней второй записью.
     adopted: int = 0
     same: int = 0
+    # Куда уйдут суммы уже лежащих в базе записей — и изменившихся, и занявших
+    # место плана: сколько выросло, сколько снизилось и на какие деньги.
+    raised: int = 0
+    lowered: int = 0
+    raised_sum: float = 0.0
+    lowered_sum: float = 0.0
+    # Каждая заявка, которую импорт создаст или изменит, — до и после.
+    details: list[RowChange] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     payments: list[Payment] = field(default_factory=list)
     first_pay: date | None = None
@@ -584,6 +672,28 @@ class ImportReport:
     def changes(self) -> int:
         return self.new + self.updated + self.adopted
 
+    def note_amount(self, before: float, after: float) -> None:
+        """Учитывает смену суммы существующей записи: куда и на сколько."""
+        delta = after - before
+        if abs(delta) < AMOUNT_EPSILON:
+            return
+        if delta > 0:
+            self.raised += 1
+            self.raised_sum += delta
+        else:
+            self.lowered += 1
+            self.lowered_sum -= delta
+
+    @property
+    def direction(self) -> str:
+        """«выросла у 12 (+340 000 ₽) · снизилась у 5 (−120 000 ₽)» — или пусто."""
+        parts = []
+        if self.raised:
+            parts.append(f"выросла у {self.raised} (+{money_text(self.raised_sum)} ₽)")
+        if self.lowered:
+            parts.append(f"снизилась у {self.lowered} (−{money_text(self.lowered_sum)} ₽)")
+        return " · ".join(parts)
+
     @property
     def summary(self) -> str:
         parts = [f"прочитано {self.rows}"]
@@ -593,6 +703,8 @@ class ImportReport:
             parts.append(f"заменят план {self.adopted}")
         if self.updated:
             parts.append(f"изменилось {self.updated}")
+        if self.direction:
+            parts.append(f"сумма {self.direction}")
         if self.same:
             parts.append(f"без изменений {self.same}")
         if self.skipped:

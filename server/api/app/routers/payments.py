@@ -39,8 +39,11 @@ COLUMNS = (
     " p.origin, p.origin_ref, p.created_at, p.updated_at,"
     " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
     " p.amount_before, p.amount_changed_at,"
+    # Пометка без автора поставлена выгрузкой 1С — так её и называем.
     " COALESCE((SELECT u.full_name FROM app_user u"
-    "           WHERE u.id = p.amount_changed_by), '') AS amount_changed_by"
+    "           WHERE u.id = p.amount_changed_by),"
+    "          CASE WHEN p.amount_before IS NOT NULL AND p.amount_changed_by IS NULL"
+    "               THEN '1С' ELSE '' END) AS amount_changed_by"
 )
 
 # Пометка о ручной правке суммы. Все ветки сравнивают с прежними значениями

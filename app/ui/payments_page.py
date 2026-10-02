@@ -548,9 +548,11 @@ class PaymentsPage(QWidget):
             text = (f"{money(payment.amount)} ₽   {payment.title}\n{payment.status.title}"
                     + (f" · {payment.responsible}" if payment.responsible else ""))
             if payment.amount_changed:
-                # Отдельной строкой: сумма, которую поменял человек, — повод
-                # присмотреться, и прятать её в конец второй строки не стоит.
-                text += f"\n• сумма изменена: {payment.amount_change_text}"
+                # Отдельной строкой: сумма, которую поменяли руками или заменила
+                # выгрузка 1С, — повод присмотреться, и прятать её в конец
+                # второй строки не стоит.
+                origin = "заменена из 1С" if payment.amount_by_import else "изменена"
+                text += f"\n• сумма {origin}: {payment.amount_change_text}"
             item = QListWidgetItem(text)
             item.setForeground(QColor(STATUS_COLORS[payment.status]))
             self.day_list.addItem(self.day_list.mark(item, payment))
@@ -747,6 +749,14 @@ class PaymentsPage(QWidget):
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    color=lambda p: QColor(Palette.WARNING),
                    sort_key=lambda p: p.amount_before if p.amount_changed else -1.0),
+            # В какую сторону ушла сумма: рост — красным, снижение — зелёным.
+            # Сортировка по самой разнице собирает наверху самые крупные сдвиги.
+            Column("Изменение", lambda p: p.amount_direction, width=140,
+                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   color=lambda p: (QColor(Palette.DANGER if p.amount_delta > 0
+                                           else Palette.SUCCESS)
+                                    if p.amount_changed else None),
+                   sort_key=lambda p: p.amount_delta),
             Column("Статус", lambda p: p.status.title, width=126,
                    color=lambda p: QColor(STATUS_COLORS[p.status]),
                    sort_key=lambda p: STATUS_ORDER.index(p.status)),

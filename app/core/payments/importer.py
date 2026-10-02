@@ -25,6 +25,7 @@ import hashlib
 import io
 import os
 import re
+from dataclasses import replace
 from datetime import date, datetime
 from typing import Callable, Iterable, Sequence
 
@@ -35,7 +36,9 @@ from .models import (
     Payment,
     PaymentOrigin,
     PaymentStatus,
+    RowChange,
     SUPPLIER_OPERATION,
+    money_text,
 )
 from .recipients import clean_name, recipient_key
 
@@ -296,6 +299,7 @@ def analyze(
 
     Сравнение идёт по полям, пришедшим из 1С. Комментарий, вложения и статус,
     выставленный человеком, в сравнении не участвуют — их импорт не меняет.
+    Для записей, у которых сумма уйдёт, отчёт запоминает, в какую сторону.
     """
     payments, skipped = parse(path, today=today, progress=progress)
     report = ImportReport(path=path, rows=len(payments) + len(skipped), skipped=skipped)
@@ -312,12 +316,35 @@ def analyze(
         found = existing.get(key)
         if found is None:
             fresh.append(payment)
-        elif _differs(payment, found):
-            report.updated += 1
         else:
-            report.same += 1
+            # Предпросмотр считает по тому, что запишет импорт: поправленная
+            # человеком сумма, которую 1С не меняла, останется как есть.
+            coming = replace(payment)
+            if getattr(found, "origin", "") == PaymentOrigin.IMPORT.value:
+                _keep_manual_amount(coming, found)
+            if _differs(coming, found):
+                report.updated += 1
+                stored = getattr(found, "values", {}).get("amount")
+                if stored is not None:
+                    report.note_amount(float(stored), coming.amount)
+                report.details.append(_row_change(coming, found))
+            else:
+                report.same += 1
         report.payments.append(payment)
-    report.adopted = len(adoptions(fresh, candidates))
+    taken = adoptions(fresh, candidates)
+    report.adopted = len(taken)
+    replaced = {id(payment) for payment in taken.values()}
+    for candidate in candidates:
+        if candidate.id in taken:
+            report.note_amount(candidate.amount, taken[candidate.id].amount)
+            report.details.append(_plan_change(candidate, taken[candidate.id]))
+    for payment in fresh:
+        if id(payment) not in replaced:
+            report.details.append(RowChange(
+                "new", payment.doc_number, payment.request_date, payment.recipient,
+                payment.amount, fields=_new_fields(payment)))
+    report.details.sort(key=lambda row: (
+        ("plan", "changed", "new").index(row.kind), -abs(row.delta), row.doc_number))
     report.new = len(fresh) - report.adopted
     dates = [p.pay_date for p in report.payments if p.pay_date]
     report.first_pay = min(dates) if dates else None
@@ -326,20 +353,105 @@ def analyze(
     return report
 
 
-def _differs(payment: Payment, existing: object) -> bool:
-    """Отличается ли запись от лежащей в базе по полям из 1С."""
+# Поля выгрузки, о которых предпросмотр говорит словами: название, вид.
+# Сумма в список не входит — у неё свои колонки «было» и «стало».
+FIELD_TITLES: dict[str, tuple[str, str]] = {
+    "pay_date": ("Дата платежа", "date"),
+    "source_status": ("Статус в 1С", "text"),
+    "paid_flag": ("Оплачена", "flag"),
+    "recipient": ("Получатель", "text"),
+    "vat": ("НДС, ₽", "money"),
+    "operation": ("Операция", "text"),
+    "over_limit": ("Сверх лимита", "flag"),
+    "priority": ("Приоритет", "text"),
+    "edo_state": ("Состояние ЭДО", "text"),
+    "responsible": ("Заявитель", "text"),
+    "author": ("Автор", "text"),
+    "currency": ("Валюта", "text"),
+    "had_files": ("Есть файлы", "flag"),
+}
+
+
+def _field_changes(payment: Payment, existing: object) -> list[tuple[str, object, object]]:
+    """Поля из 1С, которые у записи в базе отличаются: (поле, было, стало)."""
     from .store import IMPORTED_FIELDS, imported_values
 
     values = imported_values(payment)
     stored = getattr(existing, "values", {})
+    found: list[tuple[str, object, object]] = []
     for name in IMPORTED_FIELDS:
         before, after = stored.get(name), values.get(name)
         if isinstance(after, float) or isinstance(before, float):
-            if abs(float(before or 0.0) - float(after or 0.0)) > 0.005:
-                return True
-        elif str(before or "") != str(after or ""):
-            return True
-    return False
+            different = abs(float(before or 0.0) - float(after or 0.0)) > 0.005
+        else:
+            different = str(before or "") != str(after or "")
+        if different:
+            found.append((name, before, after))
+    return found
+
+
+def _differs(payment: Payment, existing: object) -> bool:
+    """Отличается ли запись от лежащей в базе по полям из 1С."""
+    return bool(_field_changes(payment, existing))
+
+
+def _show(kind: str, value: object) -> str:
+    """Значение поля глазами человека: дата — «01.10.2026», флаг — «Да»."""
+    if value is None or value == "":
+        return ""
+    if kind == "date":
+        try:
+            return f"{date.fromisoformat(str(value)[:10]):%d.%m.%Y}"
+        except ValueError:
+            return str(value)
+    if kind == "flag":
+        return "Да" if str(value).lower() in {"1", "true", "да"} else "Нет"
+    if kind == "money":
+        return money_text(float(value))
+    return str(value)
+
+
+def _row_change(payment: Payment, existing: object) -> RowChange:
+    """Что импорт изменит в записи, уже лежащей в базе."""
+    stored = getattr(existing, "values", {})
+    row = RowChange(
+        "changed", payment.doc_number, payment.request_date, payment.recipient,
+        payment.amount,
+        amount_before=float(stored["amount"]) if stored.get("amount") is not None else None)
+    changes = _field_changes(payment, existing)
+    amount_moved = any(name == "amount" for name, _, _ in changes)
+    for name, before, after in changes:
+        # НДС идёт за суммой сам — отдельной строкой он только заслоняет суть.
+        if name == "amount" or (name == "vat" and amount_moved):
+            continue
+        title, kind = FIELD_TITLES.get(name, (name, "text"))
+        if name == "recipient":
+            row.recipient = str(before or payment.recipient)
+        row.fields.append((title, _show(kind, before), _show(kind, after)))
+    return row
+
+
+def _plan_change(candidate: Payment, payment: Payment) -> RowChange:
+    """Заявка 1С встаёт на место плановой или ручной оплаты."""
+    row = RowChange(
+        "plan", payment.doc_number, payment.request_date, payment.recipient,
+        payment.amount, amount_before=candidate.amount,
+        note="вместо " + ("плана" if candidate.origin is PaymentOrigin.PLAN else "ручной записи"))
+    if candidate.pay_date != payment.pay_date:
+        row.fields.append(("Дата платежа", _show("date", candidate.pay_date and
+                           candidate.pay_date.isoformat()), _show("date", payment.pay_date and
+                           payment.pay_date.isoformat())))
+    return row
+
+
+def _new_fields(payment: Payment) -> list[tuple[str, str, str]]:
+    """У новой заявки «было» нет — показываем, на что она встала."""
+    fields = []
+    if payment.pay_date:
+        fields.append(("Дата платежа", "", _show("date", payment.pay_date.isoformat())))
+    if payment.source_status:
+        fields.append(("Статус в 1С", "", payment.source_status))
+    return fields
 
 
 def _keep_manual_amount(payment: Payment, found: object) -> None:
@@ -350,9 +462,14 @@ def _keep_manual_amount(payment: Payment, found: object) -> None:
     понедельничным импортом. Пришла другая сумма — она новее правки и
     берётся как есть. Сервер применяет то же правило сам; здесь оно нужно,
     чтобы предпросмотр не обещал изменить то, что не изменится.
+
+    Пометку, поставленную самой выгрузкой, это не касается: вернуть в 1С
+    прежнюю сумму — такое же новое значение, как и любое другое.
     """
     before = getattr(found, "amount_before", None)
-    if before is None or abs(float(before) - payment.amount) >= AMOUNT_EPSILON:
+    if before is None or getattr(found, "amount_by_import", False):
+        return
+    if abs(float(before) - payment.amount) >= AMOUNT_EPSILON:
         return
     stored = getattr(found, "values", {}).get("amount")
     if stored is not None:

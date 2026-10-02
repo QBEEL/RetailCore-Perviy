@@ -79,6 +79,9 @@ class ExistingRow(BaseModel):
     # Сумма до ручной правки. Клиенту нужна для предпросмотра: пока 1С
     # присылает её же, правка человека остаётся, и строка не «изменится».
     amount_before: float | None = None
+    # Пометку поставила сама выгрузка, а не человек: вернуть в 1С прежнюю
+    # сумму — обычное новое значение, защищать там нечего.
+    amount_by_import: bool = False
 
 
 class ImportPayment(BaseModel):
@@ -166,7 +169,9 @@ def existing_index(user: User = Depends(security.admin_only)) -> list[ExistingRo
     names = ", ".join(IMPORTED_FIELDS)
     rows = db.fetch_all(
         f"SELECT id, doc_number, request_date, origin, status,"
-        f"       (comment <> '') AS manual, amount_before, {names}"
+        f"       (comment <> '') AS manual, amount_before,"
+        f"       (amount_before IS NOT NULL AND amount_changed_by IS NULL)"
+        f"         AS amount_by_import, {names}"
         " FROM payment WHERE doc_number <> ''")
     return [
         ExistingRow(
@@ -176,6 +181,7 @@ def existing_index(user: User = Depends(security.admin_only)) -> list[ExistingRo
             values={name: row[name] for name in IMPORTED_FIELDS},
             amount_before=(float(row["amount_before"])
                            if row["amount_before"] is not None else None),
+            amount_by_import=row["amount_by_import"],
         )
         for row in rows
     ]
@@ -193,14 +199,18 @@ def apply_import(form: ImportApply,
     adopted = 0
     with db.cursor() as handle:
         if form.adopted:
-            # Сумма — из 1С, пометка о ручной правке к ней не относится.
-            # Пустой номер в условии — защита от гонки: запись могли занять
-            # между разбором и подтверждением.
+            # Плановая сумма уходит в «было», если заявка принесла другую, —
+            # так видно, что и в какую сторону заменил импорт. Прежняя пометка
+            # о ручной правке к новой сумме не относится. Пустой номер в
+            # условии — защита от гонки: запись могли занять между разбором
+            # и подтверждением. Правая часть SET видит строку до изменения.
             assignments = ", ".join(f"{name} = %({name})s" for name in ADOPTED_FIELDS)
             for item in form.adopted:
                 handle.execute(
-                    f"UPDATE payment SET {assignments}, amount_before = NULL,"
-                    " amount_changed_by = NULL, amount_changed_at = NULL,"
+                    f"UPDATE payment SET {assignments},"
+                    f" amount_before = CASE WHEN {_SAME} THEN NULL ELSE amount END,"
+                    " amount_changed_by = NULL,"
+                    f" amount_changed_at = CASE WHEN {_SAME} THEN NULL ELSE now() END,"
                     " updated_at = now(), updated_by = %(user)s"
                     " WHERE id = %(id)s AND doc_number = ''",
                     {**dict(zip(ADOPTED_FIELDS, _row(item.payment, ADOPTED_FIELDS))),
@@ -244,18 +254,27 @@ def apply_import(form: ImportApply,
                         adopted=adopted)
 
 
-# Сумма из 1С и ручная правка. Решает сервер, а не клиент: импорт из старой
-# версии приложения иначе молча стёр бы правку человека.
-# · в 1С всё та же сумма, что была до правки, — правка остаётся;
-# · 1С прислала сумму, равную исправленной, — 1С догнала, пометка остаётся;
-# · 1С прислала другую — она новее правки: сумма из 1С, пометка снимается.
-_KEEP = "amount_before IS NOT NULL AND abs(amount_before - %(amount)s::numeric) < 0.005"
+# Сумма из 1С и пометка о смене суммы. Решает сервер, а не клиент: импорт из
+# старой версии приложения иначе молча стёр бы правку человека.
+# · в 1С всё та же сумма, что была до правки человека, — правка остаётся;
+# · 1С прислала сумму, равную стоящей, — пометка остаётся как была;
+# · иначе сумма из 1С, а пометка — «было» то, что стояло, и «кто» не указан
+#   (NULL читается как 1С). Если пометку уже ставила выгрузка, «было» остаётся
+#   первым, а возврат к нему пометку снимает.
+_BY_PERSON = "amount_before IS NOT NULL AND amount_changed_by IS NOT NULL"
+_BY_IMPORT = "amount_before IS NOT NULL AND amount_changed_by IS NULL"
+_KEEP = f"{_BY_PERSON} AND abs(amount_before - %(amount)s::numeric) < 0.005"
+_BACK = f"{_BY_IMPORT} AND abs(amount_before - %(amount)s::numeric) < 0.005"
 _SAME = "abs(amount - %(amount)s::numeric) < 0.005"
 IMPORTED_AMOUNT = (
     f"amount = CASE WHEN {_KEEP} THEN amount ELSE %(amount)s END,"
-    f" amount_before = CASE WHEN {_KEEP} OR {_SAME} THEN amount_before END,"
-    f" amount_changed_by = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_by END,"
-    f" amount_changed_at = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_at END"
+    f" amount_before = CASE WHEN {_KEEP} OR {_SAME} THEN amount_before"
+    f"   WHEN {_BACK} THEN NULL"
+    f"   WHEN {_BY_IMPORT} THEN amount_before ELSE amount END,"
+    f" amount_changed_by = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_by"
+    "   ELSE NULL END,"
+    f" amount_changed_at = CASE WHEN {_KEEP} OR {_SAME} THEN amount_changed_at"
+    f"   WHEN {_BACK} THEN NULL ELSE now() END"
 )
 
 

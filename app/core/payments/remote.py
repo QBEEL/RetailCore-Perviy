@@ -366,6 +366,7 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Any]:
             manual=bool(row["manual"]),
             amount_before=(float(row["amount_before"])
                            if row.get("amount_before") is not None else None),
+            amount_by_import=bool(row.get("amount_by_import", False)),
         )
     return index
 

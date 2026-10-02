@@ -23,6 +23,7 @@ from .. import appdata
 from .models import (
     AMOUNT_EPSILON,
     Budget,
+    IMPORT_AUTHOR,
     Payment,
     PaymentFile,
     PaymentOrigin,
@@ -341,6 +342,8 @@ class Existing:
     manual: bool = False
     # Сумма до ручной правки: пока 1С присылает её же, правка человека живёт.
     amount_before: float | None = None
+    # Пометку поставила сама выгрузка — тогда она ничего не «защищает».
+    amount_by_import: bool = False
 
 
 def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
@@ -353,7 +356,7 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
     with connect(path) as connection:
         rows = connection.execute(
             f"SELECT id, doc_number, request_date, origin, status, comment,"
-            f" amount_before, {names}"
+            f" amount_before, amount_changed_by, {names}"
             " FROM payment WHERE doc_number <> ''").fetchall()
     index: dict[tuple[str, str], Existing] = {}
     for row in rows:
@@ -364,9 +367,13 @@ def existing_index(path: str | None = None) -> dict[tuple[str, str], Existing]:
             status=row["status"],
             manual=bool(row["comment"]),
             amount_before=row["amount_before"],
+            amount_by_import=row["amount_changed_by"] == IMPORT_AUTHOR,
         )
     return index
 
+
+# Сумма из выгрузки совпала с лежащей в записи. Именованный параметр :amount.
+_SAME = "ABS(amount - :amount) < 0.005"
 
 _OPEN: tuple[str, ...] = tuple(status.value for status in PaymentStatus if status.open)
 
@@ -405,15 +412,21 @@ def apply_import(
     takeovers = [(payment_id, _adopted_values(payment)) for payment_id, payment in adopted]
     with connect(path) as connection:
         if takeovers:
-            # Сумма в занятой записи — из 1С, пометка о ручной правке к ней
-            # не относится. Условие на пустой номер — защита от гонки: запись
-            # могли занять между разбором и подтверждением.
-            assignments = ", ".join(f"{name} = ?" for name in takeovers[0][1])
+            # Плановая сумма уходит в «было», если 1С принесла другую: так видно,
+            # что и в какую сторону заменил импорт. Прежняя пометка о ручной
+            # правке к новой сумме не относится. Условие на пустой номер —
+            # защита от гонки: запись могли занять между разбором и
+            # подтверждением. Правая часть SET видит строку до изменения.
+            assignments = ", ".join(f"{name} = :{name}" for name in takeovers[0][1])
             connection.executemany(
-                f"UPDATE payment SET {assignments}, amount_before = NULL,"
-                " amount_changed_by = '', amount_changed_at = '', updated_at = ?"
-                " WHERE id = ? AND doc_number = ''",
-                [[*row.values(), now, payment_id] for payment_id, row in takeovers])
+                f"UPDATE payment SET {assignments},"
+                f" amount_before = CASE WHEN {_SAME} THEN NULL ELSE amount END,"
+                f" amount_changed_by = CASE WHEN {_SAME} THEN '' ELSE :_by END,"
+                f" amount_changed_at = CASE WHEN {_SAME} THEN '' ELSE :_now END,"
+                " updated_at = :_now"
+                " WHERE id = :_id AND doc_number = ''",
+                [{**row, "_by": IMPORT_AUTHOR, "_now": now, "_id": payment_id}
+                 for payment_id, row in takeovers])
         if new_rows:
             names = ", ".join([*new_rows[0], "created_at", "updated_at"])
             marks = ", ".join("?" for _ in range(len(new_rows[0]) + 2))
@@ -422,20 +435,27 @@ def apply_import(
                 [[*row.values(), now, now] for row in new_rows])
         if updates:
             # Сумму, которую человек поправил и 1С не меняла, разбор уже
-            # оставил прежней (`importer.split_changes`). Если же сумма всё-таки
-            # меняется, она пришла из 1С новой — пометка о правке снимается.
-            # SQLite, как и Postgres, считает правую часть по строке до UPDATE.
-            assignments = ", ".join(f"{name} = ?" for name in updates[0][1])
-            same = "ABS(amount - ?) < 0.005"
-            marks = (f"amount_before = CASE WHEN {same} THEN amount_before END,"
-                     f" amount_changed_by = CASE WHEN {same} THEN amount_changed_by"
-                     " ELSE '' END,"
-                     f" amount_changed_at = CASE WHEN {same} THEN amount_changed_at"
-                     " ELSE '' END")
+            # оставил прежней (`importer.split_changes`). Пришла другая —
+            # она новее правки: «было» получает то, что стояло, а в «кто»
+            # встаёт 1С. Если пометку уже ставила выгрузка, «было» остаётся
+            # первым — от него считается, куда ушла сумма, — а возврат к нему
+            # пометку снимает. SQLite, как и Postgres, считает правую часть
+            # по строке до UPDATE.
+            assignments = ", ".join(f"{name} = :{name}" for name in updates[0][1])
+            by_import = "amount_before IS NOT NULL AND amount_changed_by = :_by"
+            back = f"{by_import} AND ABS(amount_before - :amount) < 0.005"
+            marks = (
+                f"amount_before = CASE WHEN {_SAME} THEN amount_before"
+                f" WHEN {back} THEN NULL"
+                f" WHEN {by_import} THEN amount_before ELSE amount END,"
+                f" amount_changed_by = CASE WHEN {_SAME} THEN amount_changed_by"
+                f" WHEN {back} THEN '' ELSE :_by END,"
+                f" amount_changed_at = CASE WHEN {_SAME} THEN amount_changed_at"
+                f" WHEN {back} THEN '' ELSE :_now END")
             connection.executemany(
-                f"UPDATE payment SET {marks}, {assignments}, updated_at = ?"
-                " WHERE id = ?",
-                [[*[row["amount"]] * 3, *row.values(), now, payment_id]
+                f"UPDATE payment SET {marks}, {assignments}, updated_at = :_now"
+                " WHERE id = :_id",
+                [{**row, "_by": IMPORT_AUTHOR, "_now": now, "_id": payment_id}
                  for payment_id, row in updates])
         connection.commit()
     return len(new_rows), len(updates), len(takeovers)
