@@ -56,8 +56,12 @@ a = Analysis(
     datas=DATAS,
     # QtCharts рисует графики на вкладке оплат. Он входит в PySide6, но
     # PyInstaller не видит его через отложенный импорт в app/ui/widgets/charts.py.
+    # win32timezone pywin32 подгружает сам, когда переводит даты сертификата из
+    # COM, — через статический разбор PyInstaller его не видит. Без него
+    # `.exe` не читает личные сертификаты («No module named 'win32timezone'»),
+    # хотя из `start.bat` всё работает: там модуль лежит в окружении.
     hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts",
-                   "certifi"],
+                   "certifi", "win32timezone"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
