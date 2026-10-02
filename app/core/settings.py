@@ -93,6 +93,12 @@ class AppSettings:
     # Звук при расхождении на сверке. По умолчанию включён: сверяют, глядя на
     # товар, а не на экран, и расхождение должно быть слышно.
     marking_reconcile_sound: bool = True
+    # За сколько дней до конца срока товар на складе помечается «скоро истекает».
+    marking_expiry_soon_days: int = 90
+    # Срок годности, которого нет в ответе системы (парфюмерия): на сколько лет
+    # считать от даты производства, и бренды с другим сроком — «бренд → лет».
+    marking_shelf_years: int = 3
+    marking_shelf_brands: dict[str, int] = field(default_factory=dict)
     # Выгрузка номенклатуры 1С для сопоставления кодов. Помнится путь, а не
     # содержимое: номенклатура меняется, и читать её надо заново, но выбирать
     # один и тот же файл на каждой поставке — лишнее действие.
@@ -297,6 +303,19 @@ class AppSettings:
         ]
         self.marking_reconcile_sound = bool(
             data.get("marking_reconcile_sound", self.marking_reconcile_sound))
+        soon = data.get("marking_expiry_soon_days")
+        # Порог — число дней; всё остальное в файле настроек читается как «не задан».
+        if isinstance(soon, int) and not isinstance(soon, bool) and 1 <= soon <= 3650:
+            self.marking_expiry_soon_days = soon
+        years = data.get("marking_shelf_years")
+        if isinstance(years, int) and not isinstance(years, bool) and 1 <= years <= 30:
+            self.marking_shelf_years = years
+        brands = data.get("marking_shelf_brands")
+        if isinstance(brands, dict):
+            self.marking_shelf_brands = {
+                str(name): int(value) for name, value in brands.items()
+                if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 30
+            }
         self.marking_onec_catalog = str(data.get("marking_onec_catalog", ""))
         self.marking_onec_links = {
             key: {"code": str(item.get("code") or ""),
@@ -379,6 +398,9 @@ class AppSettings:
             "marking_organisation": self.marking_organisation,
             "marking_organisations": self.marking_organisations,
             "marking_reconcile_sound": self.marking_reconcile_sound,
+            "marking_expiry_soon_days": self.marking_expiry_soon_days,
+            "marking_shelf_years": self.marking_shelf_years,
+            "marking_shelf_brands": self.marking_shelf_brands,
             "marking_onec_catalog": self.marking_onec_catalog,
             "marking_onec_links": self.marking_onec_links,
             "vpn_enabled": self.vpn_enabled,

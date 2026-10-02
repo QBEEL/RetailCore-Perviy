@@ -76,6 +76,7 @@ from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title
+from .widgets.expiry_tab import ExpiryTab
 from .widgets.marking_dialogs import (
     NomenclatureDialog,
     OrderConfirmDialog,
@@ -98,6 +99,8 @@ JOURNAL_LIMIT = 50
 # документом, и отдельно — заказать свои.
 CHECK_TAB = 0
 RECONCILE_TAB = 1
+# Срок годности по QR добавлен последним, чтобы не сдвигать номера прежних вкладок.
+EXPIRY_TAB = 3
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
 # косится краем глаза, и различать ответы он должен цветом, а не чтением.
@@ -182,6 +185,9 @@ class MarkingPage(QWidget):
         self.tabs.addTab(self._reconcile_tab(), icons.icon("compare"),
                          "Сверка кодов маркировки")
         self.tabs.addTab(self._order_tab(), icons.icon("order"), "Заказ кодов")
+        # Срок годности читается из самого QR и от входа не зависит, как и сверка.
+        self.expiry_tab = ExpiryTab(self.settings, self.notify, self)
+        self.tabs.addTab(self.expiry_tab, icons.icon("calendar"), "Срок годности")
         # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
         # в поле сканирования при открытии вкладки — не удобство, а условие
         # работы: иначе первый же код уедет в поле поиска или в никуда.
@@ -1623,6 +1629,8 @@ class MarkingPage(QWidget):
     def _on_tab_changed(self, index: int) -> None:
         if index == RECONCILE_TAB:
             self._focus_scan()
+        elif index == EXPIRY_TAB:
+            self.expiry_tab.focus_scan()
 
     def _focus_scan(self) -> None:
         """Курсор в поле сканирования. Без этого сканер печатает мимо."""
