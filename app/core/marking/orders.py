@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -638,3 +639,49 @@ def _remember(answer: Any) -> None:
     except (TypeError, ValueError):
         text = repr(answer)[:20000]
     appdata.log_event(LOG_FILE, f"Незнакомый ответ СУЗ на {ORDERS_PATH}:\n{text}")
+
+
+# --- вставка списка товаров ---------------------------------------------------------
+
+@dataclass(slots=True)
+class Pasted:
+    """Результат разбора вставленного списка: строки заказа и то, что не разобралось."""
+
+    lines: list[tuple[str, int]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    merged: int = 0
+
+
+def parse_lines(text: str) -> Pasted:
+    """Строки «код товара — количество» из буфера обмена.
+
+    Заказывают обычно десятками товаров, и набирать каждый код руками значит
+    ошибаться в нём. Список копируется из Excel (колонки разделены табуляцией),
+    из письма или из 1С, поэтому терпимы разделители: табуляция, точка с запятой,
+    пробелы. Штрихкод EAN-13 дополняется нулём до GTIN-14 — это тот же товар.
+    Одинаковые коды складываются: в заказе они запрещены, а при вставке из
+    выгрузки повторы — обычное дело.
+    """
+    result = Pasted()
+    totals: dict[str, int] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in re.split(r"[\t;]+|\s{2,}", line) if part.strip()]
+        if len(parts) < 2:
+            parts = line.split()
+        gtin = re.sub(r"\D", "", parts[0]) if parts else ""
+        if len(gtin) == 13:
+            gtin = "0" + gtin
+        quantity = re.sub(r"[^\d]", "", parts[-1]) if len(parts) > 1 else ""
+        if len(gtin) != 14 or not quantity or int(quantity) <= 0:
+            result.skipped.append(line)
+            continue
+        if gtin in totals:
+            result.merged += 1
+            totals[gtin] += int(quantity)
+        else:
+            totals[gtin] = int(quantity)
+    result.lines = list(totals.items())
+    return result

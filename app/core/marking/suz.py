@@ -38,6 +38,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 from .. import appdata
 from . import crypto, session, transport
@@ -49,11 +50,9 @@ FILE_NAME = "marking_suz.json"
 # спрашивают, чтобы убедиться, что реквизиты приняты.
 PING_PATH = "/ping"
 
-# Вход по сертификату. Устроен так же, как в True API: строка для подписи →
-# подпись → токен. Проверено обращением: `/auth/key` отвечает на обоих адресах
-# СУЗ, а `simpleSignIn` с непригодной подписью отвечает «Найденные данные по
-# UUID … не совпадают с подписанными» — то есть метод существует и проверяет
-# именно подпись.
+# Вход по сертификату — через True API, а не через хост СУЗ (руководство
+# программиста СУЗ, 9.3.2): строка для подписи → подпись → токен. Адрес
+# `simpleSignIn` содержит идентификатор соединения.
 KEY_PATH = "/auth/key"
 SIGN_IN_PATH = "/auth/simpleSignIn"
 
@@ -328,33 +327,37 @@ def sign_in(thumbprint: str, inn: str = "",
     устройство: хранить его между запусками можно, а полагаться на то, что он
     ещё жив, — нельзя.
 
-    Идентификатор соединения нужен именно здесь. В сами запросы он не уходит —
-    `ping` отвечает одинаково с ним и без него, — а вот токен выдаётся под
-    конкретное устройство, и без него запрос не о чем.
+    Идентификатор соединения нужен именно здесь: он входит в адрес запроса, а
+    токен выдаётся под конкретное устройство. В сами рабочие запросы он не
+    уходит — `ping` отвечает одинаково с ним и без него.
     """
     certificate = crypto.find(thumbprint)
     if certificate is None:
         raise crypto.SigningFailed(
             "Сертификат не найден. Возможно, подключён другой носитель ключа.")
 
-    challenge = transport.get("suz", KEY_PATH, contour=contour)
+    # Руководство программиста СУЗ (9.3.2): клиентский токен выдаёт не сама СУЗ,
+    # а единая аутентификация True API — `/auth/key` и
+    # `/auth/simpleSignIn/{omsConnection}` на хосте True API. На хосте СУЗ метод
+    # с идентификатором в адресе отвечает 405, а без него станция ищет участника
+    # по ИНН из сертификата — отсюда отказ 4035 «Сервис-провайдер не найден».
+    if not connection_id.strip():
+        raise transport.MarkingError(
+            "Не заполнен идентификатор соединения. Без него СУЗ не выдаст токен: "
+            "он берётся в личном кабинете при регистрации устройства.")
+
+    challenge = transport.get("trueapi", KEY_PATH, contour=contour)
     uuid_value, data = session.parse_challenge(challenge)
     signature = crypto.sign(data, thumbprint)
 
+    # `inn` — ИНН организации, под которой входит владелец сертификата по
+    # машиночитаемой доверенности (таблица 384). Без доверенности не нужен.
     body: dict[str, Any] = {"uuid": uuid_value, "data": signature}
     if inn.strip():
         body["inn"] = inn.strip()
-    # Идентификатор соединения уходит и полем, и параметром. Выглядит
-    # избыточно, но каждая попытка стоит человеку ввода пароля к контейнеру, а
-    # какое из двух мест верное, из строк чужой библиотеки не видно: там
-    # `omsConnection` лежит отдельным словом, без `?` и `=`. Лишний неизвестный
-    # параметр сервер игнорирует, лишний вопрос пользователю — нет.
-    params: dict[str, Any] = {}
-    if connection_id.strip():
-        body["omsConnection"] = connection_id.strip()
-        params["omsConnection"] = connection_id.strip()
-    granted = transport.post("suz", SIGN_IN_PATH, contour=contour,
-                             params=params or None, body=body)
+    granted = transport.post(
+        "trueapi", f"{SIGN_IN_PATH}/{quote(connection_id.strip(), safe='')}",
+        contour=contour, body=body)
 
     token = _token(granted)
     if not token:

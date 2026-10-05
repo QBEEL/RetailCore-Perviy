@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from . import codes as codes_module
-from . import crypto, orders as orders_module, session, store, suz, transport
+from . import crypto, issue, orders as orders_module, session, store, suz, transport
 from .models import (
     BATCH_SIZE,
     CodeInfo,
@@ -194,6 +194,67 @@ def create_suz_order(request: orders_module.Request, credentials: suz.Credential
     return with_fresh_token(
         credentials, contour, thumbprint, inn,
         lambda ready: orders_module.create(ready, request, thumbprint, contour))
+
+
+def suz_product_info(credentials: suz.Credentials, order_id: str,
+                     contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+                     inn: str = "") -> tuple[dict[str, issue.Product], suz.Credentials]:
+    """Название и ТН ВЭД товаров заказа — для этикетки и документа оборота."""
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: issue.product_info(ready, order_id, contour))
+
+
+def fetch_suz_codes(credentials: suz.Credentials, order_id: str, gtin: str,
+                    quantity: int, contour: Contour = Contour.SANDBOX,
+                    thumbprint: str = "", inn: str = "", *,
+                    product: issue.Product | None = None, product_group: str = "",
+                    release_method: str = "") -> tuple[issue.Batch, suz.Credentials]:
+    """Забирает коды из буфера и сохраняет их на диск до возврата.
+
+    Безвозвратная операция. Повтор после обновления токена безопасен: отказ по
+    учётным данным приходит до выдачи, и первая попытка кодов не списала.
+    """
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: issue.fetch(ready, order_id, gtin, quantity, contour,
+                                  product=product, product_group=product_group,
+                                  release_method=release_method))
+
+
+def recover_suz_codes(credentials: suz.Credentials, order_id: str, gtin: str,
+                      contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+                      inn: str = "", *, product: issue.Product | None = None,
+                      product_group: str = "", release_method: str = ""
+                      ) -> tuple[list[issue.Batch], suz.Credentials]:
+    """Возвращает выданные ранее, но не сохранённые здесь блоки кодов."""
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: issue.recover(ready, order_id, gtin, contour, product=product,
+                                    product_group=product_group,
+                                    release_method=release_method))
+
+
+def recover_order_codes(credentials: suz.Credentials, order_id: str,
+                        gtins: Sequence[str], contour: Contour = Contour.SANDBOX,
+                        thumbprint: str = "", inn: str = "", *,
+                        product_group: str = "", release_method: str = ""
+                        ) -> tuple[list[issue.Batch], suz.Credentials]:
+    """Возвращает потерянные блоки по всем товарам заказа.
+
+    Названия и ТН ВЭД подтягиваются из заказа, чтобы восстановленный блок
+    печатался и вводился в оборот так же, как полученный обычным путём.
+    """
+    products, credentials = suz_product_info(credentials, order_id, contour,
+                                             thumbprint, inn)
+    restored: list[issue.Batch] = []
+    for gtin in gtins:
+        found, credentials = recover_suz_codes(
+            credentials, order_id, gtin, contour, thumbprint, inn,
+            product=products.get(gtin), product_group=product_group,
+            release_method=release_method)
+        restored.extend(found)
+    return restored, credentials
 
 
 # Заказы читаются и заводятся. Признак остаётся: по нему вкладка отличает

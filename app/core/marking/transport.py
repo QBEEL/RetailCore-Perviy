@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import ssl
 import threading
@@ -46,6 +47,10 @@ HOSTS: dict[tuple[str, Contour], str] = {
     ("ismp", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
     ("trueapi", Contour.PRODUCTION): "https://markirovka.crpt.ru",
     ("trueapi", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
+    # Тот же True API, но четвёртой версии: список документов (`/doc/list`)
+    # живёт только в ней. Хосты те же — отличается лишь префикс пути.
+    ("trueapi4", Contour.PRODUCTION): "https://markirovka.crpt.ru",
+    ("trueapi4", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
     ("suz", Contour.PRODUCTION): "https://suzgrid.crpt.ru",
     ("suz", Contour.SANDBOX): "https://suz.sandbox.crptech.ru",
 }
@@ -53,7 +58,8 @@ HOSTS: dict[tuple[str, Contour], str] = {
 
 # Префикс пути у каждой системы свой. True API живёт под третьей версией, а не
 # под четвёртой: по `/api/v4` оба хоста отвечают 403.
-PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api", "suz": "/api/v3"}
+PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api",
+          "trueapi4": "/api/v4/true-api", "suz": "/api/v3"}
 
 
 def configure(system: str, contour: Contour, host: str) -> None:
@@ -226,12 +232,26 @@ def request(
             attempt += 1
 
 
+_PLAIN_ID = re.compile(r"^[0-9A-Za-z_\-]{8,64}$")
+
+
 def _send(prepared: urllib.request.Request,
           tolerate: tuple[int, ...] = ()) -> Any:
     try:
         with urllib.request.urlopen(prepared, timeout=TIMEOUT, context=net.context) as response:
             payload = response.read()
-            return json.loads(payload) if payload else None
+            if not payload:
+                return None
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                # Создание документа отвечает голым идентификатором, без JSON.
+                # Принять за него можно только короткий токен из знаков
+                # идентификатора: страница с ошибкой так не выглядит.
+                text = payload.decode("utf-8", "replace").strip()
+                if _PLAIN_ID.match(text):
+                    return text
+                raise
     except urllib.error.HTTPError as error:
         # Тело читается один раз: повторный `read()` вернёт пустоту, и разбор
         # ответа с терпимым кодом сломался бы об это.

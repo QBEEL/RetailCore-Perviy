@@ -30,7 +30,7 @@ EXCLUDED = [
     "PySide6.QtPdfWidgets", "PySide6.QtSpatialAudio", "PySide6.QtTextToSpeech",
     "PySide6.QtRemoteObjects", "PySide6.QtScxml", "PySide6.QtStateMachine",
     "PySide6.QtNetworkAuth", "PySide6.QtHttpServer", "PySide6.QtUiTools",
-    "PySide6.QtConcurrent", "PySide6.QtDBus", "PySide6.QtPrintSupport",
+    "PySide6.QtConcurrent", "PySide6.QtDBus",
     "PySide6.QtGraphs", "PySide6.QtGraphsWidgets", "PySide6.QtQuickControls2",
     "PySide6.QtQuickTest", "PySide6.QtVirtualKeyboard",
     # Тяжёлые научные пакеты в приложении не участвуют.
@@ -54,7 +54,7 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=DATAS,
-    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtCharts",
+    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtPrintSupport", "PySide6.QtCharts",
                    "certifi"],
     hookspath=[],
     hooksconfig={},

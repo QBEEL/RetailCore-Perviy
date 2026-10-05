@@ -31,8 +31,8 @@ from __future__ import annotations
 import os
 from typing import Callable, Sequence
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -64,6 +64,8 @@ from ..core.marking import (
     Organisation,
     codes as codes_module,
 )
+from ..core.marking import issue as issue_module
+from ..core.marking import introduce as introduce_module
 from ..core.marking import orders as orders_module, service
 from ..core.marking import onec as onec_module
 from ..core.marking import reconcile as reconcile_module, upd as upd_module
@@ -77,6 +79,8 @@ from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title
 from .widgets.expiry_tab import ExpiryTab
+from .widgets.issue_dialogs import IntroduceDialog, IssueDialog, PrintDialog
+from .widgets.order_dialog import OrderDialog, _plural
 from .widgets.marking_dialogs import (
     NomenclatureDialog,
     OrderConfirmDialog,
@@ -136,6 +140,7 @@ class MarkingPage(QWidget):
         # его обесценивает.
         self._suz_answer = ""
         self._orders: list = []
+        self._batches: list[issue_module.Batch] = []
         # Документ, с которым идёт сверка, и её ход. Живут, пока открыто окно:
         # сверку начинают на приёмке и заканчивают через полчаса, уходя за
         # каждой следующей коробкой, и терять её при переключении вкладки
@@ -156,6 +161,7 @@ class MarkingPage(QWidget):
         self._restore_choices()
         self._restore_catalog()
         self._sync_reconcile()
+        self.reload_batches()
         self._sync_state()
 
     # --- разметка -------------------------------------------------------------
@@ -229,9 +235,26 @@ class MarkingPage(QWidget):
         body = QVBoxLayout(page)
         body.setContentsMargins(0, Metrics.GAP, 0, 0)
         body.setSpacing(Metrics.GAP)
-        body.addWidget(self._suz_card())
-        body.addWidget(self._new_order_card())
-        body.addWidget(self._orders_card(), 1)
+        # Две подвкладки по порядку работы: сначала заказать и забрать коды,
+        # потом напечатать и ввести в оборот. Всё на одном экране вытеснило бы
+        # список заказов за нижний край окна.
+        self.order_tabs = QTabWidget(page)
+        self.order_tabs.setDocumentMode(True)
+        order = QWidget(self.order_tabs)
+        order_body = QVBoxLayout(order)
+        order_body.setContentsMargins(0, Metrics.GAP, 0, 0)
+        order_body.setSpacing(Metrics.GAP)
+        order_body.addWidget(self._suz_card())
+        order_body.addWidget(self._new_order_card())
+        order_body.addWidget(self._orders_card(), 1)
+        self.order_tabs.addTab(order, icons.icon("order"), "Заказ и получение кодов")
+        issued = QWidget(self.order_tabs)
+        issued_body = QVBoxLayout(issued)
+        issued_body.setContentsMargins(0, Metrics.GAP, 0, 0)
+        issued_body.setSpacing(Metrics.GAP)
+        issued_body.addWidget(self._batches_card(), 1)
+        self.order_tabs.addTab(issued, icons.icon("export"), "Печать и ввод в оборот")
+        body.addWidget(self.order_tabs, 1)
         return page
 
     def _session_card(self) -> Card:
@@ -312,7 +335,7 @@ class MarkingPage(QWidget):
 
         self.connection_edit = QLineEdit(card)
         self.connection_edit.setPlaceholderText(
-            "Необязательно — в запросы не уходит, опознаёт устройство в кабинете")
+            "Из личного кабинета СУЗ — нужен для кнопки «Получить токен»")
         form.addRow("Идентификатор соединения", self.connection_edit)
 
         token_row = QHBoxLayout()
@@ -346,9 +369,10 @@ class MarkingPage(QWidget):
     def _new_order_card(self) -> Card:
         """Новый заказ кодов.
 
-        Способ выпуска назван теми же словами, что в ПРИНТМАРКИ: она давно в
-        работе, и одно и то же в двух программах должно называться одинаково —
-        иначе однажды будет выбрано не то.
+        Сама форма — в отдельном окне: заказывают обычно десятки товаров сразу, и
+        таблица в полторы строки на странице для этого не годится. Способ выпуска
+        назван теми же словами, что в ПРИНТМАРКИ: одно и то же в двух программах
+        должно называться одинаково, иначе однажды будет выбрано не то.
         """
         card = Card(self)
         body = card.body()
@@ -357,75 +381,14 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Новый заказ", card))
         header.addStretch(1)
-        header.addWidget(self._action(card, "Добавить товар", "plus", self.add_line))
-        header.addWidget(self._action(card, "Убрать", "trash", self.remove_line))
-        self.order_button = self._action(card, "Заказать коды", "run", self.create_order)
+        self.order_button = self._action(card, "Заказать коды…", "run", self.new_order)
         self.order_button.setObjectName("Primary")
         header.addWidget(self.order_button)
         body.addLayout(header)
 
-        chooser = QHBoxLayout()
-        chooser.setSpacing(9)
-        self.group_box = QComboBox(card)
-        for group in GROUPS:
-            self.group_box.addItem(group.title, group.code)
-        chooser.addWidget(self.group_box, 1)
-        self.method_box = QComboBox(card)
-        for method in ReleaseMethod:
-            self.method_box.addItem(method.title, method.value)
-        self.method_box.currentIndexChanged.connect(self._sync_order_hint)
-        chooser.addWidget(self.method_box, 1)
-        body.addLayout(chooser)
-
-        details = QFormLayout()
-        details.setSpacing(9)
-        self.contact_edit = QLineEdit(card)
-        self.contact_edit.setPlaceholderText(
-            "Кому в ЦРПТ писать по этому заказу")
-        details.addRow("Контактное лицо", self.contact_edit)
-
-        # Шаблон и оплата — два числа, которых никто не помнит наизусть и
-        # которые неоткуда узнать: метода со списком шаблонов у СУЗ нет. Зато
-        # они есть в прошлых заказах участника, поэтому подставляются оттуда, а
-        # подпись рядом говорит, откуда именно. Править их можно — но не нужно.
-        # Шаблон выбирается из тех, что подходят группе, — списком, а не числом.
-        # Номер сам по себе не значит для человека ничего, и требовать его
-        # значит требовать знания, которого у категорийного менеджера нет.
-        # Различаются шаблоны длиной серийного номера и наличием криптохвоста,
-        # это и написано в каждой строке.
-        self.template_box = QComboBox(card)
-        self.template_box.currentIndexChanged.connect(self._sync_order_hint)
-        details.addRow("Шаблон кода", self.template_box)
-
-        payment = QHBoxLayout()
-        payment.setSpacing(9)
-        self.payment_box = QSpinBox(card)
-        self.payment_box.setRange(1, 9)
-        self.payment_box.setValue(orders_module.DEFAULT_PAYMENT)
-        payment.addWidget(self.payment_box)
-        self.template_hint = Hint("", card)
-        payment.addWidget(self.template_hint, 1)
-        details.addRow("Способ оплаты", payment)
-        body.addLayout(details)
-
-        self.lines = QTableWidget(0, 2, card)
-        self.lines.setHorizontalHeaderLabels(["Код товара (GTIN)", "Количество"])
-        self.lines.verticalHeader().setVisible(False)
-        self.lines.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.lines.setMaximumHeight(140)
-        head = self.lines.horizontalHeader()
-        head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        head.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.lines.itemChanged.connect(self._sync_order_hint)
-        body.addWidget(self.lines)
-
-        # Подсказка отзывается на каждое поле заказа: она отвечает на вопрос
-        # «почему кнопка ничего не делает», и отвечать должна сразу.
-        self.contact_edit.textChanged.connect(self._sync_order_hint)
-        self.group_box.currentIndexChanged.connect(self._on_group_changed)
-        self.payment_box.valueChanged.connect(self._sync_order_hint)
-
-        self.order_hint = Hint("", card)
+        self.order_hint = Hint(
+            "Откроется отдельное окно: в нём можно заказать сразу много товаров с "
+            "разными GTIN — список вставляется целиком из Excel.", card)
         body.addWidget(self.order_hint)
         return card
 
@@ -443,6 +406,18 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Заказы кодов", card))
         header.addStretch(1)
+        self.fetch_button = self._action(card, "Получить коды…", "download",
+                                         self.fetch_codes)
+        self.fetch_button.setObjectName("Primary")
+        self.fetch_button.setToolTip(
+            "Забирает коды из буфера выбранного заказа и сохраняет их на диск. "
+            "Коды выдаются безвозвратно")
+        header.addWidget(self.fetch_button)
+        self.recover_button = self._action(card, "Восстановить потерянные", "history",
+                                           self.recover_codes)
+        self.recover_button.setToolTip(
+            "Возвращает блоки, которые СУЗ уже выдала, а на этом компьютере их нет")
+        header.addWidget(self.recover_button)
         self.orders_button = self._action(card, "Обновить", "refresh",
                                           self.reload_orders)
         header.addWidget(self.orders_button)
@@ -464,6 +439,58 @@ class MarkingPage(QWidget):
 
         self.orders_hint = Hint("", card)
         body.addWidget(self.orders_hint)
+        return card
+
+    def _batches_card(self) -> Card:
+        """Полученные блоки кодов: что напечатано и что введено в оборот.
+
+        Блок здесь — не запись о заказе, а файл на диске с самими кодами. Он
+        единственная копия оплаченного, поэтому список читается с диска, а не
+        из памяти страницы: после перезапуска всё на месте, и допечатать
+        прерванное можно с той же этикетки.
+        """
+        card = Card(self)
+        body = card.body()
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        header.addWidget(SectionTitle("Полученные коды", card))
+        header.addStretch(1)
+        self.batch_print_button = self._action(card, "Печать…", "run",
+                                               self.print_batch)
+        self.batch_print_button.setObjectName("Primary")
+        header.addWidget(self.batch_print_button)
+        self.batch_introduce_button = self._action(
+            card, "Ввод в оборот…", "export", self.introduce_batch)
+        header.addWidget(self.batch_introduce_button)
+        self.batch_status_button = self._action(
+            card, "Статус документа", "refresh", self.refresh_document_status)
+        self.batch_status_button.setToolTip(
+            "Спрашивает «Честный ЗНАК», чем закончилась проверка отправленного документа")
+        header.addWidget(self.batch_status_button)
+        header.addWidget(self._action(card, "Папка с кодами", "folder",
+                                      self.open_batches_folder))
+        header.addWidget(self._action(card, "Обновить", "refresh",
+                                      self.reload_batches))
+        body.addLayout(header)
+
+        self.batches = QTableWidget(0, 5, card)
+        self.batches.setHorizontalHeaderLabels(
+            ["Получен", "Товар", "Всего", "Напечатано", "Ввод в оборот"])
+        self.batches.verticalHeader().setVisible(False)
+        self.batches.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.batches.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.batches.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        head = self.batches.horizontalHeader()
+        head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 2, 3, 4):
+            head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.batches.itemDoubleClicked.connect(lambda _item: self.print_batch())
+        self.batches.itemSelectionChanged.connect(self._sync_batches_hint)
+        body.addWidget(self.batches, 1)
+
+        self.batches_hint = Hint("", card)
+        body.addWidget(self.batches_hint)
         return card
 
     def _codes_card(self) -> Card:
@@ -836,15 +863,12 @@ class MarkingPage(QWidget):
 
     def _restore_choices(self) -> None:
         """Возвращает выбор прошлого запуска. Сертификаты читаются отдельно."""
-        self._sync_template()
         index = self.contour_box.findData(self.settings.marking_contour)
         if index >= 0:
             self.contour_box.blockSignals(True)
             self.contour_box.setCurrentIndex(index)
             self.contour_box.blockSignals(False)
         self._load_suz()
-        self._sync_template()
-        self._sync_order_hint()
 
     def _on_contour_changed(self) -> None:
         """Смена контура сбрасывает вход.
@@ -875,9 +899,6 @@ class MarkingPage(QWidget):
             self.settings.marking_organisation = ""
             self.settings.marking_organisations = []
             self.settings.save()
-        # Заказ подписывается выбранным сертификатом, поэтому его готовность
-        # меняется вместе с выбором.
-        self._sync_order_hint()
         self._sync_state()
 
     def reload_certificates(self) -> None:
@@ -907,11 +928,6 @@ class MarkingPage(QWidget):
         if wanted and (index := self.certificate_box.findData(wanted)) >= 0:
             self.certificate_box.setCurrentIndex(index)
         self.certificate_box.blockSignals(False)
-        # Контактным лицом заказа по умолчанию идёт владелец сертификата: это
-        # он и есть, а набирать своё имя руками — лишнее действие.
-        if not self.contact_edit.text().strip() and self._certificates:
-            self.contact_edit.setText(self._certificates[0].owner)
-        self._sync_order_hint()
         self._set_busy(False)
 
     def _on_certificates_error(self, message: str) -> None:
@@ -1166,138 +1182,40 @@ class MarkingPage(QWidget):
 
     # --- новый заказ ------------------------------------------------------------------
 
-    @property
-    def order_request(self) -> "orders_module.Request":
-        """Заказ в том виде, в каком он уйдёт в СУЗ."""
-        lines = []
-        for row in range(self.lines.rowCount()):
-            gtin = self.lines.item(row, 0)
-            quantity = self.lines.item(row, 1)
-            lines.append(orders_module.Line(
-                gtin=gtin.text().strip() if gtin else "",
-                quantity=_number(quantity.text() if quantity else ""),
-                template_id=self._template_id(),
-            ))
-        return orders_module.Request(
-            product_group=str(self.group_box.currentData() or ""),
-            method=ReleaseMethod(str(self.method_box.currentData() or "REMAINS")),
-            contact=self.contact_edit.text(),
-            payment_type=self.payment_box.value(),
-            lines=lines,
-            seen_templates=self._seen_templates(),
-        )
-
-    def _seen_templates(self) -> frozenset[int]:
-        """Шаблоны, которыми эту группу уже заказывали.
-
-        Справочник может отстать от системы, а принятый ею шаблон — довод
-        сильнее руководства.
-        """
-        group = str(self.group_box.currentData() or "").strip().lower()
-        return frozenset(
-            int(buffer.raw.get("templateId") or 0)
-            for order in self._orders
-            if order.product_group.strip().lower() == group
-            for buffer in order.buffers
-            if buffer.raw.get("templateId")
-        )
-
-    def _on_group_changed(self) -> None:
-        self._sync_template()
-        self._sync_order_hint()
-
-    def _sync_template(self) -> None:
-        """Заполняет список шаблонов группы и выбирает подходящий.
-
-        Основа — справочник из руководства СУЗ: у каждой товарной группы свой
-        набор, и чужой шаблон система отвергает. История заказов уточняет выбор
-        там, где шаблонов у группы несколько.
-        """
-        group = str(self.group_box.currentData() or "")
-        known = orders_module.defaults_for(group, self._orders)
-        allowed = orders_module.templates_for(group)
-
-        self.template_box.blockSignals(True)
-        self.template_box.clear()
-        for template in allowed:
-            self.template_box.addItem(template.title, template.id)
-        if not allowed:
-            # Группы нет в справочнике — запрещать нечем, но и подсказать
-            # нечего: номер придётся взять из личного кабинета.
-            self.template_box.setEditable(True)
-            self.template_box.addItem(str(known.template_id or ""),
-                                      known.template_id)
-        else:
-            self.template_box.setEditable(False)
-            if known.known and self.template_box.findData(known.template_id) < 0:
-                # Справочник этого шаблона не знает, а СУЗ его когда-то приняла.
-                # Реальность старше документа — показываем оба.
-                self.template_box.insertItem(
-                    0, f"{known.template_id} · из вашего заказа по этой группе",
-                    known.template_id)
-            if (index := self.template_box.findData(known.template_id)) >= 0:
-                self.template_box.setCurrentIndex(index)
-        self.template_box.blockSignals(False)
-
-        self.payment_box.blockSignals(True)
-        self.payment_box.setValue(known.payment_type)
-        self.payment_box.blockSignals(False)
-
-        if known.known:
-            when = f" от {known.since:%d.%m.%Y}" if known.since else ""
-            self.template_hint.setStyleSheet("")
-            self.template_hint.setText(
-                f"Как в вашем заказе{when} по этой группе — менять не нужно")
+    def new_order(self) -> None:
+        """Открывает окно заказа. Само окно ничего не отправляет."""
+        if not self.suz_credentials.stripped().filled:
+            self.notify("Сначала настройте соединение с СУЗ", ToastKind.WARNING)
             return
-        self.template_hint.setStyleSheet("" if allowed
-                                         else f"color: {Palette.WARNING};")
-        self.template_hint.setText(
-            "Шаблон — из справочника СУЗ для этой товарной группы"
-            if allowed else
-            "Этой группы нет в справочнике шаблонов — номер возьмите в личном "
-            "кабинете СУЗ")
+        # Контактным лицом заказа по умолчанию идёт владелец выбранного
+        # сертификата: это он и есть, а набирать своё имя руками — лишнее действие.
+        owner = next((item.owner for item in self._certificates
+                      if item.thumbprint == self.thumbprint),
+                     self._certificates[0].owner if self._certificates else "")
+        dialog = OrderDialog(self._orders, bool(self.thumbprint), owner, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.create_order(dialog.request)
 
-    def _template_id(self) -> int:
-        """Выбранный шаблон. У незнакомой группы список правится руками."""
-        chosen = self.template_box.currentData()
-        if chosen is not None:
-            return int(chosen)
-        return _number(self.template_box.currentText())
-
-    def add_line(self) -> None:
-        row = self.lines.rowCount()
-        self.lines.insertRow(row)
-        self.lines.setItem(row, 0, QTableWidgetItem(""))
-        self.lines.setItem(row, 1, QTableWidgetItem("0"))
-        self.lines.editItem(self.lines.item(row, 0))
-
-    def remove_line(self) -> None:
-        if (row := self.lines.currentRow()) >= 0:
-            self.lines.removeRow(row)
-        self._sync_order_hint()
-
-    def create_order(self) -> None:
+    def create_order(self, request: "orders_module.Request") -> None:
         """Заводит заказ — единственная здесь операция, которая тратит деньги.
 
         Подтверждение спрашивается всегда, даже в песочнице: привычка нажимать
         не глядя вырабатывается там, а срабатывает в бою.
         """
-        request = self.order_request
         if problems := request.problems:
             self.notify(f"Заказ не отправлен: {problems[0]}", ToastKind.WARNING)
-            self._sync_order_hint()
             return
         if not self.thumbprint:
             # Заказ подписывается, и сказать об этом нужно до подтверждения, а
             # не после отказа СУЗ.
             self.notify("Заказ подписывается — выберите сертификат на вкладке "
                         "«Проверка кодов»", ToastKind.WARNING)
-            self._sync_order_hint()
             return
         if OrderConfirmDialog(request, self.contour, self).exec() != \
                 QDialog.DialogCode.Accepted:
             return
         self._set_busy(True)
+        self.order_hint.setStyleSheet("")
         self.order_hint.setText("Отправляем заказ в «Честный ЗНАК»…")
         run_task(
             service.create_suz_order,
@@ -1311,7 +1229,7 @@ class MarkingPage(QWidget):
         order_id, credentials = outcome
         self._set_busy(False)
         self._show_suz(service.save_suz(credentials, self.contour))
-        self.lines.setRowCount(0)
+        self.order_hint.setStyleSheet("")
         self.order_hint.setText(f"Заказ создан: {order_id}")
         self.notify(f"Заказ кодов создан: {order_id}", ToastKind.SUCCESS)
         self.reload_orders()
@@ -1324,22 +1242,6 @@ class MarkingPage(QWidget):
         # Список обновляется в любом случае: если связь оборвалась, заказ мог
         # быть создан, и увидеть это нужно до того, как захочется повторить.
         self.reload_orders()
-
-    def _sync_order_hint(self) -> None:
-        request = self.order_request
-        problems = list(request.problems)
-        if not self.thumbprint:
-            problems.append("не выбран сертификат, а заказ подписывается")
-        if problems:
-            self.order_hint.setStyleSheet(f"color: {Palette.WARNING};")
-            self.order_hint.setText("Пока нельзя отправить: " + "; ".join(problems) + ".")
-            return
-        self.order_hint.setStyleSheet("")
-        self.order_hint.setText(
-            f"К заказу: {_plural(len(request.lines), 'товар', 'товара', 'товаров')}, "
-            f"{_plural(request.total, 'код', 'кода', 'кодов')}. При отправке "
-            "КриптоПро попросит пароль к контейнеру — заказ подписывается. "
-            "Отменить созданный заказ нельзя.")
 
     def reload_orders(self) -> None:
         """Перечитывает заказы. Чтение — ничего не создаёт и кодов не тратит."""
@@ -1387,8 +1289,6 @@ class MarkingPage(QWidget):
                 self.orders.item(row, 5).setForeground(QColor(Palette.DANGER))
         self.orders_button.setEnabled(True)
         self._sync_orders_hint()
-        # В прочитанных заказах и лежит ответ на вопрос «какой шаблон».
-        self._sync_template()
 
     def _on_orders_error(self, message: str) -> None:
         self.orders_button.setEnabled(True)
@@ -1421,6 +1321,338 @@ class MarkingPage(QWidget):
         self.orders_hint.setText(
             f"Заказов: {len(self._orders)} · кодов доступно к получению: {left}."
             f"{tail}")
+
+    # --- получение кодов, печать, ввод в оборот ---------------------------------------
+
+    def _selected_order(self):
+        row = self.orders.currentRow()
+        return self._orders[row] if 0 <= row < len(self._orders) else None
+
+    def _adopt_credentials(self, credentials: Credentials) -> None:
+        """Токен мог обновиться по дороге — в поле должен лежать настоящий."""
+        if credentials.token != self.suz_credentials.stripped().token:
+            self._show_suz(credentials)
+            self.notify("Токен СУЗ обновлён по сертификату", ToastKind.INFO)
+
+    def fetch_codes(self) -> None:
+        """Забирает коды из буфера выбранного заказа.
+
+        Сначала читаются названия и ТН ВЭД товаров — это ничего не расходует, —
+        и только потом человеку предлагается решение, которое нельзя отменить.
+        """
+        order = self._selected_order()
+        if order is None:
+            self.notify("Выберите заказ в списке", ToastKind.WARNING)
+            return
+        if not any(buffer.left > 0 for buffer in order.buffers):
+            self.notify("В выбранном заказе нет кодов для получения",
+                        ToastKind.WARNING)
+            return
+        if not self.suz_credentials.stripped().filled:
+            self.notify("Сначала настройте соединение с СУЗ", ToastKind.WARNING)
+            return
+        self._set_busy(True)
+        self.orders_hint.setText("Читаем сведения о товарах заказа…")
+        run_task(
+            service.suz_product_info,
+            self.suz_credentials, order.id, self.contour, self.thumbprint,
+            self.settings.marking_inn,
+            on_result=lambda outcome: self._ask_fetch(order, outcome),
+            on_error=self._on_fetch_error,
+        )
+
+    def _ask_fetch(self, order, outcome: tuple) -> None:
+        products, credentials = outcome
+        self._set_busy(False)
+        self._adopt_credentials(credentials)
+        self._sync_orders_hint()
+        dialog = IssueDialog(order, products, self.contour, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._set_busy(True)
+        self.orders_hint.setText("Получаем коды и сохраняем их на диск…")
+        run_task(
+            service.fetch_suz_codes,
+            self.suz_credentials, order.id, dialog.gtin, dialog.count,
+            self.contour, self.thumbprint, self.settings.marking_inn,
+            product=dialog.product, product_group=order.product_group,
+            release_method=str(order.raw.get("releaseMethodType") or ""),
+            on_result=self._on_codes_fetched,
+            on_error=self._on_fetch_error,
+        )
+
+    def _on_codes_fetched(self, outcome: tuple) -> None:
+        batch, credentials = outcome
+        self._set_busy(False)
+        self._adopt_credentials(credentials)
+        self.reload_batches(select=batch.id)
+        self.reload_orders()
+        self.order_tabs.setCurrentIndex(1)
+        self.notify(f"Получено кодов: {batch.total}. Сохранены на диск: "
+                    f"{issue_module.folder()}", ToastKind.SUCCESS)
+        self.print_batch()
+
+    def _on_fetch_error(self, message: str) -> None:
+        self._set_busy(False)
+        self._sync_orders_hint()
+        self.notify(f"Коды не получены: {message}", ToastKind.ERROR)
+        # Если связь оборвалась на выдаче, блок мог уйти — показать актуальное.
+        self.reload_batches()
+        self.reload_orders()
+
+    def recover_codes(self) -> None:
+        """Возвращает блоки, которые СУЗ выдала, а здесь их нет."""
+        order = self._selected_order()
+        if order is None:
+            self.notify("Выберите заказ в списке", ToastKind.WARNING)
+            return
+        gtins = [buffer.gtin for buffer in order.buffers
+                 if buffer.gtin and buffer.passed > 0]
+        if not gtins:
+            self.notify("Из этого заказа коды ещё не выдавались — восстанавливать "
+                        "нечего", ToastKind.INFO)
+            return
+        self._set_busy(True)
+        self.orders_hint.setText("Ищем выданные блоки, которых нет на этом компьютере…")
+        run_task(
+            service.recover_order_codes,
+            self.suz_credentials, order.id, gtins, self.contour, self.thumbprint,
+            self.settings.marking_inn,
+            product_group=order.product_group,
+            release_method=str(order.raw.get("releaseMethodType") or ""),
+            on_result=self._on_codes_recovered,
+            on_error=self._on_recover_error,
+        )
+
+    def _on_codes_recovered(self, outcome: tuple) -> None:
+        restored, credentials = outcome
+        self._set_busy(False)
+        self._adopt_credentials(credentials)
+        self._sync_orders_hint()
+        self.reload_batches(select=restored[0].id if restored else "")
+        if restored:
+            self.order_tabs.setCurrentIndex(1)
+            self.notify(f"Восстановлено блоков: {len(restored)} · кодов: "
+                        f"{sum(batch.total for batch in restored)}",
+                        ToastKind.SUCCESS)
+        else:
+            self.notify("Все выданные блоки уже сохранены на этом компьютере",
+                        ToastKind.INFO)
+
+    def _on_recover_error(self, message: str) -> None:
+        self._set_busy(False)
+        self._sync_orders_hint()
+        self.notify(
+            f"Блоки не восстановлены: {message}. Вернуть можно только пока заказ "
+            "не закрыт и коды первый раз забирались через API.", ToastKind.ERROR)
+
+    def reload_batches(self, select: str = "") -> None:
+        """Перечитывает сохранённые блоки с диска."""
+        chosen = self._selected_batch() if not select else None
+        current = select or (chosen.id if chosen else "")
+        self._batches = issue_module.saved()
+        self.batches.setRowCount(len(self._batches))
+        for row, batch in enumerate(self._batches):
+            stamp = issue_module.parse_stamp(batch.created)
+            when = f"{stamp:%d.%m.%Y %H:%M}" if stamp else "—"
+            product = f"{batch.name} · {batch.gtin}" if batch.name else batch.gtin
+            done = f"{batch.printed} из {batch.total}"
+            introduced = _introduced_text(batch)
+            for column, text in enumerate((when, product, str(batch.total), done,
+                                           introduced)):
+                cell = QTableWidgetItem(text)
+                if column in (2, 3):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                self.batches.setItem(row, column, cell)
+            if batch.printed >= batch.total:
+                self.batches.item(row, 3).setForeground(QColor(Palette.SUCCESS))
+            elif batch.printed:
+                self.batches.item(row, 3).setForeground(QColor(Palette.WARNING))
+            if batch.id == current:
+                self.batches.selectRow(row)
+        self._sync_batches_hint()
+
+    def _selected_batch(self):
+        row = self.batches.currentRow()
+        return self._batches[row] if 0 <= row < len(self._batches) else None
+
+    def _sync_batches_hint(self) -> None:
+        batch = self._selected_batch()
+        if not self._batches:
+            self.batches_hint.setText(
+                "Блоков нет. Выберите заказ на соседней вкладке и нажмите «Получить "
+                "коды…» — они сохранятся на диск и появятся здесь.")
+            return
+        if batch is None:
+            self.batches_hint.setText(
+                f"Блоков: {len(self._batches)}. Выберите блок, чтобы напечатать "
+                "его или подготовить файл ввода в оборот.")
+            return
+        tail = (" Напечатано не всё — «Печать…» продолжит с первой ненапечатанной."
+                if 0 < batch.printed < batch.total else "")
+        self.batches_hint.setText(
+            f"Выбран блок на {batch.total} кодов, напечатано {batch.printed}."
+            f"{tail}")
+
+    def print_batch(self) -> None:
+        batch = self._selected_batch()
+        if batch is None:
+            self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
+            return
+        PrintDialog(batch, self).exec()
+        self.reload_batches(select=batch.id)
+
+    def _send_problem(self, batch: issue_module.Batch) -> dict[str, str]:
+        """Почему этот блок нельзя отправить из программы, по видам документа.
+
+        Пустая строка — можно. Условия общие (контур, сертификат, вход), а вот
+        поддержка товарной группы у остатков своя: тип документа проверен только
+        для лёгкой промышленности.
+        """
+        common = ""
+        if batch.contour and batch.contour != self.contour.value:
+            common = (f"блок получен в контуре «{_contour_title(batch.contour)}», а "
+                      f"выбран «{self.contour.title}».")
+        elif not self.thumbprint:
+            common = "не выбран сертификат, а документ подписывается."
+        elif not service.signed_in():
+            common = ("не выполнен вход по сертификату — документ уходит от имени "
+                      "организации. Войдите на вкладке «Проверка кодов».")
+        elif service.current().contour != self.contour:
+            common = "вход выполнен в другом контуре — войдите заново."
+        problems = {"remark": common, "ostatky": common}
+        if not common:
+            try:
+                introduce_module.document_type(batch.product_group)
+            except introduce_module.IntroduceProblem as error:
+                problems["ostatky"] = str(error)
+        return problems
+
+    def introduce_batch(self) -> None:
+        """Ввод в оборот: отправка документа из программы или сохранение файла."""
+        batch = self._selected_batch()
+        if batch is None:
+            self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
+            return
+        # Документ отправляется от имени организации, под которой выполнен вход:
+        # её ИНН и подставляется. Набирать его руками значит ошибиться в цифре.
+        inn = (service.current().inn if service.signed_in() else "") \
+            or self.settings.marking_inn
+        dialog = IntroduceDialog(batch, inn, self.contour, self._send_problem(batch),
+                                 self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
+            self.reload_batches(select=batch.id)
+            return
+        if dialog.action == "file":
+            self.reload_batches(select=batch.id)
+            self.notify(f"Файл ввода в оборот сохранён: {dialog.saved_path}. "
+                        "Загрузите его в личном кабинете системы маркировки.",
+                        ToastKind.SUCCESS)
+            return
+        if dialog.action == "send":
+            self._send_document(batch, dialog.document, dialog.covered)
+
+    def _send_document(self, batch: issue_module.Batch,
+                       document: "introduce_module.Document", covered: int) -> None:
+        """Отправляет документ и ждёт итога. Номер сохраняется сразу после создания."""
+        self._set_busy(True)
+        self.batches_hint.setStyleSheet("")
+        self.batches_hint.setText(
+            "Подписываем и отправляем документ — КриптоПро может спросить пароль…")
+
+        def created(doc_id: str) -> None:
+            # Номер документа — единственное, по чему потом узнают его судьбу.
+            issue_module.mark_sent(batch, doc_id, covered)
+
+        run_task(
+            introduce_module.send,
+            document, self.thumbprint, batch.product_group, self.contour,
+            on_created=created,
+            on_result=lambda sent: self._on_document_sent(batch, sent),
+            on_error=lambda message: self._on_document_error(batch, message),
+        )
+
+    def _on_document_sent(self, batch: issue_module.Batch,
+                          sent: "introduce_module.Sent") -> None:
+        self._set_busy(False)
+        # Файл на диске мог обновиться в фоне — берём его, а не устаревший объект.
+        fresh = issue_module.load(batch.id) or batch
+        if sent.status.code:
+            issue_module.mark_status(fresh, sent.status.code, sent.status.failed)
+        self.reload_batches(select=batch.id)
+        self._report_document(sent.doc_id, sent.status)
+
+    def _report_document(self, doc_id: str, status: "introduce_module.DocStatus") -> None:
+        if status.done:
+            self.batches_hint.setStyleSheet("")
+            self.batches_hint.setText(f"Документ {doc_id}: {status.title}.")
+            self.notify(f"Ввод в оборот выполнен: {status.title}. Документ {doc_id}",
+                        ToastKind.SUCCESS)
+        elif status.failed:
+            self.batches_hint.setStyleSheet(f"color: {Palette.DANGER};")
+            self.batches_hint.setText(f"Документ {doc_id}: {status.text}")
+            self.notify(f"Ввод в оборот не выполнен. Документ {doc_id}: {status.text}",
+                        ToastKind.ERROR)
+        elif status.errors and not status.code:
+            # Статус не получен — это не отказ: документ создан, и чем он
+            # закончился, неизвестно. Объявить его невыполненным значило бы
+            # подтолкнуть к повторной отправке.
+            reason = "; ".join(status.errors)
+            self.batches_hint.setStyleSheet(f"color: {Palette.WARNING};")
+            self.batches_hint.setText(
+                f"Документ {doc_id} создан, но узнать его статус не удалось ({reason}). "
+                "Не отправляйте повторно: посмотрите статус кнопкой «Статус документа» "
+                "или в личном кабинете.")
+            self.notify(f"Документ {doc_id} создан, но его статус не получен: {reason}. "
+                        "Повторно не отправляйте.", ToastKind.WARNING)
+        else:
+            self.batches_hint.setStyleSheet(f"color: {Palette.WARNING};")
+            self.batches_hint.setText(
+                f"Документ {doc_id} создан, итога пока нет: {status.text}. "
+                "Нажмите «Статус документа» через минуту-другую.")
+            self.notify(f"Документ {doc_id} создан, итога пока нет ({status.title}). "
+                        "Проверьте статус позже.", ToastKind.WARNING)
+
+    def _on_document_error(self, batch: issue_module.Batch, message: str) -> None:
+        self._set_busy(False)
+        self.reload_batches(select=batch.id)
+        self.batches_hint.setStyleSheet(f"color: {Palette.DANGER};")
+        self.batches_hint.setText(f"Документ не отправлен: {message}")
+        self.notify(f"Документ не отправлен: {message}", ToastKind.ERROR)
+
+    def refresh_document_status(self) -> None:
+        """Спрашивает, чем закончилась проверка отправленного документа."""
+        batch = self._selected_batch()
+        if batch is None or not batch.doc_id:
+            self.notify("У выбранного блока нет отправленного документа",
+                        ToastKind.WARNING)
+            return
+        if not service.signed_in():
+            self.notify("Войдите по сертификату на вкладке «Проверка кодов»",
+                        ToastKind.WARNING)
+            return
+        self._set_busy(True)
+        run_task(
+            introduce_module.status, batch.doc_id, batch.product_group, self.contour,
+            on_result=lambda status: self._on_status(batch, status),
+            on_error=lambda message: self._on_document_error(batch, message),
+        )
+
+    def _on_status(self, batch: issue_module.Batch,
+                   status: "introduce_module.DocStatus") -> None:
+        self._set_busy(False)
+        fresh = issue_module.load(batch.id) or batch
+        if status.code:
+            issue_module.mark_status(fresh, status.code, status.failed)
+        self.reload_batches(select=batch.id)
+        self._report_document(batch.doc_id, status)
+
+    def open_batches_folder(self) -> None:
+        folder = issue_module.folder()
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _show_suz(self, credentials: Credentials) -> None:
         """Возвращает в поля то, что действительно сохранено."""
@@ -2138,26 +2370,22 @@ class MarkingPage(QWidget):
                 f"настоящих кодов переключите контур на боевой.{chosen}")
 
 
-def _plural(count: int, one: str, few: str, many: str) -> str:
-    """Число со словом в правильном падеже: «1 товар», «2 товара», «5 товаров».
-
-    Сводку перед заказом читают, чтобы поймать ошибку, и «1 товаров» отвлекает
-    ровно в тот момент, когда отвлекаться нельзя.
-    """
-    tail, hundred = count % 10, count % 100
-    if tail == 1 and hundred != 11:
-        word = one
-    elif 2 <= tail <= 4 and not 12 <= hundred <= 14:
-        word = few
-    else:
-        word = many
-    return f"{count} {word}"
+def _contour_title(value: str) -> str:
+    return Contour.PRODUCTION.title if value == Contour.PRODUCTION.value \
+        else Contour.SANDBOX.title
 
 
-def _number(text: str) -> int:
-    """Число из ячейки таблицы. Всё, что не число, — ноль, а не исключение."""
-    digits = "".join(ch for ch in str(text) if ch.isdigit())
-    return int(digits) if digits else 0
+def _introduced_text(batch: issue_module.Batch) -> str:
+    """Что показать в колонке «Ввод в оборот»."""
+    if batch.doc_id:
+        code = batch.doc_status
+        title = introduce_module.STATUS_TITLES.get(code.upper(), code) \
+            if code else "статус неизвестен"
+        return f"{title} · {batch.introduced_count} из {batch.total}"
+    if batch.introduced:
+        moment = issue_module.parse_stamp(batch.introduced)
+        return f"файл {moment:%d.%m %H:%M}" if moment else "файл готов"
+    return "—"
 
 
 def _life(credentials: Credentials) -> str:

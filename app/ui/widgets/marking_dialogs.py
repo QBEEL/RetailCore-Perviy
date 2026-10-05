@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -209,11 +210,19 @@ class OrderConfirmDialog(QDialog):
         root.addWidget(SectionTitle(
             f"Заказать {request.total} кодов · {contour.title}"))
 
-        rows = QVBoxLayout()
-        rows.setSpacing(4)
-        for line in request.lines:
-            rows.addWidget(Hint(f"{line.gtin} — {line.quantity} шт."))
-        root.addLayout(rows)
+        # Список прокручивается: заказывают десятки товаров, и окно во всю
+        # высоту экрана с кнопкой подтверждения за краем — худшее, что можно
+        # сделать с решением, которое нельзя отменить.
+        rows = QPlainTextEdit(self)
+        rows.setReadOnly(True)
+        rows.setPlainText(chr(10).join(f"{line.gtin} — {line.quantity} шт."
+                                    for line in request.lines))
+        font = rows.font()
+        font.setPointSize(font.pointSize() + 2)
+        rows.setFont(font)
+        rows.setMinimumHeight(90)
+        rows.setMaximumHeight(280)
+        root.addWidget(rows)
 
         root.addWidget(Hint(f"Способ выпуска: {request.method.title}. "
                             f"Товарная группа: {request.product_group}. "

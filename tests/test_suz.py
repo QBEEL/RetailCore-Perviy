@@ -306,10 +306,10 @@ def test_токен_добывается_подписью_а_не_перенос
     monkeypatch.setattr(suz.crypto, "find", lambda thumbprint: object())
     monkeypatch.setattr(suz.crypto, "sign", lambda data, thumbprint: f"подпись({data})")
 
-    token = suz.sign_in("ААББ", contour=Contour.SANDBOX)
+    token = suz.sign_in("ААББ", contour=Contour.SANDBOX, connection_id=CONNECTION)
 
     assert token == "выданный-токен"
-    assert calls[0].full_url.endswith("/api/v3/auth/key")
+    assert calls[0].full_url.endswith("/api/v3/true-api/auth/key")
     assert json.loads(calls[1].data) == {"uuid": "u-1", "data": "подпись(подписать-это)"}
 
 
@@ -364,9 +364,8 @@ def test_отказ_по_учётным_данным_отличён_от_про�
     assert not suz.stale(transport.Offline("сети нет"))
 
 
-def test_идентификатор_соединения_уходит_в_запрос_токена(sent, monkeypatch):
-    """Токен выдаётся под конкретное устройство — без соединения запрос не о чем."""
-    calls, _ = sent
+def _stub_sign_in(monkeypatch):
+    calls: list = []
     answers = [{"uuid": "u-1", "data": "подписать"}, {"token": "выданный"}]
 
     def send(prepared, tolerate=()):
@@ -376,14 +375,38 @@ def test_идентификатор_соединения_уходит_в_зап�
     monkeypatch.setattr(transport, "_send", send)
     monkeypatch.setattr(suz.crypto, "find", lambda thumbprint: object())
     monkeypatch.setattr(suz.crypto, "sign", lambda data, thumbprint: "подпись")
+    return calls
+
+
+def test_идентификатор_соединения_входит_в_адрес_запроса_токена(monkeypatch):
+    """Руководство СУЗ 9.3.2: True API, `/auth/simpleSignIn/{omsConnection}`."""
+    calls = _stub_sign_in(monkeypatch)
 
     suz.sign_in("ААББ", contour=Contour.SANDBOX, connection_id=CONNECTION)
 
-    body = json.loads(calls[1].data)
-    assert body["omsConnection"] == CONNECTION
-    # И параметром тоже: какое из двух мест верное, из чужой библиотеки не
-    # видно, а каждая попытка стоит человеку пароля к контейнеру.
-    assert f"omsConnection={CONNECTION}" in calls[1].full_url
+    assert calls[1].full_url.endswith(f"/api/v3/true-api/auth/simpleSignIn/{CONNECTION}")
+    assert "omsConnection" not in json.loads(calls[1].data)
+
+
+def test_инн_организации_уходит_в_теле_запроса_токена(monkeypatch):
+    """Вход физлица по доверенности: ИНН организации — поле `inn` (таблица 384)."""
+    calls = _stub_sign_in(monkeypatch)
+
+    suz.sign_in("ААББ", "250101802801", Contour.SANDBOX, CONNECTION)
+
+    assert json.loads(calls[1].data)["inn"] == "250101802801"
+
+
+def test_без_идентификатора_соединения_подпись_не_запрашивается(monkeypatch):
+    """Каждая попытка стоит пароля к контейнеру — отказ должен быть до неё."""
+    signed: list = []
+    monkeypatch.setattr(suz.crypto, "find", lambda thumbprint: object())
+    monkeypatch.setattr(suz.crypto, "sign",
+                        lambda data, thumbprint: signed.append(data) or "подпись")
+
+    with pytest.raises(transport.MarkingError, match="идентификатор соединения"):
+        suz.sign_in("ААББ", contour=Contour.SANDBOX)
+    assert signed == []
 
 
 # --- обновление протухшего токена -------------------------------------------------

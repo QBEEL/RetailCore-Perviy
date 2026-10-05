@@ -773,11 +773,14 @@ def confirm(monkeypatch):
     return box
 
 
-def _order_form(page, gtin="04601234567893", quantity="500") -> None:
-    page.contact_edit.setText("Иванов Евгений")
-    page.add_line()
-    page.lines.item(0, 0).setText(gtin)
-    page.lines.item(0, 1).setText(quantity)
+def _request(gtin="04601234567893", quantity=500, *extra):
+    """Заказ, каким его собирает окно заказа."""
+    from app.core.marking.orders import Line, Request
+
+    lines = [Line(gtin=gtin, quantity=quantity, template_id=9)]
+    lines += [Line(gtin=g, quantity=q, template_id=9) for g, q in extra]
+    return Request(product_group="perfumery", method=ReleaseMethod.REMAINS,
+                   contact="Иванов Евгений", lines=lines)
 
 
 def test_заказ_спрашивает_подтверждение_и_показывает_что_уйдёт(application, tmp_path,
@@ -786,14 +789,29 @@ def test_заказ_спрашивает_подтверждение_и_пока�
     calls, state = stub
     state["suz"] = {Contour.SANDBOX: SUZ}
     page = _page(application, tmp_path)
-    _order_form(page)
 
-    page.create_order()
+    page.create_order(_request())
     _settle(application)
 
     assert confirm["shown"].total == 500
     assert confirm["shown"].lines[0].gtin == "04601234567893"
     assert len(calls["ordered"]) == 1
+
+
+def test_несколько_товаров_уходят_одним_заказом(application, tmp_path, stub, confirm):
+    calls, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    page = _page(application, tmp_path)
+
+    page.create_order(_request("04601234567893", 100, ("04607177964080", 250),
+                               ("04600000000007", 30)))
+    _settle(application)
+
+    assert len(calls["ordered"]) == 1
+    sent = calls["ordered"][0][0]
+    assert [line.gtin for line in sent.lines] == [
+        "04601234567893", "04607177964080", "04600000000007"]
+    assert sent.total == 380
 
 
 def test_отказ_в_подтверждении_ничего_не_отправляет(application, tmp_path, stub,
@@ -802,9 +820,8 @@ def test_отказ_в_подтверждении_ничего_не_отправ
     state["suz"] = {Contour.SANDBOX: SUZ}
     confirm["result"] = 0
     page = _page(application, tmp_path)
-    _order_form(page)
 
-    page.create_order()
+    page.create_order(_request())
     _settle(application)
 
     assert calls["ordered"] == []
@@ -816,31 +833,24 @@ def test_негодный_заказ_не_доходит_до_подтвержд
     calls, state = stub
     state["suz"] = {Contour.SANDBOX: SUZ}
     page = _page(application, tmp_path)
-    _order_form(page)
-    page.add_line()
-    page.lines.item(1, 0).setText("04601234567893")
-    page.lines.item(1, 1).setText("10")
 
-    page.create_order()
+    page.create_order(_request("04601234567893", 500, ("04601234567893", 10)))
     _settle(application)
 
     assert confirm["shown"] is None
     assert calls["ordered"] == []
-    assert "одинаковые коды товаров" in page.order_hint.text().lower()
 
 
-def test_созданный_заказ_очищает_строки_и_обновляет_список(application, tmp_path,
+def test_созданный_заказ_сообщает_номер_и_обновляет_список(application, tmp_path,
                                                            stub, confirm):
     calls, state = stub
     state["suz"] = {Contour.SANDBOX: SUZ}
     page = _page(application, tmp_path)
-    _order_form(page)
     asked = len(calls["orders_asked"])
 
-    page.create_order()
+    page.create_order(_request())
     _settle(application)
 
-    assert page.lines.rowCount() == 0
     assert "новый-заказ" in page.order_hint.text()
     assert len(calls["orders_asked"]) > asked
 
@@ -853,92 +863,15 @@ def test_неизвестный_исход_заказа_ведёт_к_списк
     state["order_error"] = ("Связь оборвалась, и что стало с заказом — неизвестно. "
                             "Обновите список заказов")
     page = _page(application, tmp_path)
-    _order_form(page)
     asked = len(calls["orders_asked"])
 
-    page.create_order()
+    page.create_order(_request())
     _settle(application)
 
     assert "неизвестно" in page.order_hint.text()
     # Список перечитан сам: заказ мог быть создан, и увидеть это нужно до того,
     # как захочется нажать ещё раз.
     assert len(calls["orders_asked"]) > asked
-
-
-def test_производство_названо_неготовым_на_экране(application, tmp_path, stub):
-    _, state = stub
-    state["suz"] = {Contour.SANDBOX: SUZ}
-    page = _page(application, tmp_path)
-    _order_form(page)
-    page.method_box.setCurrentIndex(
-        page.method_box.findData(ReleaseMethod.PRODUCTION.value))
-
-    assert "производственной площадке" in page.order_hint.text()
-
-
-def test_сводка_заказа_согласована_по_числам(application, tmp_path, stub):
-    """«1 товаров» отвлекает ровно там, где отвлекаться нельзя."""
-    from app.ui.marking_page import _plural
-
-    assert _plural(1, "товар", "товара", "товаров") == "1 товар"
-    assert _plural(3, "товар", "товара", "товаров") == "3 товара"
-    assert _plural(5, "код", "кода", "кодов") == "5 кодов"
-    assert _plural(11, "код", "кода", "кодов") == "11 кодов"
-    assert _plural(21, "код", "кода", "кодов") == "21 код"
-
-    _, state = stub
-    state["suz"] = {Contour.SANDBOX: SUZ}
-    page = _page(application, tmp_path)
-    _order_form(page, quantity="500")
-
-    assert "1 товар," in page.order_hint.text()
-    assert "500 кодов" in page.order_hint.text()
-
-
-def test_шаблон_подставляется_из_прошлого_заказа_и_объясняется(application, tmp_path,
-                                                               stub):
-    """Число «10» само по себе не значит ничего — важно, откуда оно взялось."""
-    from datetime import datetime
-
-    _, state = stub
-    state["suz"] = {Contour.SANDBOX: SUZ}
-    past = Order(id="з-1", status="READY", product_group="lp",
-                 created_at=datetime(2026, 8, 3), raw={"paymentType": 2})
-    past.buffers = [Buffer(gtin="046", raw={"templateId": 14})]
-    state["orders"] = [past]
-    page = _page(application, tmp_path)
-    _settle(application)
-
-    page.group_box.setCurrentIndex(page.group_box.findData("lp"))
-
-    # Справочник для «lp» знает шаблон 10, но СУЗ однажды приняла 14 —
-    # реальность старше документа, и выбран именно он.
-    assert page.template_box.currentData() == 14
-    assert page.payment_box.value() == 2
-    assert "03.08.2026" in page.template_hint.text()
-    assert page.order_request.problems == () or "шаблон" not in         " ".join(page.order_request.problems)
-
-
-def test_группа_без_истории_берёт_шаблон_из_справочника(application, tmp_path, stub):
-    """Именно на этом и споткнулся первый заказ: духам подставлялся шаблон «lp»."""
-    from datetime import datetime
-
-    _, state = stub
-    state["suz"] = {Contour.SANDBOX: SUZ}
-    past = Order(id="з-1", status="READY", product_group="lp",
-                 created_at=datetime(2026, 8, 3), raw={"paymentType": 2})
-    past.buffers = [Buffer(gtin="046", raw={"templateId": 10})]
-    state["orders"] = [past]
-    page = _page(application, tmp_path)
-    _settle(application)
-
-    page.group_box.setCurrentIndex(page.group_box.findData("perfumery"))
-
-    assert page.template_box.currentData() == 9
-    assert "справочника СУЗ" in page.template_hint.text()
-    # И номер не единственное, что видно: шаблоны различаются длиной серийного
-    # номера и криптохвостом, это и написано в строке.
-    assert "серийный номер 13 знаков" in page.template_box.currentText()
 
 
 def test_заказ_без_сертификата_не_доходит_до_подтверждения(application, tmp_path,
@@ -948,11 +881,402 @@ def test_заказ_без_сертификата_не_доходит_до_по�
     state["suz"] = {Contour.SANDBOX: SUZ}
     state["certificates"] = []
     page = _page(application, tmp_path)
-    _order_form(page)
 
-    page.create_order()
+    page.create_order(_request())
     _settle(application)
 
     assert confirm["shown"] is None
     assert calls["ordered"] == []
-    assert "не выбран сертификат" in page.order_hint.text()
+
+
+def test_окно_заказа_открывается_из_страницы_и_отправляет_собранное(
+        application, tmp_path, stub, confirm, monkeypatch):
+    from app.ui import marking_page
+
+    calls, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    seen: dict = {}
+
+    class FakeOrder:
+        def __init__(self, orders, has_certificate, contact="", parent=None):
+            seen["orders"] = list(orders)
+            seen["certificate"] = has_certificate
+            seen["contact"] = contact
+
+        def exec(self):
+            return 1
+
+        request = _request("04601234567893", 40, ("04607177964080", 60))
+
+    monkeypatch.setattr(marking_page, "OrderDialog", FakeOrder)
+    page = _page(application, tmp_path)
+    _settle(application)
+
+    page.new_order()
+    _settle(application)
+
+    # Окну отдаётся то, что нужно для подсказок: заказы, сертификат и имя.
+    assert seen["certificate"] is True
+    assert seen["contact"] == "Иванов Евгений"
+    assert calls["ordered"][0][0].total == 100
+
+
+def test_без_реквизитов_суз_окно_заказа_не_открывается(application, tmp_path, stub,
+                                                       monkeypatch):
+    from app.ui import marking_page
+
+    opened: list = []
+    monkeypatch.setattr(marking_page, "OrderDialog",
+                        lambda *args, **kwargs: opened.append(1))
+    page = _page(application, tmp_path)
+
+    page.new_order()
+
+    assert opened == []
+
+
+def test_сводка_заказа_согласована_по_числам():
+    """«1 товаров» отвлекает ровно там, где отвлекаться нельзя."""
+    from app.ui.marking_page import _plural
+
+    assert _plural(1, "товар", "товара", "товаров") == "1 товар"
+    assert _plural(3, "товар", "товара", "товаров") == "3 товара"
+    assert _plural(5, "код", "кода", "кодов") == "5 кодов"
+    assert _plural(11, "код", "кода", "кодов") == "11 кодов"
+    assert _plural(21, "код", "кода", "кодов") == "21 код"
+
+
+# --- получение кодов, печать, ввод в оборот --------------------------------------------
+
+def _issue_page(application, tmp_path, stub, monkeypatch):
+    """Вкладка с заказом в списке и подменёнными окнами получения и печати."""
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    calls, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["orders"] = [_order()]
+    seen: dict = {"fetched": [], "printed": [], "asked": []}
+
+    def product_info(credentials, order_id, contour=Contour.SANDBOX,
+                     thumbprint="", inn=""):
+        seen["asked"].append(order_id)
+        return {"04601234567893": issue.Product(gtin="04601234567893",
+                                                name="Духи", tnved="3303001000")}, \
+            credentials.stripped()
+
+    def fetch(credentials, order_id, gtin, quantity, contour=Contour.SANDBOX,
+              thumbprint="", inn="", *, product=None, product_group="",
+              release_method=""):
+        seen["fetched"].append((order_id, gtin, quantity, product))
+        batch = issue.Batch(id="blk-1", gtin=gtin, name=product.name,
+                            codes=[PERFUME] * quantity, created="2026-10-05T10:00:00")
+        issue.save(batch)
+        return batch, credentials.stripped()
+
+    class FakeIssue:
+        def __init__(self, order, products, contour, parent=None):
+            seen["dialog_products"] = dict(products)
+
+        def exec(self):
+            return 1
+
+        gtin = "04601234567893"
+        count = 3
+        product = issue.Product(gtin="04601234567893", name="Духи", tnved="3303001000")
+
+    class FakePrint:
+        def __init__(self, batch, parent=None):
+            seen["printed"].append(batch.id)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(marking_page.service, "suz_product_info", product_info)
+    monkeypatch.setattr(marking_page.service, "fetch_suz_codes", fetch)
+    monkeypatch.setattr(marking_page, "IssueDialog", FakeIssue)
+    monkeypatch.setattr(marking_page, "PrintDialog", FakePrint)
+    page = _page(application, tmp_path)
+    _settle(application)
+    page.orders.selectRow(0)
+    return page, seen
+
+
+def test_коды_забираются_сохраняются_и_сразу_идут_на_печать(application, tmp_path,
+                                                            stub, monkeypatch):
+    page, seen = _issue_page(application, tmp_path, stub, monkeypatch)
+
+    page.fetch_codes()
+    _settle(application)
+
+    assert seen["asked"] == ["3a8f-0001"]
+    assert seen["dialog_products"]["04601234567893"].tnved == "3303001000"
+    assert seen["fetched"][0][:3] == ("3a8f-0001", "04601234567893", 3)
+    # Блок лежит на диске и виден в списке, а окно печати открылось само.
+    assert page.batches.rowCount() == 1
+    assert page.batches.item(0, 2).text() == "3"
+    assert seen["printed"] == ["blk-1"]
+    assert page.order_tabs.currentIndex() == 1
+
+
+def test_без_выбранного_заказа_коды_не_забираются(application, tmp_path, stub,
+                                                  monkeypatch):
+    page, seen = _issue_page(application, tmp_path, stub, monkeypatch)
+    page.orders.clearSelection()
+    page.orders.setCurrentCell(-1, -1)
+
+    page.fetch_codes()
+    _settle(application)
+
+    assert seen["asked"] == [] and seen["fetched"] == []
+
+
+def test_заказ_без_остатка_в_буфере_не_предлагает_получение(application, tmp_path,
+                                                            stub, monkeypatch):
+    _, state = stub
+    state["orders"] = [_order(buffers=[Buffer(gtin="04601234567893", left=0, passed=10,
+                                              total=10, status="EXHAUSTED")])]
+    page, seen = _issue_page(application, tmp_path, stub, monkeypatch)
+    state["orders"] = [_order(buffers=[Buffer(gtin="04601234567893", left=0, passed=10,
+                                              total=10, status="EXHAUSTED")])]
+    page.reload_orders()
+    _settle(application)
+    page.orders.selectRow(0)
+
+    page.fetch_codes()
+    _settle(application)
+
+    assert seen["asked"] == []
+
+
+def test_сохранённые_блоки_видны_после_перезапуска(application, tmp_path, stub,
+                                                   monkeypatch):
+    from app.core.marking import issue
+
+    issue.save(issue.Batch(id="old", gtin="04601234567893", name="Духи",
+                           codes=[PERFUME] * 5, printed=2,
+                           created="2026-10-01T09:00:00"))
+    page = _page(application, tmp_path)
+
+    assert page.batches.rowCount() == 1
+    assert page.batches.item(0, 3).text() == "2 из 5"
+
+
+# --- ввод в оборот из программы --------------------------------------------------------
+
+def _intro_page(application, tmp_path, stub, monkeypatch, *, action="send", group="lp",
+                signed=True, contour=Contour.SANDBOX):
+    """Вкладка с одним блоком кодов и подменёнными окном ввода и отправкой."""
+    from app.core.marking import introduce, issue
+    from app.ui import marking_page
+
+    _, state = stub
+    state["signed"] = signed
+    state["session"].contour = contour
+    batch = issue.Batch(id="blk-9", gtin="04601234567893", name="Колготки",
+                        tnved="6115950000", product_group=group,
+                        contour=Contour.SANDBOX.value, codes=[PERFUME] * 5, printed=5,
+                        created="2026-10-05T10:00:00")
+    issue.save(batch)
+    seen: dict = {"dialogs": [], "sent": []}
+
+    class FakeIntro:
+        def __init__(self, batch, inn, contour, send_problem="", parent=None):
+            seen["dialogs"].append({"inn": inn, "problem": send_problem})
+            self.saved_path = "C:/x.xml"
+            self.covered = 5
+            self.action = action
+            self.document = introduce.Document(
+                "250101802801", "6115950000", tuple(batch.codes))
+
+        def exec(self):
+            return 1
+
+    def send(document, thumbprint, product_group, contour, *, on_created=None, **_):
+        seen["sent"].append((document, thumbprint, product_group, contour))
+        if on_created:
+            on_created("doc-1")
+        return seen["result"]
+
+    seen["result"] = introduce.Sent("doc-1", introduce.DocStatus("CHECKED_OK"))
+    monkeypatch.setattr(marking_page, "IntroduceDialog", FakeIntro)
+    monkeypatch.setattr(marking_page.introduce_module, "send", send)
+    page = _page(application, tmp_path)
+    page.batches.selectRow(0)
+    return page, seen
+
+
+def test_отправленный_документ_запоминается_и_показывает_итог(application, tmp_path,
+                                                             stub, monkeypatch):
+    from app.core.marking import issue
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+
+    page.introduce_batch()
+    _settle(application)
+
+    document, thumbprint, group, contour = seen["sent"][0]
+    assert len(document.codes) == 5 and thumbprint == "ААББ" and group == "lp"
+    saved = issue.load("blk-9")
+    assert saved.doc_id == "doc-1" and saved.introduced_count == 5
+    assert saved.doc_status == "CHECKED_OK"
+    assert "Проверен" in page.batches.item(0, 4).text()
+    assert "5 из 5" in page.batches.item(0, 4).text()
+
+
+def test_номер_документа_сохранён_даже_если_итога_нет(application, tmp_path, stub,
+                                                      monkeypatch):
+    from app.core.marking import introduce, issue
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+    seen["result"] = introduce.Sent("doc-1", introduce.DocStatus("IN_PROGRESS"))
+
+    page.introduce_batch()
+    _settle(application)
+
+    assert issue.load("blk-9").doc_id == "doc-1"
+    assert "итога пока нет" in page.batches_hint.text()
+
+
+def test_отказ_системы_показан_с_причиной(application, tmp_path, stub, monkeypatch):
+    from app.core.marking import introduce
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+    seen["result"] = introduce.Sent("doc-1", introduce.DocStatus(
+        "CHECKED_NOT_OK", ("Код уже в обороте",)))
+
+    page.introduce_batch()
+    _settle(application)
+
+    assert "Код уже в обороте" in page.batches_hint.text()
+
+
+def test_ошибка_отправки_не_помечает_блок_отправленным(application, tmp_path, stub,
+                                                       monkeypatch):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+
+    def failing(*args, **kwargs):
+        raise MarkingError("Подпись невалидна")
+
+    monkeypatch.setattr(marking_page.introduce_module, "send", failing)
+
+    page.introduce_batch()
+    _settle(application)
+
+    assert issue.load("blk-9").doc_id == ""
+    assert "Подпись невалидна" in page.batches_hint.text()
+
+
+def test_сохранение_файла_ничего_не_отправляет(application, tmp_path, stub, monkeypatch):
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch, action="file")
+
+    page.introduce_batch()
+    _settle(application)
+
+    assert seen["sent"] == []
+
+
+def test_без_входа_отправка_запрещена_с_причиной(application, tmp_path, stub,
+                                                monkeypatch):
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch, action="file",
+                             signed=False)
+
+    page.introduce_batch()
+
+    assert "не выполнен вход" in seen["dialogs"][0]["problem"]["remark"]
+    assert "не выполнен вход" in seen["dialogs"][0]["problem"]["ostatky"]
+
+
+def test_группа_без_поддержки_отправки_называет_причину(application, tmp_path, stub,
+                                                       monkeypatch):
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch, action="file",
+                             group="perfumery")
+
+    page.introduce_batch()
+
+    problems = seen["dialogs"][0]["problem"]
+    # Остатки для этой группы не подключены, а перемаркировка — общий документ.
+    assert "не подключена" in problems["ostatky"]
+    assert problems["remark"] == ""
+
+
+def test_блок_из_другого_контура_не_отправляется(application, tmp_path, stub,
+                                                monkeypatch):
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch, action="file")
+    page.contour_box.setCurrentIndex(
+        page.contour_box.findData(Contour.PRODUCTION.value))
+
+    page.batches.selectRow(0)
+    page.introduce_batch()
+
+    assert "в контуре" in seen["dialogs"][0]["problem"]["remark"]
+
+
+def test_инн_берётся_из_выполненного_входа(application, tmp_path, stub, monkeypatch):
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch, action="file")
+
+    page.introduce_batch()
+
+    assert seen["dialogs"][0]["inn"] == "2536000000"
+
+
+def test_статус_документа_обновляется_по_запросу(application, tmp_path, stub,
+                                                monkeypatch):
+    from app.core.marking import introduce, issue
+    from app.ui import marking_page
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+    batch = issue.load("blk-9")
+    issue.mark_sent(batch, "doc-1", 5, "IN_PROGRESS")
+    page.reload_batches(select="blk-9")
+    asked: list = []
+
+    def status(doc_id, group, contour):
+        asked.append((doc_id, group))
+        return introduce.DocStatus("CHECKED_OK")
+
+    monkeypatch.setattr(marking_page.introduce_module, "status", status)
+
+    page.refresh_document_status()
+    _settle(application)
+
+    assert asked == [("doc-1", "lp")]
+    assert issue.load("blk-9").doc_status == "CHECKED_OK"
+
+
+def test_у_блока_без_документа_статус_не_спрашивается(application, tmp_path, stub,
+                                                     monkeypatch):
+    from app.ui import marking_page
+
+    page, _ = _intro_page(application, tmp_path, stub, monkeypatch)
+    asked: list = []
+    monkeypatch.setattr(marking_page.introduce_module, "status",
+                        lambda *args: asked.append(args))
+
+    page.refresh_document_status()
+    _settle(application)
+
+    assert asked == []
+
+
+def test_статус_не_получен_это_не_отказ_и_повторять_не_нужно(application, tmp_path, stub,
+                                                           monkeypatch):
+    """Документ создан; сказать «не выполнен» значило бы толкнуть к повторной отправке."""
+    from app.core.marking import introduce, issue
+
+    page, seen = _intro_page(application, tmp_path, stub, monkeypatch)
+    seen["result"] = introduce.Sent("doc-1", introduce.DocStatus(
+        errors=("статус не получен: Метод с указанным URL не найден",)))
+
+    page.introduce_batch()
+    _settle(application)
+
+    saved = issue.load("blk-9")
+    assert saved.doc_id == "doc-1"
+    # Текст ошибки в колонку статуса не попадает — только настоящий статус.
+    assert saved.doc_status == ""
+    assert "не отправляйте повторно" in page.batches_hint.text().lower()
+    assert "не выполнен" not in page.batches_hint.text().lower()
