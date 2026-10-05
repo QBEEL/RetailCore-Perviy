@@ -161,3 +161,57 @@ def test_клетка_дня_отдаёт_идентификаторы_пере�
     cell.payments_dropped.emit(payment_ids(payment_mime(ids_of(page, "Альфа"))), TARGET, False)
 
     assert seen == [([rows_by_name("Альфа").id], TARGET, False)]
+
+
+# --- проверка дублей ----------------------------------------------------------
+
+def test_кнопка_дублей_видна_только_администратору_общей_базы(page, monkeypatch):
+    from app.core.payments import transport
+
+    assert page._may_check_duplicates()
+    monkeypatch.setattr(transport.session, "token", "t")
+    monkeypatch.setattr(transport.session, "base_url", "http://сервер")
+    monkeypatch.setattr(transport.session, "is_admin", False)
+    assert not page._may_check_duplicates()
+    monkeypatch.setattr(transport.session, "is_admin", True)
+    assert page._may_check_duplicates()
+
+
+def test_окно_дублей_отмечает_уверенные_и_отдаёт_отмеченное(page, monkeypatch):
+    from app.core.payments import duplicates
+    from app.ui.widgets import payment_dialogs
+
+    monkeypatch.setattr(payment_dialogs, "run_task", lambda *args, **kwargs: None)
+    sure = duplicates.Suspect(
+        duplicates.DuplicateKind.DOUBLE, "НеваЛайн ООО",
+        manual=[Payment(id=1, amount=800_000.0, pay_date=DAY, recipient="НеваЛайн ООО")],
+        requests=[Payment(id=2, amount=800_000.0, pay_date=DAY, recipient="НеваЛайн ООО",
+                          doc_number="IP00-1")])
+    doubtful = duplicates.Suspect(
+        duplicates.DuplicateKind.DOUBLE, "Сафило СНГ ООО", confident=False,
+        manual=[Payment(id=3, amount=500_000.0, pay_date=DAY, recipient="Сафило СНГ ООО")],
+        requests=[Payment(id=4, amount=900_000.0, pay_date=DAY, recipient="Сафило СНГ ООО",
+                          doc_number="IP00-2")])
+
+    dialog = payment_dialogs.DuplicatesDialog(parent=page)
+    dialog._found([sure, doubtful])
+
+    assert dialog.tree.topLevelItemCount() == 2
+    assert dialog._checked() == [sure]
+    assert dialog.apply_button.isEnabled()
+    assert dialog.tree.topLevelItem(0).childCount() == 2
+
+    dialog.kind_filter.setCurrentIndex(dialog.kind_filter.findData("check"))
+    assert dialog.tree.topLevelItemCount() == 1
+    assert dialog._checked() == []
+    assert not dialog.apply_button.isEnabled()
+
+
+def test_пустая_проверка_дублей_говорит_что_дублей_нет(page, monkeypatch):
+    from app.ui.widgets import payment_dialogs
+
+    monkeypatch.setattr(payment_dialogs, "run_task", lambda *args, **kwargs: None)
+    dialog = payment_dialogs.DuplicatesDialog(parent=page)
+    dialog._found([])
+    assert "не найдено" in dialog.summary.text()
+    assert not dialog.apply_button.isEnabled()

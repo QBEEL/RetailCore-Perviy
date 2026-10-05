@@ -24,11 +24,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +46,7 @@ from ...core.payments import (
     STATUS_ORDER,
     SupplierStats,
     analytics,
+    duplicates,
     importer,
     planning,
     service,
@@ -1132,6 +1136,220 @@ class RecipientLinkDialog(QDialog):
                 store.save_recipient_link(recipient, supplier_id, self.db_path)
                 self.linked += 1
         self.accept()
+
+
+class DuplicatesDialog(QDialog):
+    """Возможные дубли: ручные записи, на которые в 1С уже есть заявка.
+
+    Поиск ничего не меняет. Отменяется только то, что администратор отметил, и
+    только ручная сторона группы — заявка 1С остаётся как источник истины.
+    """
+
+    resolved = Signal(int, int)
+    open_requested = Signal(object)
+
+    def __init__(self, *, db_path: str | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.db_path = db_path
+        self.suspects: list[duplicates.Suspect] = []
+        self.setWindowTitle("Проверка дублей оплат")
+        self.setMinimumSize(980, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(Metrics.PAD + 4, Metrics.PAD, Metrics.PAD + 4, Metrics.PAD)
+        root.setSpacing(Metrics.GAP)
+        root.addWidget(Hint(
+            "Ищем записи, внесённые в программе вручную, на которые в 1С уже есть заявка: "
+            "та же оплата с датой в пределах трёх дней, счёт, разбитый на части в программе, "
+            "или заявки 1С, разбитые из одной записи. Заявка 1С остаётся, ручная запись "
+            "получает статус «Отменено» с пометкой — комментарий и вложения сохраняются, а "
+            "вернуть её можно сменой статуса. Группы со сходящимися суммами отмечены "
+            "заранее, остальные проверьте и отметьте сами.", self))
+
+        self.progress = QProgressBar(self)
+        self.progress.setRange(0, 0)
+        root.addWidget(self.progress)
+
+        self.summary = QLabel("Ищу дубли…", self)
+        self.summary.setWordWrap(True)
+        root.addWidget(self.summary)
+
+        self.filter_row = QWidget(self)
+        bar = QHBoxLayout(self.filter_row)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.addWidget(QLabel("Показать:", self.filter_row))
+        self.kind_filter = QComboBox(self.filter_row)
+        for title, key in (("Все", ""), ("Уверенные", "sure"), ("Проверьте", "check")):
+            self.kind_filter.addItem(title, key)
+        self.kind_filter.currentIndexChanged.connect(self._fill)
+        bar.addWidget(self.kind_filter)
+        bar.addStretch(1)
+        self.export_button = QPushButton("Сохранить список в Excel", self.filter_row)
+        self.export_button.clicked.connect(self._export)
+        bar.addWidget(self.export_button)
+        self.filter_row.setVisible(False)
+        root.addWidget(self.filter_row)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderLabels(
+            ["Группа / запись", "Дата платежа", "Заявка 1С", "Сумма, ₽", "Статус", "Ответственный"])
+        self.tree.setColumnWidth(0, 470)
+        for column, width in ((1, 100), (2, 110), (3, 100), (4, 110)):
+            self.tree.setColumnWidth(column, width)
+        self.tree.itemChanged.connect(self._checked_changed)
+        self.tree.itemDoubleClicked.connect(self._open_item)
+        self.tree.setVisible(False)
+        root.addWidget(self.tree, 1)
+
+        buttons = QDialogButtonBox(self)
+        self.apply_button = buttons.addButton(QDialogButtonBox.StandardButton.Ok)
+        self.apply_button.setText("Схлопнуть отмеченные")
+        self.apply_button.setObjectName("Primary")
+        self.apply_button.setEnabled(False)
+        buttons.addButton(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
+        buttons.accepted.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        run_task(
+            service.find_duplicates, db_path=db_path,
+            on_result=self._found, on_error=self._failed)
+
+    def _found(self, suspects: list) -> None:
+        self.suspects = list(suspects)
+        self.progress.setVisible(False)
+        if not self.suspects:
+            self.summary.setText("Дублей не найдено.")
+            return
+        self.filter_row.setVisible(True)
+        self.tree.setVisible(True)
+        self._fill()
+
+    def _fill(self) -> None:
+        """Строит дерево с учётом отбора. Галочки возвращаются к рекомендованным."""
+        key = self.kind_filter.currentData()
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        for index, suspect in enumerate(self.suspects):
+            if (key == "sure" and not suspect.confident) or (key == "check" and suspect.confident):
+                continue
+            top = QTreeWidgetItem(self.tree)
+            tag = "" if suspect.confident else "проверьте · "
+            warning = f" · ⚠ {suspect.warning}" if suspect.warning else ""
+            top.setText(0, f"{suspect.recipient} · {tag}{suspect.title}{warning}")
+            top.setFlags(top.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            top.setCheckState(0, Qt.CheckState.Checked if suspect.recommended
+                              else Qt.CheckState.Unchecked)
+            top.setData(0, Qt.ItemDataRole.UserRole, index)
+            top.setForeground(0, QColor(Palette.WARNING if (warning or not suspect.confident)
+                                        else Palette.TEXT))
+            for payment in suspect.manual:
+                self._add_row(top, payment, "Ручная запись — будет отменена")
+            for payment in suspect.requests:
+                self._add_row(top, payment, "Заявка 1С — остаётся")
+            top.setExpanded(True)
+        self.tree.blockSignals(False)
+        self._refresh_summary()
+
+    def _add_row(self, parent: QTreeWidgetItem, payment: Payment, role: str) -> None:
+        item = QTreeWidgetItem(parent, [
+            role,
+            f"{payment.pay_date:%d.%m.%Y}" if payment.pay_date else "",
+            payment.doc_number,
+            money(payment.amount),
+            payment.status.title,
+            payment.responsible,
+        ])
+        item.setData(1, Qt.ItemDataRole.UserRole, payment)
+        item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        item.setForeground(4, QColor(STATUS_COLORS.get(payment.status, Palette.TEXT)))
+        if payment.doc_number:
+            item.setForeground(0, QColor(Palette.SUCCESS))
+
+    def _checked(self) -> list[duplicates.Suspect]:
+        chosen = []
+        for position in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(position)
+            if top.checkState(0) == Qt.CheckState.Checked:
+                chosen.append(self.suspects[int(top.data(0, Qt.ItemDataRole.UserRole))])
+        return chosen
+
+    def _checked_changed(self, *_: object) -> None:
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        if not self.suspects:
+            return
+        chosen = self._checked()
+        extra = sum(s.manual_total for s in chosen)
+        sure = sum(1 for s in self.suspects if s.confident)
+        self.summary.setText(
+            f"Найдено групп: {len(self.suspects)} (сходятся суммы или дата: {sure}) · "
+            f"отмечено {len(chosen)}, лишних в расчётах на {money(extra)} ₽")
+        self.summary.setStyleSheet("")
+        self.apply_button.setEnabled(bool(chosen))
+
+    def _open_item(self, item: QTreeWidgetItem, _column: int) -> None:
+        payment = item.data(1, Qt.ItemDataRole.UserRole)
+        if payment is not None:
+            self.open_requested.emit(payment)
+
+    def _export(self) -> None:
+        if not self.suspects:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить список дублей", "Возможные дубли оплат.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+        titles = ["Группа", "Вид", "Уверенность", "Роль", "Получатель", "Дата платежа",
+                  "Заявка 1С", "Сумма, ₽", "Статус", "Ответственный"]
+        values = []
+        for number, suspect in enumerate(self.suspects, start=1):
+            for role, rows in (("Ручная — будет отменена", suspect.manual),
+                               ("Заявка 1С — остаётся", suspect.requests)):
+                for payment in rows:
+                    values.append([
+                        number, suspect.kind.title,
+                        "сходятся" if suspect.confident else "проверьте", role,
+                        payment.recipient,
+                        f"{payment.pay_date:%d.%m.%Y}" if payment.pay_date else "",
+                        payment.doc_number, payment.amount, payment.status.title,
+                        payment.responsible])
+        run_task(
+            write_sheet, path, "Дубли", titles, values,
+            on_result=lambda _: self.summary.setText(f"Сохранено строк: {len(values)}"),
+            on_error=self._failed)
+
+    def _apply(self) -> None:
+        chosen = self._checked()
+        if not chosen:
+            return
+        count = sum(len(s.manual) for s in chosen)
+        answer = QMessageBox.question(
+            self, "Схлопнуть дубли",
+            f"Отменить ручных записей: {count} на {money(sum(s.manual_total for s in chosen))} ₽?\n"
+            "Заявки 1С останутся. Отменённую запись можно вернуть, сменив статус.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.apply_button.setEnabled(False)
+        self.progress.setVisible(True)
+        self.summary.setText("Отменяю…")
+        run_task(
+            service.resolve_duplicates, chosen, db_path=self.db_path,
+            on_result=self._resolved, on_error=self._failed)
+
+    def _resolved(self, result: tuple[int, int]) -> None:
+        done, failed = result
+        self.resolved.emit(int(done), int(failed))
+        self.accept()
+
+    def _failed(self, message: str) -> None:
+        self.progress.setVisible(False)
+        self.summary.setText(message)
+        self.summary.setStyleSheet(f"color: {Palette.DANGER};")
+        self.apply_button.setEnabled(bool(self.suspects))
 
 
 def _bold(text: str, parent: QWidget) -> QLabel:

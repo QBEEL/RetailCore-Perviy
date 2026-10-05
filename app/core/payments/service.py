@@ -12,11 +12,11 @@ from typing import Callable, Sequence
 
 from .. import appdata
 from ..suppliers import store as suppliers_store
-from . import data, importer, plan, remote, sync, transport
+from . import data, duplicates, importer, plan, remote, sync, transport
 # Локальная база под своим именем: `store` в этом модуле — источник по выбору
 # пользователя, а выгрузке нужны обе стороны сразу и без подмен.
 from . import store as local_store
-from .models import ImportReport, Payment, PaymentOrigin
+from .models import ImportReport, Payment, PaymentOrigin, PaymentStatus
 from .recipients import Guess, guess_supplier, recipient_key
 from .store import Filter
 
@@ -438,6 +438,62 @@ def link_candidates(
         (recipient, count, total, guess_supplier(recipient, names) if names else None)
         for recipient, count, total in rows
     ]
+
+
+# --- дубли ---------------------------------------------------------------------
+
+class DuplicatesNotAllowed(RuntimeError):
+    """Проверка дублей отменяет записи других менеджеров — это право администратора."""
+
+
+def _may_clean() -> None:
+    if transport.session.active and not transport.session.is_admin:
+        raise DuplicatesNotAllowed(
+            "Проверка дублей доступна только администратору: она отменяет оплаты "
+            "всего отдела, включая чужие.")
+
+
+def find_duplicates(*, db_path: str | None = None) -> list[duplicates.Suspect]:
+    """Возможные дубли среди оплат в базе. Ничего не меняет."""
+    _may_clean()
+    return duplicates.find_duplicates(store.list_payments(None, db_path))
+
+
+def resolve_duplicates(
+    suspects: Sequence[duplicates.Suspect],
+    *,
+    today: date | None = None,
+    db_path: str | None = None,
+) -> tuple[int, int]:
+    """Отменяет ручную сторону отмеченных групп. Возвращает (отменено, не удалось).
+
+    Запись перечитывается перед отменой: между поиском и подтверждением её могли
+    занять заявкой, отменить или удалить, и затирать такую нельзя. Сбой на одной
+    записи не останавливает остальные.
+    """
+    _may_clean()
+    moment = today or date.today()
+    done = failed = 0
+    for suspect in suspects:
+        note = suspect.note(moment)
+        for payment in suspect.manual:
+            try:
+                fresh = store.get_payment(payment.id, db_path)
+                if (fresh is None or fresh.doc_number
+                        or fresh.status is PaymentStatus.CANCELLED):
+                    continue
+                fresh.status = PaymentStatus.CANCELLED
+                fresh.comment = f"{fresh.comment}\n{note}" if fresh.comment.strip() else note
+                store.save_payment(fresh, db_path)
+                done += 1
+            except Exception as error:  # noqa: BLE001 — одна запись не должна ронять остальные
+                failed += 1
+                appdata.log_event(LOG_FILE, f"Дубли: не отменена запись {payment.id}: {error}")
+    appdata.log_event(
+        LOG_FILE,
+        f"Проверка дублей: отменено {done}, не удалось {failed}"
+        + "".join(f"\n  · {s.recipient}: {s.title}" for s in suspects))
+    return done, failed
 
 
 # --- статусы -------------------------------------------------------------------

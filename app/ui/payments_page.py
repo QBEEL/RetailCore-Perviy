@@ -88,6 +88,7 @@ from .widgets.payment_dialogs import (
     BudgetDialog,
     BulkEditDialog,
     DateInput,
+    DuplicatesDialog,
     ImportDialog,
     PaymentDialog,
     RecipientLinkDialog,
@@ -150,6 +151,18 @@ class PaymentsPage(QWidget):
         self.link_button.setIcon(icons.icon("link"))
         self.link_button.clicked.connect(self.link_recipients)
         head.addWidget(self.link_button)
+
+        # Только администратору: отмена оплат затрагивает весь отдел. Видимость
+        # обновляется при каждом чтении данных — вход выполняется уже после
+        # того, как окно построено.
+        self.duplicates_button = QPushButton("Проверить дубли", self)
+        self.duplicates_button.setIcon(icons.icon("columns"))
+        self.duplicates_button.setToolTip(
+            "Найти оплаты, внесённые вручную и уже заведённые в 1С, — в том числе "
+            "счета, разбитые на части, и сдвиг даты на день-два")
+        self.duplicates_button.clicked.connect(self.check_duplicates)
+        self.duplicates_button.setVisible(self._may_check_duplicates())
+        head.addWidget(self.duplicates_button)
 
         # Две команды одного сценария под одной кнопкой: план из Excel
         # начинается с выдачи шаблона и заканчивается его загрузкой, и держать
@@ -1544,6 +1557,7 @@ class PaymentsPage(QWidget):
         self.link_button.setText(
             f"Привязать получателей ({unlinked})" if unlinked else "Привязать получателей")
         self.link_button.setEnabled(unlinked > 0)
+        self.duplicates_button.setVisible(self._may_check_duplicates())
         if overdue:
             self.notify(f"Просроченными стали {overdue} оплат", ToastKind.WARNING)
         self._check_conflicts()
@@ -1776,6 +1790,27 @@ class PaymentsPage(QWidget):
         if dialog.exec() and dialog.linked:
             self.notify(f"Привязано получателей: {dialog.linked}", ToastKind.SUCCESS)
             self.reload()
+
+    @staticmethod
+    def _may_check_duplicates() -> bool:
+        """Проверка дублей отменяет записи отдела: с общей базой — только администратору."""
+        return not transport.session.active or transport.session.is_admin
+
+    def check_duplicates(self) -> None:
+        if not self._may_check_duplicates():
+            self.notify("Проверка дублей доступна только администратору", ToastKind.WARNING)
+            return
+        dialog = DuplicatesDialog(parent=self)
+        dialog.open_requested.connect(self.open_payment)
+        dialog.resolved.connect(self._after_duplicates)
+        dialog.exec()
+
+    def _after_duplicates(self, done: int, failed: int) -> None:
+        text = f"Дубли схлопнуты: отменено записей {done}"
+        if failed:
+            text += f", не удалось {failed} (подробности в журнале)"
+        self.notify(text, ToastKind.WARNING if failed else ToastKind.SUCCESS)
+        self.reload()
 
     def create_payment(
         self,
