@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QTimer
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
+from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, Qt, QTimer
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QToolButton, QWidget
 
 from .. import icons
 from ..theme import Metrics, Palette
@@ -26,11 +26,25 @@ _STYLE: dict[ToastKind, tuple[str, str, str]] = {
 }
 
 
+# Сколько живёт уведомление; 0 — пока пользователь не закроет сам.
+_TIMEOUTS: dict[ToastKind, int] = {
+    ToastKind.SUCCESS: 4000,
+    ToastKind.INFO: 4000,
+    ToastKind.WARNING: 9000,
+    ToastKind.ERROR: 0,
+}
+
+# Сколько ошибок держим на экране одновременно: старые закрываются сами.
+_MAX_STICKY = 4
+
+
 class Toast(QFrame):
     """Одиночное уведомление, всплывающее в правом нижнем углу окна."""
 
     def __init__(self, parent: QWidget, text: str, kind: ToastKind, timeout: int = 4000) -> None:
         super().__init__(parent)
+        self.kind = kind
+        self.text = text
         color, background, icon_name = _STYLE[kind]
         self.setStyleSheet(
             f"QFrame {{ background: {background}; border: 1px solid {color};"
@@ -49,11 +63,27 @@ class Toast(QFrame):
         label = QLabel(text, self)
         label.setWordWrap(True)
         label.setMaximumWidth(360)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setCursor(Qt.CursorShape.IBeamCursor)
         layout.addWidget(label, 1)
+
+        close = QToolButton(self)
+        close.setIcon(icons.icon("close", color))
+        close.setToolTip("Закрыть")
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setAutoRaise(True)
+        close.setFixedSize(22, 22)
+        close.setStyleSheet(
+            "QToolButton { background: transparent; border: none; border-radius: 4px; }"
+            " QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+        )
+        close.clicked.connect(self.dismiss)
+        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignTop)
 
         apply_shadow(self, blur=28, alpha=38, offset=5)
         self.adjustSize()
-        QTimer.singleShot(timeout, self.dismiss)
+        if timeout > 0:
+            QTimer.singleShot(timeout, self.dismiss)
 
     def slide_in(self, target: QPoint) -> None:
         start = QPoint(target.x() + 28, target.y())
@@ -82,8 +112,6 @@ class Toast(QFrame):
             manager.remove(self)
         self.deleteLater()
 
-    def mousePressEvent(self, event) -> None:
-        self.dismiss()
 
 
 class ToastManager:
@@ -96,7 +124,15 @@ class ToastManager:
         self._toasts: list[Toast] = []
         host._toast_manager = self
 
-    def show(self, text: str, kind: ToastKind = ToastKind.INFO, timeout: int = 4000) -> None:
+    def show(self, text: str, kind: ToastKind = ToastKind.INFO, timeout: int | None = None) -> None:
+        if timeout is None:
+            timeout = _TIMEOUTS[kind]
+        if timeout == 0:
+            if any(t.text == text and t.kind == kind for t in self._toasts):
+                return
+            sticky = [t for t in self._toasts if t.kind == kind and t.isVisible()]
+            for old in sticky[: max(0, len(sticky) - _MAX_STICKY + 1)]:
+                old.dismiss()
         toast = Toast(self.host, text, kind, timeout)
         self._toasts.append(toast)
         self.reposition()

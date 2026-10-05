@@ -60,6 +60,7 @@ NAMES = {
     "key": "mdi6.key-variant",
     "marking": "mdi6.barcode-scan",
     "certificate": "mdi6.certificate-outline",
+    "close": "mdi6.close",
 }
 
 
