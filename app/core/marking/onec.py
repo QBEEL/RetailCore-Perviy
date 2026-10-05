@@ -439,7 +439,7 @@ def _save_xlsx(rows: Sequence[tuple[str, str, str]], destination: str) -> None:
         cell.fill = PatternFill("solid", fgColor="1F3864")
     for index, row in enumerate(rows, start=2):
         for column, value in enumerate(row, start=1):
-            cell = sheet.cell(row=index, column=column, value=value)
+            cell = workbook_module.as_text(sheet.cell(row=index, column=column, value=value))
             # Текстовый формат обязателен: код начинается с «01», и числом
             # Excel съел бы ведущий ноль вместе с годностью кода.
             cell.number_format = "@"

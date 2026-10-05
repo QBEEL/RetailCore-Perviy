@@ -112,9 +112,13 @@ def update_user(user_id: int, form: UserIn,
                             detail="Нельзя снять с себя права администратора")
 
     db.execute(
-        "UPDATE app_user SET full_name = %s, is_admin = %s, is_active = %s"
+        "UPDATE app_user SET full_name = %s, is_admin = %s, is_active = %s,"
+        # Отключение заканчивает выданные входы: включённая позже учётка
+        # входит заново. Правая часть видит строку до изменения.
+        "                    token_version = token_version"
+        "                      + CASE WHEN is_active AND NOT %s THEN 1 ELSE 0 END"
         " WHERE id = %s",
-        (form.full_name, form.is_admin, form.is_active, user_id))
+        (form.full_name, form.is_admin, form.is_active, form.is_active, user_id))
     db.execute("DELETE FROM user_responsible WHERE user_id = %s", (user_id,))
     for name in form.responsible:
         db.execute("INSERT INTO user_responsible (user_id, responsible)"
@@ -136,7 +140,8 @@ def reset_password(user_id: int,
     # Назначенный администратором пароль владельцу учётки придётся заменить:
     # его видел не только он.
     changed = db.execute(
-        "UPDATE app_user SET password_hash = %s, must_change_password = TRUE"
+        "UPDATE app_user SET password_hash = %s, must_change_password = TRUE,"
+        "                    token_version = token_version + 1"
         " WHERE id = %s", (security.hash_password(password), user_id))
     if not changed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,

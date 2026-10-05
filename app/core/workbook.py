@@ -206,6 +206,19 @@ def invalidate_cache(path: str | None = None) -> None:
         del _cache[key]
 
 
+def as_text(cell: Any) -> Any:
+    """Оставляет строку, начинающуюся с «=», текстом, а не формулой.
+
+    openpyxl читает такую строку как формулу, а в выгрузки попадают тексты из
+    1С и комментарии: название получателя, начавшееся со знака «=», иначе
+    открылось бы в Excel вычисляемым значением. Возвращает ячейку, чтобы вызов
+    можно было вставить в цепочку.
+    """
+    if isinstance(cell.value, str) and cell.value.startswith("="):
+        cell.data_type = "s"
+    return cell
+
+
 def write_sheet(
     destination: str,
     sheet_name: str,
@@ -230,6 +243,8 @@ def write_sheet(
         written = 0
         for row in rows:
             worksheet.append(list(row))
+            for cell in worksheet[worksheet.max_row]:
+                as_text(cell)
             written += 1
         worksheet.freeze_panes = "A2"
         for index, title in enumerate(titles, start=1):
@@ -265,6 +280,7 @@ def write_values(
             if cell.value not in (None, "") and not overwrite:
                 continue
             cell.value = value
+            as_text(cell)
             written += 1
         workbook.save(destination)
         return written

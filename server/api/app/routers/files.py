@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
@@ -23,6 +24,39 @@ router = APIRouter(prefix="/api/payments", tags=["Вложения"])
 # выбранный архив на сотни мегабайт забил бы диск, который делится с соседом.
 MAX_SIZE = 25 * 1024 * 1024
 CHUNK = 1024 * 1024
+
+# Типы, которые система запускает, а не показывает: как вложения не нужны.
+# Тот же набор и та же очистка имени — в клиенте (`app/core/payments/safe_files.py`).
+RISKY_EXTENSIONS = frozenset({
+    ".exe", ".com", ".scr", ".pif", ".msi", ".msp", ".dll", ".cpl", ".sys",
+    ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
+    ".wsh", ".hta", ".lnk", ".url", ".reg", ".jar", ".msc", ".chm", ".appx",
+    ".gadget", ".application", ".sh", ".command", ".app", ".dmg", ".apk",
+})
+_FORBIDDEN = '<>:"|?*'
+MAX_NAME = 150
+_SAFE_EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
+
+
+def clean_name(raw: str | None) -> str:
+    """Имя без путей, управляющих знаков и запрещённых символов.
+
+    Имя приходит от клиента как есть и потом уезжает другим клиентам, которые
+    складывают файл на диск под этим именем: путь в нём нужно отбросить.
+    """
+    name = (raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in _FORBIDDEN)
+    name = name.strip(" .")
+    if len(name) > MAX_NAME:
+        root, ext = os.path.splitext(name)
+        name = root[:MAX_NAME - len(ext)] + ext
+    return name
+
+
+def is_risky(name: str) -> bool:
+    """Запускаемый тип — по любому расширению в имени, не только по последнему."""
+    return any(f".{part.strip()}" in RISKY_EXTENSIONS
+               for part in name.lower().split(".")[1:])
 
 
 def _owner(payment_id: int) -> str:
@@ -51,9 +85,16 @@ async def upload(payment_id: int, file: UploadFile,
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="Оплата закреплена за другим менеджером")
 
+    name = clean_name(file.filename)
+    if is_risky(name):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Программы и сценарии прикладывать нельзя — только документы")
+    extension = os.path.splitext(name)[1]
+    stored = secrets.token_hex(16) + (
+        extension if _SAFE_EXTENSION.match(extension) else "")
     folder = os.path.join(settings.files_dir, str(payment_id))
     os.makedirs(folder, exist_ok=True)
-    stored = secrets.token_hex(16) + os.path.splitext(file.filename or "")[1]
     target = os.path.join(folder, stored)
 
     size = 0
@@ -77,7 +118,7 @@ async def upload(payment_id: int, file: UploadFile,
         "INSERT INTO payment_file (payment_id, name, stored_as, size, added_by)"
         " VALUES (%s, %s, %s, %s, %s)"
         " RETURNING id, payment_id, name, size, added_at",
-        (payment_id, file.filename or stored, stored, size, user.id))
+        (payment_id, name or stored, stored, size, user.id))
     db.execute("UPDATE payment SET had_files = TRUE WHERE id = %s",
                (payment_id,))
     return FileOut(**row)
@@ -97,7 +138,8 @@ def download(file_id: int, user: User = Depends(security.current_user)
     if not os.path.isfile(path):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Файл потерян: есть в базе, но не на диске")
-    return FileResponse(path, filename=row["name"])
+    # Имена, приложенные до очистки при загрузке, могли быть любыми.
+    return FileResponse(path, filename=clean_name(row["name"]) or row["stored_as"])
 
 
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT,

@@ -62,11 +62,21 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(expected, actual)
 
 
-def create_token(user_id: int, login: str) -> str:
+def create_token(user_id: int, login: str, version: int = 0,
+                 auth_time: int | None = None) -> str:
+    """Токен учётки.
+
+    `ver` — версия учётки на момент выдачи; она растёт при смене пароля, и
+    выданные до этого токены заканчиваются. `auth` — когда человек вошёл по
+    паролю; продление его сохраняет, и по нему сервер решает, не пора ли
+    спросить пароль заново.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "login": login,
+        "ver": int(version),
+        "auth": int(auth_time if auth_time is not None else now.timestamp()),
         "iat": now,
         "exp": now + timedelta(hours=settings.token_hours),
     }
@@ -81,6 +91,9 @@ class User:
     is_admin: bool
     # Значения `responsible` из выгрузки 1С, которые считаются «своими».
     responsible: frozenset[str]
+    # Когда человек вошёл по паролю (секунды Unix). Продление токена этот
+    # момент не сдвигает.
+    auth_time: int = 0
 
     def may_edit(self, responsible: str) -> bool:
         """Администратор правит всё, остальные — только свои оплаты."""
@@ -98,17 +111,29 @@ def current_user(token: str = Depends(scheme)) -> User:
     except jwt.PyJWTError:
         raise denied from None
 
+    try:
+        user_id = int(payload.get("sub", 0))
+        version = int(payload.get("ver", 0))
+        auth_time = int(payload.get("auth", payload.get("iat", 0)))
+    except (TypeError, ValueError):
+        raise denied from None
+
     row = db.fetch_one(
         "SELECT u.id, u.login, u.full_name, u.is_admin, u.is_active,"
+        "       u.token_version,"
         "       COALESCE(array_agg(r.responsible)"
         "                FILTER (WHERE r.responsible IS NOT NULL), '{}') AS responsible"
         " FROM app_user u"
         " LEFT JOIN user_responsible r ON r.user_id = u.id"
         " WHERE u.id = %s GROUP BY u.id",
-        (int(payload.get("sub", 0)),))
+        (user_id,))
     # Учётку могли отключить, пока токен ещё жив: проверяем на каждом запросе,
     # иначе уволенный сотрудник работал бы до конца срока действия токена.
     if not row or not row["is_active"]:
+        raise denied
+    # Версия учётки выросла — пароль сменили или сбросили, либо учётку
+    # отключали: вход, выданный до этого, нужно получить заново.
+    if version != int(row["token_version"]):
         raise denied
     return User(
         id=row["id"],
@@ -116,6 +141,7 @@ def current_user(token: str = Depends(scheme)) -> User:
         full_name=row["full_name"],
         is_admin=row["is_admin"],
         responsible=frozenset(row["responsible"]),
+        auth_time=auth_time,
     )
 
 
@@ -162,7 +188,7 @@ def authenticate(login: str, password: str) -> dict | None:
 
     row = db.fetch_one(
         "SELECT id, login, full_name, password_hash, is_admin, is_active,"
-        "       must_change_password"
+        "       must_change_password, token_version"
         " FROM app_user WHERE login = %s", (login,))
     if not row or not row["is_active"]:
         # Пароль всё равно проверяется по заглушке: без этого несуществующий

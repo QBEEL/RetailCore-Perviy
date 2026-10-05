@@ -10,6 +10,9 @@ class Settings:
     dsn: str
     secret: str
     token_hours: int
+    # Сколько дней можно продлевать вход, не вводя пароль. Отсчёт идёт от
+    # входа по паролю, а не от последнего продления.
+    session_days: int
     files_dir: str
 
     @classmethod
@@ -27,6 +30,7 @@ class Settings:
             # Смена длиннее рабочего дня: заново вводить пароль после обеда
             # никто не должен, но и вечный токен оставлять незачем.
             token_hours=int(os.environ.get("API_TOKEN_HOURS", "12")),
+            session_days=int(os.environ.get("API_SESSION_DAYS", "7")),
             files_dir=os.environ.get("API_FILES_DIR", "/srv/files"),
         )
 

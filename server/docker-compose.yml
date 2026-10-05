@@ -43,6 +43,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       API_SECRET: ${API_SECRET}
       API_TOKEN_HOURS: ${API_TOKEN_HOURS:-12}
+      API_SESSION_DAYS: ${API_SESSION_DAYS:-7}
       API_FILES_DIR: /srv/files
     volumes:
       # Та же папка, что копирует backup.sh: вложения переживают пересборку

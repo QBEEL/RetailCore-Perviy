@@ -57,6 +57,7 @@ from ...core.payments import (
 MANUAL_VAT = "Вручную"
 # Общая база, если выполнен вход, иначе своя локальная — см. core/payments/data.
 from ...core.payments import data as store
+from ...core.payments.safe_files import is_risky
 from ...core.workbook import write_sheet
 from .. import icons
 from ..tasks import run_task
@@ -569,6 +570,14 @@ class PaymentDialog(QDialog):
         for attachment in store.files(self.payment.id, self.db_path):
             if attachment.id != wanted or not store.file_available(attachment):
                 continue
+            if is_risky(attachment.name) and QMessageBox.warning(
+                    self, "Запускаемый файл",
+                    f"«{attachment.name}» — программа или сценарий, а не документ. "
+                    "Открытие запустит его на этом компьютере.\n\n"
+                    "Откройте, только если уверены, кто и зачем его приложил.",
+                    QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Open:
+                return
             try:
                 # У серверного вложения локального пути нет — оно скачивается
                 # при первом открытии и потом берётся из кэша.

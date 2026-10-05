@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .. import net
+from .safe_files import safe_name
 
 TIMEOUT = 120
 # Сервер отдаёт всю историю одним ответом — несколько мегабайт JSON. На
@@ -208,7 +209,8 @@ def upload(path: str, source: str) -> Any:
     if not session.active:
         raise AuthError("Вход в систему не выполнен")
     boundary = "----RetailCore" + uuid.uuid4().hex
-    name = os.path.basename(source)
+    # Имя идёт в заголовок: кавычка или перевод строки в нём ломали бы запрос.
+    name = safe_name(os.path.basename(source), "file")
     with open(source, "rb") as handle:
         content = handle.read()
 
@@ -328,5 +330,15 @@ def sign_out() -> None:
 
 
 def change_password(old_password: str, new_password: str) -> None:
-    post("/api/auth/password",
-         {"old_password": old_password, "new_password": new_password})
+    answer = post("/api/auth/password",
+                  {"old_password": old_password, "new_password": new_password})
+    # Сервер новой версии выдаёт после смены пароля новый вход взамен
+    # нынешнего. Сервер прежней версии отвечает пустым телом — тогда менять
+    # нечего.
+    if isinstance(answer, dict) and answer.get("access_token"):
+        _adopt(answer)
+        # Сохранённый рядом токен устарел бы, и первый же запуск потребовал бы
+        # пароль заново.
+        from . import session_store
+
+        session_store.save(session)

@@ -31,6 +31,7 @@ from .models import (
     SupplierRow,
 )
 from .recipients import recipient_key
+from .safe_files import safe_name
 from .store import Filter
 
 # Куда складываются скачанные вложения. Папка временная по смыслу: файл всегда
@@ -596,9 +597,14 @@ def local_copy(attachment: PaymentFile) -> str:
     Файл лежит на сервере, а `os.startfile` умеет открывать только локальный
     путь. Повторное открытие того же вложения скачивания не повторяет.
     """
-    folder = os.path.join(appdata.path_to(CACHE_DIR), str(attachment.payment_id))
+    # В путь идёт очищенное имя, и только внутри папки этого вложения.
+    folder = os.path.join(appdata.path_to(CACHE_DIR), str(attachment.payment_id),
+                          str(attachment.id))
     os.makedirs(folder, exist_ok=True)
-    target = os.path.join(folder, attachment.name)
+    target = os.path.join(folder, safe_name(attachment.name, f"file{attachment.id}"))
+    if os.path.commonpath([os.path.abspath(target), os.path.abspath(folder)]) \
+            != os.path.abspath(folder):
+        raise ValueError("Недопустимое имя вложения")
     if os.path.isfile(target) and os.path.getsize(target) == attachment.size:
         return target
     transport.download(f"/api/payments/files/{attachment.id}", target)

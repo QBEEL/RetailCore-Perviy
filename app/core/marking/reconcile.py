@@ -28,6 +28,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .. import workbook as workbook_module
 from . import codes as codes_module
 from .upd import Document, Line, Mark
 
@@ -299,7 +300,7 @@ def _lines_sheet(sheet, session: Reconciliation) -> None:
     ]
     for row, (label, value) in enumerate(head, start=1):
         sheet.cell(row=row, column=1, value=label).font = Font(bold=True, size=12 if row == 1 else 11)
-        sheet.cell(row=row, column=2, value=value)
+        workbook_module.as_text(sheet.cell(row=row, column=2, value=value))
     row = len(head) + 2
 
     columns = ("№", "Товар", "GTIN", "Ожидалось", "Сверено", "Не найдено", "Состояние")
@@ -314,7 +315,7 @@ def _lines_sheet(sheet, session: Reconciliation) -> None:
         values = (item.line.number, item.line.title, item.line.gtin, item.expected,
                   item.scanned, item.left, item.state)
         for column, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row, column=column, value=value)
+            cell = workbook_module.as_text(sheet.cell(row=row, column=column, value=value))
             cell.fill = DONE_FILL if item.done else TROUBLE_FILL
         row += 1
 
@@ -336,14 +337,14 @@ def _codes_sheet(sheet, session: Reconciliation) -> None:
                   "Сверен" if found else "Не найден на товаре",
                   "" if found else "код есть в документе, вещь не отсканирована")
         for column, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row, column=column, value=value)
+            cell = workbook_module.as_text(sheet.cell(row=row, column=column, value=value))
             cell.fill = DONE_FILL if found else TROUBLE_FILL
         row += 1
 
     for scan in session.extra:
         values = ("", "", scan.raw, "Лишний — нет в документе", scan.note)
         for column, value in enumerate(values, start=1):
-            cell = sheet.cell(row=row, column=column, value=value)
+            cell = workbook_module.as_text(sheet.cell(row=row, column=column, value=value))
             cell.fill = TROUBLE_FILL
         row += 1
 
