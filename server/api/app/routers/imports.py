@@ -233,6 +233,9 @@ def apply_import(form: ImportApply,
             assignments = ", ".join(
                 [f"{name} = %({name})s" for name in IMPORTED_FIELDS
                  if name != "amount"] + [IMPORTED_AMOUNT])
+            # Статус импорт не переписывает — его могли назначить вручную. Кроме
+            # одного случая: 1С говорит «оплачена», а факт оплаты сильнее статуса.
+            assignments += ", status = CASE WHEN %(paid_flag)s THEN 'paid' ELSE status END"
             handle.executemany(
                 f"UPDATE payment SET {assignments}, updated_at = now(),"
                 " updated_by = %(user)s WHERE id = %(id)s",

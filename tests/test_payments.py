@@ -559,3 +559,170 @@ def test_повторяющиеся_подписи_не_склеиваются()
     from app.ui.widgets.charts import _thin
 
     assert len(set(_thin(["янв", "янв", "фев", "фев"], 1))) == 4
+
+
+def _status_after(tmp_path, db, *files: str) -> str:
+    for name, row in enumerate(files):
+        path = _csv(tmp_path, row, name=f"выгрузка{name}.csv")
+        service.apply_import(
+            service.analyze_import(path, today=TODAY, db_path=db),
+            today=TODAY, db_path=db, link=False)
+    return store.list_payments(None, db)[0].status.value
+
+
+def test_просроченная_заявка_становится_оплаченной_после_новой_выгрузки(tmp_path, db):
+    """Заявка легла просроченной, потом её оплатили: в 1С стоит «Оплачена»."""
+    unpaid = _row("IP00-000001", "01.01.2022", "95 700,00", "НеваЛайн ООО", "02.01.2022", "Нет")
+    paid = _row("IP00-000001", "01.01.2022", "95 700,00", "НеваЛайн ООО", "02.01.2022", "Да")
+    assert _status_after(tmp_path, db, unpaid) == "overdue"
+    assert _status_after(tmp_path, db, paid) == "paid"
+
+
+def test_повторная_выгрузка_лечит_оплаченную_заявку_с_просрочкой(tmp_path, db):
+    """База уже испорчена: отметка об оплате есть, а статус остался «Просрочено»."""
+    unpaid = _row("IP00-000001", "01.01.2022", "95 700,00", "НеваЛайн ООО", "02.01.2022", "Нет")
+    paid = _row("IP00-000001", "01.01.2022", "95 700,00", "НеваЛайн ООО", "02.01.2022", "Да")
+    _status_after(tmp_path, db, unpaid)
+    with store.connect(db) as connection:
+        connection.execute("UPDATE payment SET paid_flag = 1")
+        connection.commit()
+    assert store.list_payments(None, db)[0].status.value == "overdue"
+    path = _csv(tmp_path, paid, name="повтор.csv")
+    report = service.analyze_import(path, today=TODAY, db_path=db)
+    assert report.updated == 1
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.list_payments(None, db)[0].status.value == "paid"
+
+
+def test_перенесённая_заявка_не_сбрасывается_импортом(tmp_path, db):
+    """Перенос назначил человек — неоплаченная выгрузка его не откатывает."""
+    unpaid = _row("IP00-000001", "01.01.2022", "95 700,00", "НеваЛайн ООО", "02.01.2022", "Нет")
+    _status_after(tmp_path, db, unpaid)
+    with store.connect(db) as connection:
+        connection.execute("UPDATE payment SET status = 'moved'")
+        connection.commit()
+    changed = _csv(tmp_path, _row("IP00-000001", "01.01.2022", "99 000,00", "НеваЛайн ООО",
+                                 "02.01.2022", "Нет"), name="сумма.csv")
+    service.apply_import(service.analyze_import(changed, today=TODAY, db_path=db),
+                         today=TODAY, db_path=db, link=False)
+    assert store.list_payments(None, db)[0].status.value == "moved"
+
+
+def _plan(amount: float, ident: int) -> Payment:
+    return Payment(id=ident, amount=amount, recipient="АСТЭРА ГК ООО", pay_date=date(2026, 8, 3),
+                   status=PaymentStatus.PLANNED, origin=PaymentOrigin.MANUAL)
+
+
+def _request(amount: float, number: str) -> Payment:
+    return Payment(doc_number=number, request_date=date(2026, 8, 1), amount=amount,
+                   recipient="АСТЭРА ГК ООО", pay_date=date(2026, 8, 3),
+                   origin=PaymentOrigin.IMPORT)
+
+
+def _taken(plans, requests) -> dict[int, str]:
+    found = importer.adoptions(requests, plans)
+    return {ident: payment.doc_number for ident, payment in found.items()}
+
+
+def test_заявки_делят_записи_дня_по_наименьшему_расхождению_а_не_по_порядку_строк():
+    plans = [_plan(800_000, 1), _plan(500_000, 2), _plan(100_000, 3)]
+    # Первой в файле идёт 520 000: жадный перебор отдал бы ей 500 000 и оставил
+    # 450 000 без близкой записи.
+    requests = [_request(520_000, "A"), _request(450_000, "B"), _request(790_000, "C")]
+    assert _taken(plans, requests) == {1: "C", 2: "A", 3: "B"}
+
+
+def test_порядок_строк_не_меняет_сопоставление():
+    plans = [_plan(800_000, 1), _plan(500_000, 2), _plan(100_000, 3)]
+    requests = [_request(520_000, "A"), _request(450_000, "B"), _request(790_000, "C")]
+    assert _taken(plans, list(reversed(requests))) == _taken(plans, requests)
+
+
+def test_лишняя_заявка_остаётся_без_пары_и_берётся_наиболее_далёкая():
+    plans = [_plan(800_000, 1), _plan(100_000, 2)]
+    requests = [_request(790_000, "A"), _request(105_000, "B"), _request(2_000_000, "C")]
+    assert _taken(plans, requests) == {1: "A", 2: "B"}
+
+
+def test_лишняя_запись_остаётся_свободной():
+    plans = [_plan(800_000, 1), _plan(500_000, 2), _plan(100_000, 3)]
+    assert _taken(plans, [_request(95_000, "A")]) == {3: "A"}
+
+
+def test_равные_суммы_разводятся_детерминированно():
+    plans = [_plan(100.0, 7), _plan(100.0, 5)]
+    requests = [_request(100.0, "A"), _request(100.0, "B")]
+    assert _taken(plans, requests) == {5: "A", 7: "B"}
+
+
+def _analyzed(tmp_path, db, *rows: str):
+    return service.analyze_import(_csv(tmp_path, *rows), today=TODAY, db_path=db)
+
+
+def test_сумму_новой_заявки_можно_поправить_до_записи(tmp_path, db):
+    report = _analyzed(tmp_path, db, _row("IP00-000001", "09.01.2026", "95 700,00",
+                                           "НеваЛайн ООО", "11.08.2026"))
+    key = report.details[0].key
+    assert report.set_amount(key, 90_000.0)
+    assert report.details[0].amount_after == pytest.approx(90_000.0)
+    assert report.details[0].edited and "поправлена вручную" in report.details[0].fields_text
+    assert report.total == pytest.approx(90_000.0)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    saved = store.list_payments(None, db)[0]
+    assert saved.amount == pytest.approx(90_000.0)
+
+
+def test_правка_суммы_пересчитывает_ндс_по_ставке(tmp_path, db):
+    line = _row("IP00-000001", "09.01.2026", "120 000,00", "НеваЛайн ООО", "11.08.2026")
+    cells = line.split(";")
+    cells[4] = "20 000,00"          # НДС 20 000 с 120 000
+    report = _analyzed(tmp_path, db, ";".join(cells))
+    report.set_amount(report.details[0].key, 60_000.0)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.list_payments(None, db)[0].vat == pytest.approx(10_000.0)
+
+
+def test_возврат_к_предложенной_сумме_снимает_правку(tmp_path, db):
+    report = _analyzed(tmp_path, db, _row("IP00-000001", "09.01.2026", "95 700,00",
+                                           "НеваЛайн ООО", "11.08.2026"))
+    key = report.details[0].key
+    report.set_amount(key, 1.0)
+    report.set_amount(key, 95_700.0)
+    assert not report.overrides and not report.details[0].edited
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.list_payments(None, db)[0].amount == pytest.approx(95_700.0)
+
+
+def test_нулевая_и_чужая_сумма_не_принимаются(tmp_path, db):
+    report = _analyzed(tmp_path, db, _row("IP00-000001", "09.01.2026", "95 700,00",
+                                           "НеваЛайн ООО", "11.08.2026"))
+    assert not report.set_amount(report.details[0].key, 0.0)
+    assert not report.set_amount(("нет", "такой"), 10.0)
+
+
+def test_правка_суммы_существующей_заявки_и_счётчик_направления(tmp_path, db):
+    first = _row("IP00-000001", "09.01.2026", "100 000,00", "НеваЛайн ООО", "11.08.2026")
+    service.apply_import(_analyzed(tmp_path, db, first), today=TODAY, db_path=db, link=False)
+    second = _row("IP00-000001", "09.01.2026", "120 000,00", "НеваЛайн ООО", "11.08.2026")
+    report = _analyzed(tmp_path, db, second)
+    assert report.raised == 1
+    report.set_amount(report.details[0].key, 90_000.0)
+    assert (report.raised, report.lowered) == (0, 1)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    assert store.list_payments(None, db)[0].amount == pytest.approx(90_000.0)
+
+
+def test_правка_суммы_не_меняет_подбор_пар_с_планом(tmp_path, db):
+    store.save_payment(_plan(800_000, 0), db)
+    store.save_payment(_plan(100_000, 0), db)
+    report = _analyzed(
+        tmp_path, db,
+        _row("IP00-000001", "01.08.2026", "790 000,00", "АСТЭРА ГК ООО", "03.08.2026"),
+        _row("IP00-000002", "01.08.2026", "105 000,00", "АСТЭРА ГК ООО", "03.08.2026"))
+    big = next(r for r in report.details if r.doc_number == "IP00-000001")
+    # Правка сделала бы большую заявку «ближе» к 100 000 — пары остаются прежними.
+    report.set_amount(big.key, 110_000.0)
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    amounts = sorted(p.amount for p in store.list_payments(None, db))
+    assert amounts == [pytest.approx(105_000.0), pytest.approx(110_000.0)]
+    assert len(amounts) == 2

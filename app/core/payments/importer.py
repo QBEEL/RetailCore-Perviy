@@ -342,7 +342,7 @@ def analyze(
         if id(payment) not in replaced:
             report.details.append(RowChange(
                 "new", payment.doc_number, payment.request_date, payment.recipient,
-                payment.amount, fields=_new_fields(payment)))
+                payment.amount, fields=_new_fields(payment), key=payment.key))
     report.details.sort(key=lambda row: (
         ("plan", "changed", "new").index(row.kind), -abs(row.delta), row.doc_number))
     report.new = len(fresh) - report.adopted
@@ -390,9 +390,20 @@ def _field_changes(payment: Payment, existing: object) -> list[tuple[str, object
     return found
 
 
+def _paid_in_1c(payment: Payment, existing: object) -> bool:
+    """1С считает заявку оплаченной, а в базе статус другой.
+
+    Отметка об оплате лежит среди полей из 1С, а статус — нет: его могли
+    назначить вручную («Перенесено»). Но факт оплаты сильнее любого статуса,
+    поэтому оплаченная в 1С заявка получает «Оплачено» и из просрочки, и из
+    переноса. Это же лечит записи, у которых отметка уже дошла, а статус остался.
+    """
+    return payment.paid_flag and getattr(existing, "status", "") != PaymentStatus.PAID.value
+
+
 def _differs(payment: Payment, existing: object) -> bool:
     """Отличается ли запись от лежащей в базе по полям из 1С."""
-    return bool(_field_changes(payment, existing))
+    return bool(_field_changes(payment, existing)) or _paid_in_1c(payment, existing)
 
 
 def _show(kind: str, value: object) -> str:
@@ -416,7 +427,7 @@ def _row_change(payment: Payment, existing: object) -> RowChange:
     stored = getattr(existing, "values", {})
     row = RowChange(
         "changed", payment.doc_number, payment.request_date, payment.recipient,
-        payment.amount,
+        payment.amount, key=payment.key,
         amount_before=float(stored["amount"]) if stored.get("amount") is not None else None)
     changes = _field_changes(payment, existing)
     amount_moved = any(name == "amount" for name, _, _ in changes)
@@ -428,6 +439,9 @@ def _row_change(payment: Payment, existing: object) -> RowChange:
         if name == "recipient":
             row.recipient = str(before or payment.recipient)
         row.fields.append((title, _show(kind, before), _show(kind, after)))
+    if _paid_in_1c(payment, existing):
+        was = next((s for s in PaymentStatus if s.value == getattr(existing, "status", "")), None)
+        row.fields.append(("Статус", was.title if was else "", PaymentStatus.PAID.title))
     return row
 
 
@@ -435,7 +449,7 @@ def _plan_change(candidate: Payment, payment: Payment) -> RowChange:
     """Заявка 1С встаёт на место плановой или ручной оплаты."""
     row = RowChange(
         "plan", payment.doc_number, payment.request_date, payment.recipient,
-        payment.amount, amount_before=candidate.amount,
+        payment.amount, amount_before=candidate.amount, key=payment.key,
         note="вместо " + ("плана" if candidate.origin is PaymentOrigin.PLAN else "ручной записи"))
     if candidate.pay_date != payment.pay_date:
         row.fields.append(("Дата платежа", _show("date", candidate.pay_date and
@@ -488,9 +502,11 @@ def adoptions(
 
     Своя запись узнаётся по получателю и дате платежа. Сумма в условие не
     входит: в плане она обычно круглая («800 000»), а в заявке — по счёту
-    («855 876»). Если на день у получателя несколько открытых записей, заявке
-    достаётся ближайшая по сумме. Заявка без пары остаётся новой: сумма из 1С
-    всё равно главнее, и терять её нельзя.
+    («855 876»). Если на день у получателя несколько открытых записей, заявки
+    делятся между ними так, чтобы суммарное расхождение сумм вышло наименьшим
+    (`_pair_by_amount`), а не по очереди строк файла: иначе первая же заявка
+    забирала бы «свою» запись у той, которой она подходит лучше. Заявка без
+    пары остаётся новой: сумма из 1С всё равно главнее, и терять её нельзя.
 
     Возвращает номер записи в базе → заявку, которая её заменит.
     """
@@ -500,17 +516,62 @@ def adoptions(
             continue
         buckets.setdefault(
             (recipient_key(candidate.recipient), candidate.pay_date), []).append(candidate)
-    found: dict[int, Payment] = {}
+    requests: dict[tuple[str, date], list[Payment]] = {}
     for payment in fresh:
         if payment.pay_date is None:
             continue
-        group = buckets.get((recipient_key(payment.recipient), payment.pay_date))
-        if not group:
-            continue
-        nearest = min(group, key=lambda c: (abs(c.amount - payment.amount), c.id))
-        group.remove(nearest)
-        found[nearest.id] = payment
+        key = (recipient_key(payment.recipient), payment.pay_date)
+        if key in buckets:
+            requests.setdefault(key, []).append(payment)
+    found: dict[int, Payment] = {}
+    for key, group in requests.items():
+        for candidate, payment in _pair_by_amount(buckets[key], group):
+            found[candidate.id] = payment
     return found
+
+
+def _pair_by_amount(
+    candidates: Sequence[Payment],
+    requests: Sequence[Payment],
+) -> list[tuple[Payment, Payment]]:
+    """Пары «запись, заявка» с наименьшей суммой расхождений сумм.
+
+    Берётся min(записей, заявок) пар; лишние остаются без пары. Для разницы по
+    модулю лучшее сопоставление не пересекается: если обе стороны отсортировать
+    по сумме, то пары идут по порядку, и остаётся выбрать, какие из более
+    длинного ряда взять. Это решается таблицей по префиксам. Равные суммы
+    разводятся номером записи и порядком заявок в файле — результат не зависит
+    от случайного порядка.
+    """
+    left = sorted(candidates, key=lambda c: (c.amount, c.id))
+    right = sorted(enumerate(requests), key=lambda item: (item[1].amount, item[0]))
+    swapped = len(left) > len(right)
+    short, long = (right, left) if swapped else (left, right)
+    rows, columns = len(short), len(long)
+
+    def price(i: int, j: int) -> float:
+        a = short[i][1].amount if swapped else short[i].amount
+        b = long[j].amount if swapped else long[j][1].amount
+        return abs(a - b)
+
+    inf = float("inf")
+    # best[i][j] — наименьшая цена, если первые i коротких ставим в первые j длинных.
+    best = [[0.0 if i == 0 else inf for _ in range(columns + 1)] for i in range(rows + 1)]
+    for i in range(1, rows + 1):
+        for j in range(i, columns + 1):
+            skip = best[i][j - 1]
+            take = best[i - 1][j - 1] + price(i - 1, j - 1)
+            best[i][j] = take if take <= skip else skip
+    pairs: list[tuple[Payment, Payment]] = []
+    i, j = rows, columns
+    while i > 0:
+        if best[i][j] == best[i - 1][j - 1] + price(i - 1, j - 1) and best[i - 1][j - 1] != inf:
+            candidate = short[i - 1] if not swapped else long[j - 1]
+            request = (long[j - 1][1] if not swapped else short[i - 1][1])
+            pairs.append((candidate, request))
+            i -= 1
+        j -= 1
+    return pairs
 
 
 def split_changes(
@@ -540,9 +601,24 @@ def split_changes(
         if getattr(found, "origin", "") != PaymentOrigin.IMPORT.value:
             continue
         _keep_manual_amount(payment, found)
+        # Правка человека новее и «защищённой» суммы, и присланной 1С.
+        payment = _with_override(payment, report)
         if _differs(payment, found):
             changed.append((int(getattr(found, "id", 0)), payment))
+    # Пары подбираются по суммам из 1С, а правка накладывается после: иначе
+    # исправленная сумма меняла бы пары, которые человек видел в предпросмотре.
     adopted = adoptions(created, candidates)
     taken = {id(payment) for payment in adopted.values()}
-    created = [payment for payment in created if id(payment) not in taken]
-    return created, changed, list(adopted.items())
+    created = [_with_override(payment, report) for payment in created
+               if id(payment) not in taken]
+    return (created, changed,
+            [(ident, _with_override(payment, report)) for ident, payment in adopted.items()])
+
+
+def _with_override(payment: Payment, report: ImportReport) -> Payment:
+    """Платёж с суммой, поправленной в предпросмотре; НДС идёт за суммой."""
+    value = report.overrides.get(payment.key)
+    if value is None or abs(value - payment.amount) < AMOUNT_EPSILON:
+        return payment
+    vat = round(payment.vat * value / payment.amount, 2) if payment.amount and payment.vat else payment.vat
+    return replace(payment, amount=float(value), vat=vat)

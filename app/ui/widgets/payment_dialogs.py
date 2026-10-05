@@ -613,6 +613,57 @@ def _supplier_history(
     return stats, planning.payment_terms(rows), rows[:14]
 
 
+class ImportAmountDialog(QDialog):
+    """Правка суммы одной заявки в предпросмотре импорта."""
+
+    def __init__(self, row, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.row = row
+        self.proposed = row.amount_proposed if row.edited else row.amount_after
+        self.setWindowTitle("Сумма заявки")
+        self.setMinimumWidth(460)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(Metrics.PAD + 4, Metrics.PAD, Metrics.PAD + 4, Metrics.PAD)
+        root.setSpacing(Metrics.GAP)
+        title = QLabel(
+            f"{row.recipient}\n{row.doc_number}"
+            + (f" от {row.request_date:%d.%m.%Y}" if row.request_date else ""), self)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        root.addWidget(title)
+
+        form = QFormLayout()
+        form.setSpacing(9)
+        if row.amount_before is not None:
+            form.addRow("Сейчас в базе", QLabel(f"{money(row.amount_before)} ₽", self))
+        form.addRow("Предлагает программа", QLabel(f"{money(self.proposed)} ₽", self))
+        self.amount = DecimalInput(self)
+        self.amount.setRange(0.01, 100_000_000_000.0)
+        self.amount.setDecimals(2)
+        self.amount.setGroupSeparatorShown(True)
+        self.amount.setSuffix(" ₽")
+        self.amount.setValue(row.amount_after)
+        form.addRow("Записать сумму", self.amount)
+        root.addLayout(form)
+        root.addWidget(Hint(
+            "Правка действует на этот импорт. Если в следующей выгрузке 1С пришлёт "
+            "другую сумму, она попадёт в список изменений снова.", self))
+
+        buttons = QDialogButtonBox(self)
+        save = buttons.addButton(QDialogButtonBox.StandardButton.Ok)
+        save.setText("Применить")
+        save.setObjectName("Primary")
+        back = buttons.addButton("Как предлагает программа", QDialogButtonBox.ButtonRole.ResetRole)
+        back.clicked.connect(lambda: self.amount.setValue(self.proposed))
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def value(self) -> float:
+        return float(self.amount.value())
+
+
 class ImportDialog(QDialog):
     """Импорт выгрузки: разбор в фоне, предпросмотр, применение."""
 
@@ -640,7 +691,8 @@ class ImportDialog(QDialog):
             "Выгрузка «Оплата поставщикам» из 1С в формате CSV. Файл разбирается "
             "без записи — сначала будет видно, что именно изменится. Повторный "
             "импорт того же файла ничего не создаёт: записи опознаются по паре "
-            "«номер заявки + дата заявки».", self))
+            "«номер заявки + дата заявки». Сумму любой заявки из списка можно "
+            "поправить двойным щелчком, пока она не записана.", self))
 
         self.picker = FilePicker("Файл выгрузки", "не выбран", self, file_filter=CSV_FILTER)
         self.picker.set_recent(recent or [])
@@ -702,6 +754,7 @@ class ImportDialog(QDialog):
             Column("Что ещё изменилось", lambda r: r.fields_text, 420),
         ], self)
         self.details.setMinimumHeight(220)
+        self.details.item_activated.connect(self._edit_amount)
         self.details.setVisible(False)
         root.addWidget(self.details, 1)
 
@@ -755,6 +808,20 @@ class ImportDialog(QDialog):
             period = f" · платежи с {report.first_pay:%d.%m.%Y} по {report.last_pay:%d.%m.%Y}"
         self.summary.setText(
             f"{os.path.basename(report.path)}{period} · получателей: {report.recipients}")
+        self._draw_numbers(report)
+        self.kind_filter.blockSignals(True)
+        self.kind_filter.setCurrentIndex(0)
+        self.kind_filter.blockSignals(False)
+        self._show_details()
+        if report.skipped:
+            self.skipped.clear()
+            self.skipped.addItems(report.skipped[:200])
+            self.skipped.setVisible(True)
+        self.apply_button.setEnabled(report.changes > 0)
+        if not report.changes:
+            self.apply_button.setText("Изменений нет")
+
+    def _draw_numbers(self, report: ImportReport) -> None:
         _clear(self.numbers)
         tiles = [
             ("Прочитано", report.rows, Palette.TEXT_MUTED),
@@ -772,21 +839,20 @@ class ImportDialog(QDialog):
             number.setStyleSheet(f"font-size: 17px; font-weight: 600; color: {colour};")
             self.numbers.addWidget(number, 0, index)
             self.numbers.addWidget(caption, 1, index)
-        if report.direction:
-            # Не только сколько записей изменится, но и куда уйдут суммы.
-            self.direction.setText(f"Суммы существующих оплат: {report.direction}")
-            self.direction.setVisible(True)
-        self.kind_filter.blockSignals(True)
-        self.kind_filter.setCurrentIndex(0)
-        self.kind_filter.blockSignals(False)
-        self._show_details()
-        if report.skipped:
-            self.skipped.clear()
-            self.skipped.addItems(report.skipped[:200])
-            self.skipped.setVisible(True)
-        self.apply_button.setEnabled(report.changes > 0)
-        if not report.changes:
-            self.apply_button.setText("Изменений нет")
+        # Не только сколько записей изменится, но и куда уйдут суммы.
+        self.direction.setText(f"Суммы существующих оплат: {report.direction}")
+        self.direction.setVisible(bool(report.direction))
+
+    def _edit_amount(self, row) -> None:
+        """Двойной щелчок по строке списка: поправить сумму до записи."""
+        if self.report is None or not getattr(row, "key", None) or not row.key[0]:
+            return
+        dialog = ImportAmountDialog(row, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self.report.set_amount(row.key, dialog.value()):
+            self._draw_numbers(self.report)
+            self.details.model_.refresh_item(row)
 
     def _shown_details(self) -> list:
         """Строки списка с учётом выбранного отбора."""

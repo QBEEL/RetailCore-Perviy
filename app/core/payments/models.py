@@ -606,8 +606,16 @@ class RowChange:
     # Прочие поля: (название, было, стало).
     fields: list[tuple[str, str, str]] = field(default_factory=list)
     note: str = ""
+    # Ключ заявки «номер + дата заявки» — по нему правка суммы находит строку.
+    key: tuple[str, str] = ("", "")
+    # Сумма, которую предложила программа, если человек её поправил до записи.
+    amount_proposed: float | None = None
 
     KINDS = {"new": "Новая", "plan": "Заменит план", "changed": "Изменится"}
+
+    @property
+    def edited(self) -> bool:
+        return self.amount_proposed is not None
 
     @property
     def kind_title(self) -> str:
@@ -634,6 +642,8 @@ class RowChange:
                  for name, before, after in self.fields]
         if self.note:
             parts.insert(0, self.note)
+        if self.edited:
+            parts.insert(0, f"сумма поправлена вручную, предлагалось {money_text(self.amount_proposed)} ₽")
         return "; ".join(parts)
 
 
@@ -663,10 +673,39 @@ class ImportReport:
     last_pay: date | None = None
     recipients: int = 0
     applied: bool = False
+    # Суммы, поправленные человеком в предпросмотре: ключ заявки → сумма. В
+    # `payments` лежит то, что прислала 1С, — правка накладывается при записи,
+    # уже после подбора пар (`importer.split_changes`), чтобы не менять пары.
+    overrides: dict[tuple[str, str], float] = field(default_factory=dict)
 
     @property
     def total(self) -> float:
-        return sum(p.amount for p in self.payments)
+        return sum(self.overrides.get(p.key, p.amount) for p in self.payments)
+
+    def set_amount(self, key: tuple[str, str], value: float) -> bool:
+        """Правит сумму заявки в предпросмотре. Возвращает, нашлась ли строка."""
+        row = next((r for r in self.details if r.key == key), None)
+        if row is None or value <= 0:
+            return False
+        proposed = row.amount_proposed if row.edited else row.amount_after
+        if abs(value - proposed) < AMOUNT_EPSILON:
+            # Вернули предложенное — правки нет.
+            self.overrides.pop(key, None)
+            row.amount_proposed = None
+        else:
+            self.overrides[key] = float(value)
+            row.amount_proposed = proposed
+        row.amount_after = float(value) if row.edited else proposed
+        self.recount_amounts()
+        return True
+
+    def recount_amounts(self) -> None:
+        """Пересчитывает «выросла / снизилась» по строкам списка."""
+        self.raised = self.lowered = 0
+        self.raised_sum = self.lowered_sum = 0.0
+        for row in self.details:
+            if row.amount_before is not None:
+                self.note_amount(row.amount_before, row.amount_after)
 
     @property
     def changes(self) -> int:

@@ -452,8 +452,11 @@ def apply_import(
                 f" WHEN {back} THEN '' ELSE :_by END,"
                 f" amount_changed_at = CASE WHEN {_SAME} THEN amount_changed_at"
                 f" WHEN {back} THEN '' ELSE :_now END")
+            # Статус импорт не переписывает — его могли назначить вручную. Кроме
+            # одного случая: 1С говорит «оплачена», а факт оплаты сильнее статуса.
+            paid = f"status = CASE WHEN :paid_flag = 1 THEN '{PaymentStatus.PAID.value}' ELSE status END"
             connection.executemany(
-                f"UPDATE payment SET {marks}, {assignments}, updated_at = :_now"
+                f"UPDATE payment SET {marks}, {assignments}, {paid}, updated_at = :_now"
                 " WHERE id = :_id",
                 [{**row, "_by": IMPORT_AUTHOR, "_now": now, "_id": payment_id}
                  for payment_id, row in updates])
