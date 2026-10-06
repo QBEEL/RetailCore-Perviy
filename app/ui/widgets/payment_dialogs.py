@@ -57,6 +57,7 @@ from ...core.payments import (
 MANUAL_VAT = "Вручную"
 # Общая база, если выполнен вход, иначе своя локальная — см. core/payments/data.
 from ...core.payments import data as store
+from ...core.payments import transport
 from ...core.payments.safe_files import is_risky
 from ...core.workbook import write_sheet
 from .. import icons
@@ -554,8 +555,10 @@ class PaymentDialog(QDialog):
         for path in paths:
             try:
                 store.attach_file(self.payment.id, path, self.db_path)
-            except (OSError, ValueError) as failure:
-                self.error.setText(str(failure))
+            except (OSError, ValueError, transport.ServerError) as failure:
+                # Отказ сервера (тип, размер, права) должен быть виден: иначе
+                # файл просто не появляется в списке.
+                self.error.setText(f"«{os.path.basename(path)}»: {failure}")
         self._reload_files()
 
     def _detach(self) -> None:

@@ -54,9 +54,8 @@ def clean_name(raw: str | None) -> str:
 
 
 def is_risky(name: str) -> bool:
-    """Запускаемый тип — по любому расширению в имени, не только по последнему."""
-    return any(f".{part.strip()}" in RISKY_EXTENSIONS
-               for part in name.lower().split(".")[1:])
+    """Запускаемый тип — по последнему расширению, как его видит Windows."""
+    return os.path.splitext(name.lower())[1].strip() in RISKY_EXTENSIONS
 
 
 def _owner(payment_id: int) -> str:

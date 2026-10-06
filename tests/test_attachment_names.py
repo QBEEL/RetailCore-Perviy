@@ -38,7 +38,8 @@ def test_длинное_имя_укорачивается_с_сохранени�
 @pytest.mark.parametrize("name, risky", [
     ("счёт.pdf", False), ("акт.xlsx", False), ("архив.zip", False),
     ("setup.exe", True), ("run.BAT", True), ("счёт.pdf.exe", True),
-    ("счёт.exe.pdf", True), ("ярлык.lnk", True), ("s.ps1", True),
+    ("счёт.exe.pdf", False), ("ярлык.lnk", True), ("s.ps1", True),
+    ("www.ozon.com.xlsx", False), ("отчёт.js.xlsx", False), ("ООО Альфа.com", True),
 ])
 def test_запускаемые_типы_распознаются(name, risky):
     assert is_risky(name) is risky

@@ -41,10 +41,10 @@ def safe_name(raw: str | None, fallback: str = "file") -> str:
 
 
 def is_risky(name: str | None) -> bool:
-    """Запускаемый тип: по последнему расширению и по любому внутри имени.
+    """Запускаемый тип — по последнему расширению, как его видит Windows.
 
-    «счёт.exe.pdf» Windows открывает как PDF, но «счёт.pdf.exe» — как программу;
-    лишняя осторожность к первому ничего не стоит.
+    «счёт.pdf.exe» запускается как программа, а «счёт.exe.pdf» и
+    «www.ozon.com.xlsx» открываются как документы: точка в середине имени —
+    часть названия, и отказ по ней не пускал обычные файлы Excel.
     """
-    parts = safe_name(name, "").lower().split(".")[1:]
-    return any(f".{part.strip()}" in RISKY_EXTENSIONS for part in parts)
+    return os.path.splitext(safe_name(name, "").lower())[1].strip() in RISKY_EXTENSIONS
