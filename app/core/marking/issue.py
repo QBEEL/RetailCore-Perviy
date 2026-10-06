@@ -41,6 +41,9 @@ PRODUCT_PATH = "/order/product"
 
 FOLDER = "marking_codes"
 
+# Куда уезжают удалённые блоки. Не стираются: это оплаченные коды.
+TRASH = "deleted"
+
 # Предел одного запроса — из руководства СУЗ, таблица 90.
 MAX_PER_REQUEST = 150_000
 
@@ -185,7 +188,7 @@ def fetch(credentials: Credentials, order_id: str, gtin: str, quantity: int,
     except transport.Offline as error:
         raise CodesUnknown(
             "Связь оборвалась, и неизвестно, выдала ли СУЗ коды. Нажмите "
-            "«Восстановить потерянные»: если блок выдан, он вернётся оттуда. "
+            "«Восстановить»: если блок выдан, он вернётся оттуда. "
             f"Повторное получение забрало бы второй блок.\n\nПодробности: {error}"
         ) from None
 
@@ -193,7 +196,7 @@ def fetch(credentials: Credentials, order_id: str, gtin: str, quantity: int,
     if not codes:
         raise transport.MarkingError(
             "СУЗ ответила, но кодов в ответе нет. Если они списались из "
-            "буфера, их можно вернуть кнопкой «Восстановить потерянные».")
+            "буфера, их можно вернуть кнопкой «Восстановить».")
     return _store(codes, block_id, order_id, gtin, contour, product,
                   product_group, release_method)
 
@@ -329,6 +332,27 @@ def load(batch_id: str) -> Batch | None:
         introduced_count=int(raw.get("introduced_count") or 0),
         country=str(raw.get("country") or ""), color=str(raw.get("color") or ""),
         size=str(raw.get("size") or ""))
+
+
+def delete(batch: Batch) -> str:
+    """Убирает блок из списка и возвращает, куда его переложили.
+
+    Файл не стирается, а уезжает в подпапку `deleted`: это единственная копия
+    оплаченных кодов, и «Удалить», нажатое по ошибке, не должно стоить денег.
+    Список подпапку не читает — `saved()` берёт только `*.json` в самой папке.
+    """
+    source = _file(batch.id)
+    trash = os.path.join(folder(), TRASH)
+    os.makedirs(trash, exist_ok=True)
+    target = os.path.join(trash, os.path.basename(source))
+    os.replace(source, target)
+    return target
+
+
+def stored_for(order_id: str, gtin: str = "") -> int:
+    """Сколько кодов заказа сохранено на этом компьютере (по товару, если указан)."""
+    return sum(batch.total for batch in saved()
+               if batch.order_id == order_id and (not gtin or batch.gtin == gtin))
 
 
 def mark_printed(batch: Batch, printed: int) -> None:

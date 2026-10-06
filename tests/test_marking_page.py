@@ -1280,3 +1280,442 @@ def test_статус_не_получен_это_не_отказ_и_повтор
     assert saved.doc_status == ""
     assert "не отправляйте повторно" in page.batches_hint.text().lower()
     assert "не выполнен" not in page.batches_hint.text().lower()
+
+
+# --- закрытие заказа и удаление блоков ---------------------------------------------------
+
+@pytest.fixture
+def asked(monkeypatch):
+    """Вопрос подтверждения вместо окна: что спросили и что ответили."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from app.ui import marking_page
+
+    box: dict = {"yes": True, "text": [], "buttons": []}
+
+    class Fake:
+        Icon = QMessageBox.Icon
+        ButtonRole = QMessageBox.ButtonRole
+
+        def __init__(self, parent=None):
+            self._yes = None
+
+        def setWindowTitle(self, text):
+            pass
+
+        def setIcon(self, icon):
+            pass
+
+        def setText(self, text):
+            box["text"].append(text)
+
+        def setInformativeText(self, text):
+            box["text"].append(text)
+
+        def addButton(self, text, role):
+            button = object()
+            box["buttons"].append(text)
+            if role == QMessageBox.ButtonRole.DestructiveRole:
+                self._yes = button
+            return button
+
+        def setDefaultButton(self, button):
+            pass
+
+        def exec(self):
+            return 0
+
+        def clickedButton(self):
+            return self._yes if box["yes"] else None
+
+    monkeypatch.setattr(marking_page, "QMessageBox", Fake)
+    return box
+
+
+def _close_page(application, tmp_path, stub, monkeypatch, *, order=None):
+    """Вкладка с одним заказом и подменённым закрытием в СУЗ."""
+    from app.ui import marking_page
+
+    _, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["orders"] = [order or _order(buffers=[Buffer(
+        gtin="04601234567893", left=0, passed=10, total=10, status="EXHAUSTED")])]
+    closed: list = []
+
+    def close_suz_order(credentials, order_id, contour=Contour.SANDBOX,
+                        thumbprint="", inn=""):
+        closed.append((order_id, contour, thumbprint))
+        # После закрытия СУЗ показывает заказ закрытым.
+        state["orders"] = [_order(status="CLOSED", buffers=state["orders"][0].buffers)]
+        return None, credentials.stripped()
+
+    monkeypatch.setattr(marking_page.service, "close_suz_order", close_suz_order)
+    page = _page(application, tmp_path)
+    _settle(application)
+    return page, closed
+
+
+def test_заказ_с_полученными_кодами_закрывается_после_подтверждения(
+        application, tmp_path, stub, monkeypatch, asked):
+    from app.core.marking import issue
+
+    issue.save(issue.Batch(id="a", order_id="3a8f-0001", gtin="04601234567893",
+                           codes=[PERFUME] * 10))
+    page, closed = _close_page(application, tmp_path, stub, monkeypatch)
+    assert not page.close_order_button.isEnabled()      # заказ не выбран
+
+    page.orders.selectRow(0)
+    assert page.close_order_button.isEnabled()
+    page.close_order()
+    _settle(application)
+
+    assert closed == [("3a8f-0001", Contour.SANDBOX, "ААББ")]
+    # Список перечитан: заказ закрыт, и кнопка больше не нужна.
+    assert page.orders.item(0, 2).text() == "Закрыт"
+    page.orders.selectRow(0)
+    assert not page.close_order_button.isEnabled()
+    # Всё выданное лежит на диске — предупреждения о потере нет.
+    assert not any("ВНИМАНИЕ" in text for text in asked["text"])
+
+
+def test_отказ_в_подтверждении_ничего_не_закрывает(application, tmp_path, stub,
+                                                   monkeypatch, asked):
+    asked["yes"] = False
+    page, closed = _close_page(application, tmp_path, stub, monkeypatch)
+    page.orders.selectRow(0)
+
+    page.close_order()
+    _settle(application)
+
+    assert closed == []
+
+
+def test_закрытие_предупреждает_о_несохранённых_и_неполученных_кодах(
+        application, tmp_path, stub, monkeypatch, asked):
+    """Блок, которого нет на диске, после закрытия не вернуть — об этом спрашивают заранее."""
+    page, closed = _close_page(application, tmp_path, stub, monkeypatch,
+                               order=_order())     # получено 750, в буфере ещё 250
+    page.orders.selectRow(0)
+
+    page.close_order()
+    _settle(application)
+
+    text = "\n".join(asked["text"])
+    assert "сохранено 0 из 750" in text
+    assert "ещё 250 кодов" in text
+    assert closed                                   # решение за человеком
+
+
+def test_нетронутый_заказ_закрыть_нельзя(application, tmp_path, stub, monkeypatch, asked):
+    page, closed = _close_page(
+        application, tmp_path, stub, monkeypatch,
+        order=_order(buffers=[Buffer(gtin="1", left=500, total=500, passed=0)]))
+    page.orders.selectRow(0)
+
+    assert not page.close_order_button.isEnabled()
+    page.close_order()
+    _settle(application)
+
+    assert closed == [] and asked["text"] == []
+
+
+def test_отказ_суз_при_закрытии_не_делает_заказ_закрытым(application, tmp_path, stub, monkeypatch,
+                                          asked):
+    from app.ui import marking_page
+
+    page, closed = _close_page(application, tmp_path, stub, monkeypatch)
+
+    def refuse(*args, **kwargs):
+        raise MarkingError("Заказ уже закрыт")
+
+    monkeypatch.setattr(marking_page.service, "close_suz_order", refuse)
+    page.orders.selectRow(0)
+    page.close_order()
+    _settle(application)
+
+    # Ошибка не делает вид, что заказ закрыт: список перечитан, он по-прежнему
+    # открыт, и закрыть его можно снова.
+    assert page.orders.item(0, 2).text() == "Готов"
+    page.orders.selectRow(0)
+    assert page.close_order_button.isEnabled()
+    assert not page._busy
+
+
+def test_блок_кодов_удаляется_после_подтверждения_и_файл_остаётся(
+        application, tmp_path, stub, monkeypatch, asked):
+    from app.core.marking import issue
+
+    issue.save(issue.Batch(id="old", gtin="04601234567893", name="Духи",
+                           codes=[PERFUME] * 5, printed=2,
+                           created="2026-10-01T09:00:00"))
+    page = _page(application, tmp_path)
+    assert not page.batch_delete_button.isEnabled()      # блок не выбран
+
+    page.batches.selectRow(0)
+    assert page.batch_delete_button.isEnabled()
+    page.delete_batch()
+
+    assert page.batches.rowCount() == 0
+    assert issue.saved() == []
+    assert os.path.exists(os.path.join(issue.folder(), issue.TRASH, "old.json"))
+    # Человеку сказали, сколько останется ненапечатанным.
+    assert "Не напечатано ещё 3" in "\n".join(asked["text"])
+
+
+def test_отказ_в_подтверждении_оставляет_блок(application, tmp_path, stub, monkeypatch,
+                                              asked):
+    from app.core.marking import issue
+
+    asked["yes"] = False
+    issue.save(issue.Batch(id="keep", gtin="04601234567893", codes=[PERFUME] * 2,
+                           created="2026-10-01T09:00:00"))
+    page = _page(application, tmp_path)
+    page.batches.selectRow(0)
+
+    page.delete_batch()
+
+    assert page.batches.rowCount() == 1
+    assert [batch.id for batch in issue.saved()] == ["keep"]
+
+
+def _many_page(application, tmp_path, stub, monkeypatch, orders_list, closing):
+    """Вкладка с несколькими заказами; `closing(order_id)` решает судьбу закрытия."""
+    from app.ui import marking_page
+
+    _, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["orders"] = list(orders_list)
+    closed: list = []
+
+    def close_suz_order(credentials, order_id, contour=Contour.SANDBOX,
+                        thumbprint="", inn=""):
+        closed.append(order_id)
+        closing(order_id)
+        state["orders"] = [_order(id=o.id, status="CLOSED", buffers=o.buffers)
+                           if o.id == order_id else o for o in state["orders"]]
+        return None, credentials.stripped()
+
+    monkeypatch.setattr(marking_page.service, "close_suz_order", close_suz_order)
+    page = _page(application, tmp_path)
+    _settle(application)
+    return page, closed
+
+
+def _done(order_id: str) -> Order:
+    return _order(id=order_id, buffers=[Buffer(gtin="1", left=0, passed=10, total=10)])
+
+
+def test_несколько_заказов_закрываются_одним_подтверждением(
+        application, tmp_path, stub, monkeypatch, asked):
+    page, closed = _many_page(
+        application, tmp_path, stub, monkeypatch,
+        [_done("o1"), _done("o2"), _done("o3")], lambda order_id: None)
+
+    page.orders.selectAll()
+    assert page.close_order_button.isEnabled()
+    assert "(3)" in page.close_order_button.text()
+    page.close_order()
+    _settle(application)
+
+    assert closed == ["o1", "o2", "o3"]
+    assert [page.orders.item(row, 2).text() for row in range(3)] == ["Закрыт"] * 3
+    # Один вопрос на всех, и в нём видны все номера.
+    assert asked["buttons"].count("Отмена") == 1
+    text = "\n".join(asked["text"])
+    assert all(f"· o{n} — получено 10" in text for n in (1, 2, 3))
+
+
+def test_отказ_по_одному_заказу_не_останавливает_остальные(
+        application, tmp_path, stub, monkeypatch, asked):
+    def closing(order_id):
+        if order_id == "o2":
+            raise MarkingError("Заказ уже закрыт")
+
+    page, closed = _many_page(
+        application, tmp_path, stub, monkeypatch,
+        [_done("o1"), _done("o2"), _done("o3")], closing)
+
+    page.orders.selectAll()
+    page.close_order()
+    _settle(application)
+
+    assert closed == ["o1", "o2", "o3"]
+    states = {page.orders.item(row, 0).text(): page.orders.item(row, 2).text()
+              for row in range(3)}
+    # Закрыты два, а отказавший остался открытым — его можно закрыть снова.
+    assert states == {"o1": "Закрыт", "o2": "Готов", "o3": "Закрыт"}
+    assert not page._busy
+
+
+def test_в_пачке_закрываются_только_годные_заказы(application, tmp_path, stub,
+                                                   monkeypatch, asked):
+    untouched = _order(id="o2", buffers=[Buffer(gtin="1", left=500, total=500)])
+    page, closed = _many_page(
+        application, tmp_path, stub, monkeypatch,
+        [_done("o1"), untouched, _order(id="o3", status="CLOSED",
+                                        buffers=_done("o3").buffers)],
+        lambda order_id: None)
+
+    page.orders.selectAll()
+    assert page.close_order_button.text() == "Закрыть заказ…"   # годный один
+    page.close_order()
+    _settle(application)
+
+    assert closed == ["o1"]
+    assert "Пропущено 2" in "\n".join(asked["text"])
+
+
+def test_коды_получают_по_одному_заказу(application, tmp_path, stub, monkeypatch):
+    page, seen = _issue_page(application, tmp_path, stub, monkeypatch)
+    _, state = stub
+    state["orders"] = [_order(), _order(id="3a8f-0002")]
+    page.reload_orders()
+    _settle(application)
+    page.orders.selectAll()
+
+    page.fetch_codes()
+    _settle(application)
+
+    assert seen["asked"] == [] and seen["fetched"] == []
+
+
+# --- выгрузка из сверки в «Срок годности» --------------------------------------------------
+
+def _reconciled_page(application, tmp_path, stub, *, signed=True):
+    """Вкладка со сверкой документа и подменённым ответом «Честного ЗНАКа»."""
+    from app.core.marking import reconcile, upd
+
+    from tests.test_marking_reconcile import DOCUMENT, FIRST, SECOND
+
+    path = tmp_path / "ON_NSCHFDOPPR_2BM-1.xml"
+    path.write_bytes(DOCUMENT.encode("cp1251"))
+    _, state = stub
+    state["signed"] = signed
+    page = _page(application, tmp_path)
+    page._upd = upd.read(str(path))
+    page._session = reconcile.Reconciliation(page._upd)
+    page._sync_reconcile()
+    asked: list = []
+    page.expiry_tab._lookup_many = lambda codes: asked.append(list(codes)) or {}
+    return page, asked, (FIRST, SECOND)
+
+
+def test_без_сканов_выгружать_в_сроки_нечего(application, tmp_path, stub):
+    page, asked, _ = _reconciled_page(application, tmp_path, stub)
+
+    assert not page.upd_expiry_button.isEnabled()
+    page.codes_to_expiry()
+
+    assert page.expiry_tab.entries == [] and asked == []
+
+
+def test_отсканированное_при_сверке_уходит_в_срок_годности(application, tmp_path, stub):
+    from app.ui.marking_page import EXPIRY_TAB
+
+    page, asked, (first, second) = _reconciled_page(application, tmp_path, stub)
+    page._session.scan(first)
+    page._session.scan(second)
+    page._sync_reconcile()
+    assert page.upd_expiry_button.isEnabled()
+
+    page.codes_to_expiry()
+    _settle(application)
+
+    assert page.tabs.currentIndex() == EXPIRY_TAB
+    assert [entry.card.kiz for entry in page.expiry_tab.entries] == [first, second]
+    # Срок спрошен одной пачкой, а не по запросу на код.
+    assert asked == [[first, second]]
+
+
+def test_без_входа_срок_не_выгружается(application, tmp_path, stub):
+    from app.ui.marking_page import RECONCILE_TAB
+
+    page, asked, (first, _) = _reconciled_page(application, tmp_path, stub, signed=False)
+    page.tabs.setCurrentIndex(RECONCILE_TAB)
+    page._session.scan(first)
+    page._sync_reconcile()
+
+    page.codes_to_expiry()
+    _settle(application)
+
+    assert page.expiry_tab.entries == [] and asked == []
+    assert page.tabs.currentIndex() == RECONCILE_TAB
+
+
+def test_повторная_выгрузка_не_дублирует_журнал(application, tmp_path, stub):
+    page, asked, (first, second) = _reconciled_page(application, tmp_path, stub)
+    page._session.scan(first)
+    page._sync_reconcile()
+
+    page.codes_to_expiry()
+    _settle(application)
+    page._session.scan(second)
+    page.codes_to_expiry()
+    _settle(application)
+
+    assert [entry.card.kiz for entry in page.expiry_tab.entries] == [first, second]
+    assert asked == [[first], [second]]
+
+
+# --- раскладка вкладки «Заказ кодов» ---------------------------------------------------------
+
+def test_заказ_кодов_не_растягивается_до_высоты_других_вкладок(application, tmp_path,
+                                                              stub):
+    """Страница лежит в прокручиваемой области: раньше она брала высоту самой
+    высокой вкладки, и список заказов уезжал под нижний край."""
+    from app.ui.marking_page import ORDER_TAB
+
+    page = _page(application, tmp_path)
+    page.tabs.setCurrentIndex(ORDER_TAB)
+    application.processEvents()
+
+    check_tab = page.tabs.widget(0).minimumSizeHint().height()
+    assert page.tabs.sizeHint().height() < check_tab
+    assert not page.tabs.hasHeightForWidth()
+    # Скрытые вкладки высоту не просят.
+    assert page.tabs.widget(0).sizePolicy().verticalPolicy().name == "Ignored"
+    assert page.tabs.widget(ORDER_TAB).sizePolicy().verticalPolicy().name != "Ignored"
+
+
+def test_настроенное_соединение_свёрнуто_а_ненастроенное_открыто(application, tmp_path,
+                                                                 stub):
+    _, state = stub
+    empty = _page(application, tmp_path)
+    assert not empty.suz_form.isHidden()
+
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    configured = _page(application, tmp_path)
+    assert configured.suz_form.isHidden()
+    # Состояние проверки остаётся на виду, а поля раскрываются кнопкой.
+    configured._toggle_suz()
+    assert not configured.suz_form.isHidden()
+    configured._toggle_suz()
+    assert configured.suz_form.isHidden()
+
+
+def test_вкладки_просят_предпочтительную_высоту_открытой_страницы(application, tmp_path,
+                                                                 stub):
+    """Не минимум: у проверки кодов и сверки он занижен, и плитки налезали на соседей."""
+    page = _page(application, tmp_path)
+
+    for index in range(page.tabs.count() - 1):
+        page.tabs.setCurrentIndex(index)
+        application.processEvents()
+        current = page.tabs.widget(index)
+        assert page.tabs.sizeHint().height() >= current.sizeHint().height()
+        assert page.tabs.sizeHint().height() >= current.minimumSizeHint().height()
+
+
+def test_шапки_карточек_заказа_не_раздувают_вкладку(application, tmp_path, stub):
+    """Второстепенное — значком с подсказкой, иначе окно минимальной ширины
+    получало горизонтальную прокрутку."""
+    page = _page(application, tmp_path)
+
+    for button in (page.orders_button,):
+        assert button.text() == "" and button.toolTip()
+    assert page.recover_button.text() == "Восстановить"
+    # Сохранить и забыть — под полями реквизитов, а не в шапке карточки.
+    assert page.suz_form.isAncestorOf(page.suz_save_button)
+    assert page.suz_form.isAncestorOf(page.suz_forget_button)
+    # «В срок годности» — в шапке списка позиций, а не среди кнопок документа.
+    assert page.progress.parentWidget().isAncestorOf(page.upd_expiry_button)

@@ -50,6 +50,11 @@ ORDER_STATUS_PATH = "/order/status"
 # Создание заказа. Единственный расходный метод здесь.
 ORDER_PATH = "/order"
 
+# Закрытие заказа (руководство СУЗ, 4.4.8): `POST /api/v3/order/close`, тело —
+# `{"orderId": ...}`, ответ — `{"omsId": ...}`. Тело подписывается так же, как
+# при создании, — в примере руководства стоит заголовок `X-Signature`.
+CLOSE_PATH = "/order/close"
+
 # Заголовок, которым уходит открепленная подпись тела заказа. Тем же
 # пользуется ПРИНТМАРКИ — `X-Signature` лежит в её библиотеке рядом с
 # `clientToken` и адресом заказа.
@@ -266,6 +271,20 @@ class Order:
     @property
     def products(self) -> int:
         return len(self.buffers)
+
+    @property
+    def finished(self) -> bool:
+        """Заказ уже не принимает коды: закрыт, отклонён или просрочен."""
+        return self.status.upper() in ("CLOSED", "DECLINED", "EXPIRED")
+
+    @property
+    def closable(self) -> bool:
+        """Можно ли закрыть: коды по заказу уже получены, а сам он ещё открыт.
+
+        Заказ без единой выданной пачки закрывать нечем — закрывать там нечего,
+        а необратимое действие над нетронутым заказом почти наверняка ошибка.
+        """
+        return bool(self.id) and not self.finished and self.passed > 0
 
     @property
     def expiring(self) -> bool:
@@ -494,6 +513,44 @@ class OrderUnknown(transport.MarkingError):
     Отдельным исключением, потому что лечится оно единственным способом:
     посмотреть список заказов. Повторять нельзя — это были бы вторые деньги.
     """
+
+
+def close(credentials: Credentials, order_id: str, thumbprint: str,
+          contour: Contour = Contour.SANDBOX) -> None:
+    """Закрывает заказ: СУЗ перестаёт выдавать из него коды.
+
+    Операция необратимая, и устроена как создание заказа: тело подписывается
+    открепленной подписью, запрос идёт без повторов. Повтор здесь вреда бы не
+    принёс, но оборванный ответ всё равно не значит «не закрылся» — после него
+    честнее посмотреть список заказов, чем гадать.
+
+    После закрытия потерянный блок кодов уже не вернуть (руководство СУЗ, 4.4.5),
+    поэтому спрашивать подтверждение и сверять, что всё выданное сохранено на
+    диске, — дело вызывающего.
+    """
+    if gaps := credentials.stripped().missing:
+        raise transport.MarkingError(f"Не заполнено: {', '.join(gaps)}.")
+    if not order_id.strip():
+        raise transport.MarkingError("Не указан заказ, который нужно закрыть.")
+    if not thumbprint.strip():
+        raise transport.MarkingError(
+            "Закрытие заказа нужно подписать, а сертификат не выбран. Выберите "
+            "его на вкладке «Проверка кодов».")
+
+    ready = credentials.stripped()
+    apply(ready, contour)
+    payload = json.dumps({"orderId": order_id.strip()}, ensure_ascii=False)
+    signature = crypto.sign(payload, thumbprint, detached=True)
+    try:
+        transport.post(
+            "suz", CLOSE_PATH, contour=contour,
+            params={"omsId": ready.oms_id},
+            headers={TOKEN_HEADER: ready.token, SIGNATURE_HEADER: signature},
+            text_body=payload, retries=0)
+    except transport.Offline as error:
+        raise transport.MarkingError(
+            "Связь оборвалась, и закрылся ли заказ — неизвестно. Обновите список "
+            f"заказов и посмотрите его состояние.\n\nПодробности: {error}") from None
 
 
 def orders(credentials: Credentials,

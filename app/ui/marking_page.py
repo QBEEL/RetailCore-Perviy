@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 from typing import Callable, Sequence
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,8 +45,10 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -87,6 +89,7 @@ from .widgets.marking_dialogs import (
     OrganisationDialog,
 )
 from .widgets.toast import ToastKind
+from .widgets.withdrawal_tab import WithdrawalTab
 
 # Сколько строк результата показывать. Проверяют тысячами, а глазами смотрят на
 # несоответствия — их отбирает переключатель «только замечания».
@@ -103,8 +106,11 @@ JOURNAL_LIMIT = 50
 # документом, и отдельно — заказать свои.
 CHECK_TAB = 0
 RECONCILE_TAB = 1
+ORDER_TAB = 2
 # Срок годности по QR добавлен последним, чтобы не сдвигать номера прежних вкладок.
 EXPIRY_TAB = 3
+# Вывод из оборота добавлен следом по той же причине.
+WITHDRAWAL_TAB = 4
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
 # косится краем глаза, и различать ответы он должен цветом, а не чтением.
@@ -114,6 +120,53 @@ VERDICT_COLORS: dict[Verdict, tuple[str, str]] = {
     Verdict.UNKNOWN: (Palette.DANGER, Palette.DANGER_SOFT),
     Verdict.BROKEN: (Palette.DANGER, Palette.DANGER_SOFT),
 }
+
+
+class _CompactTabs(QTabWidget):
+    """Вкладки, которые просят место по открытой странице, а не по самой высокой.
+
+    Страница лежит в прокручиваемой области, а та растягивает её до
+    предпочтительного размера. У обычного `QTabWidget` он считается по самой
+    высокой вкладке из всех, и «Заказ кодов» вытягивался до высоты проверки
+    кодов: страница становилась в полтора раза выше окна, а список заказов
+    оказывался под нижним краем.
+
+    Просить же минимум открытой страницы нельзя: у проверки кодов и сверки он
+    занижен (плитки и подписи с переносом занимают больше), и карточки
+    сжимались и налезали друг на друга. Поэтому просится предпочтительный
+    размер открытой страницы — но только её. Скрытым страницам вертикаль
+    объявлена игнорируемой, см. `_fit_to_current`.
+    """
+
+    def _chrome(self) -> int:
+        """Высота всего, что вокруг страницы: полоса вкладок и рамка."""
+        page = self.currentWidget()
+        if page is None:
+            return 0
+        return max(0, super().minimumSizeHint().height()
+                   - page.minimumSizeHint().height())
+
+    def sizeHint(self) -> QSize:
+        page = self.currentWidget()
+        base = super().minimumSizeHint()
+        if page is None:
+            return base
+        wanted = max(page.sizeHint().height(), page.minimumSizeHint().height())
+        return QSize(max(base.width(), page.sizeHint().width()),
+                     self._chrome() + wanted)
+
+    def hasHeightForWidth(self) -> bool:
+        page = self.currentWidget()
+        return page is not None and page.hasHeightForWidth()
+
+    def heightForWidth(self, width: int) -> int:
+        # «Высота от ширины» стопки страниц — максимум по всем, скрытым тоже.
+        # Нужна только открытая: переносимые подписи на ней растут при сужении.
+        page = self.currentWidget()
+        if page is None or not page.hasHeightForWidth():
+            return -1
+        return self._chrome() + max(page.heightForWidth(width),
+                                    page.minimumSizeHint().height())
 
 
 class MarkingPage(QWidget):
@@ -186,7 +239,7 @@ class MarkingPage(QWidget):
         # через СУЗ по её реквизитам, сверка не идёт никуда вовсе, и держать
         # перед глазами все три значит каждый раз выбирать, какие две трети
         # экрана сейчас не нужны.
-        self.tabs = QTabWidget(self)
+        self.tabs = _CompactTabs(self)
         self.tabs.addTab(self._check_tab(), icons.icon("marking"), "Проверка кодов")
         self.tabs.addTab(self._reconcile_tab(), icons.icon("compare"),
                          "Сверка кодов маркировки")
@@ -194,11 +247,22 @@ class MarkingPage(QWidget):
         # Срок годности читается из самого QR и от входа не зависит, как и сверка.
         self.expiry_tab = ExpiryTab(self.settings, self.notify, self)
         self.tabs.addTab(self.expiry_tab, icons.icon("calendar"), "Срок годности")
+        # Вывод из оборота — документ, который уходит в «Честный ЗНАК» от имени
+        # организации, поэтому ему нужны контур, сертификат и ИНН этой страницы.
+        self.withdrawal_tab = WithdrawalTab(
+            self.settings, self.notify, self,
+            contour=lambda: self.contour, thumbprint=lambda: self.thumbprint,
+            inn=self._participant_inn)
+        self.withdrawal_tab.journal_changed.connect(self.reload_journal)
+        self.tabs.addTab(self.withdrawal_tab, icons.icon("export"), "Вывод из оборота")
         # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
         # в поле сканирования при открытии вкладки — не удобство, а условие
         # работы: иначе первый же код уедет в поле поиска или в никуда.
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
+        for tabs in (self.tabs, self.order_tabs):
+            tabs.currentChanged.connect(lambda _index, tabs=tabs: _fit_to_current(tabs))
+            _fit_to_current(tabs)
 
     def _check_tab(self) -> QWidget:
         page = QWidget(self)
@@ -238,14 +302,13 @@ class MarkingPage(QWidget):
         # Две подвкладки по порядку работы: сначала заказать и забрать коды,
         # потом напечатать и ввести в оборот. Всё на одном экране вытеснило бы
         # список заказов за нижний край окна.
-        self.order_tabs = QTabWidget(page)
+        self.order_tabs = _CompactTabs(page)
         self.order_tabs.setDocumentMode(True)
         order = QWidget(self.order_tabs)
         order_body = QVBoxLayout(order)
         order_body.setContentsMargins(0, Metrics.GAP, 0, 0)
         order_body.setSpacing(Metrics.GAP)
         order_body.addWidget(self._suz_card())
-        order_body.addWidget(self._new_order_card())
         order_body.addWidget(self._orders_card(), 1)
         self.order_tabs.addTab(order, icons.icon("order"), "Заказ и получение кодов")
         issued = QWidget(self.order_tabs)
@@ -320,14 +383,26 @@ class MarkingPage(QWidget):
         self.suz_check_button = self._action(card, "Проверить соединение", "run",
                                              self.check_suz)
         self.suz_check_button.setObjectName("Primary")
+        # Сохранить и забыть относятся к самим полям, поэтому лежат под ними и
+        # прячутся вместе с ними: в шапке им нет места, а нужны они только
+        # тому, кто правит реквизиты.
         self.suz_save_button = self._action(card, "Сохранить", "save", self.save_suz)
         self.suz_forget_button = self._action(card, "Забыть", "clear", self.forget_suz)
-        for button in (self.suz_token_button, self.suz_check_button,
-                       self.suz_save_button, self.suz_forget_button):
+        self.suz_toggle = self._action(card, "Реквизиты", "settings",
+                                       self._toggle_suz)
+        self.suz_toggle.setToolTip(
+            "Показать или скрыть поля реквизитов. Когда соединение настроено, "
+            "они свёрнуты — освобождают место списку заказов")
+        for button in (self.suz_toggle, self.suz_token_button,
+                       self.suz_check_button):
             header.addWidget(button)
         body.addLayout(header)
 
-        form = QFormLayout()
+        # Поля — в своём виджете, чтобы сворачивать их разом. Подсказка под
+        # ними остаётся на виду всегда: в ней итог проверки соединения.
+        self.suz_form = QWidget(card)
+        form = QFormLayout(self.suz_form)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(9)
         self.oms_edit = QLineEdit(card)
         self.oms_edit.setPlaceholderText("Идентификатор ОМС из личного кабинета СУЗ")
@@ -356,7 +431,13 @@ class MarkingPage(QWidget):
         self.suz_host_edit.setPlaceholderText(
             "Пусто — облачная СУЗ. Адрес нужен только локальной станции")
         form.addRow("Адрес СУЗ", self.suz_host_edit)
-        body.addLayout(form)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(9)
+        buttons.addStretch(1)
+        buttons.addWidget(self.suz_save_button)
+        buttons.addWidget(self.suz_forget_button)
+        form.addRow("", buttons)
+        body.addWidget(self.suz_form)
 
         for field in (self.oms_edit, self.connection_edit, self.token_edit,
                       self.suz_host_edit):
@@ -364,32 +445,6 @@ class MarkingPage(QWidget):
 
         self.suz_hint = Hint("", card)
         body.addWidget(self.suz_hint)
-        return card
-
-    def _new_order_card(self) -> Card:
-        """Новый заказ кодов.
-
-        Сама форма — в отдельном окне: заказывают обычно десятки товаров сразу, и
-        таблица в полторы строки на странице для этого не годится. Способ выпуска
-        назван теми же словами, что в ПРИНТМАРКИ: одно и то же в двух программах
-        должно называться одинаково, иначе однажды будет выбрано не то.
-        """
-        card = Card(self)
-        body = card.body()
-
-        header = QHBoxLayout()
-        header.setSpacing(9)
-        header.addWidget(SectionTitle("Новый заказ", card))
-        header.addStretch(1)
-        self.order_button = self._action(card, "Заказать коды…", "run", self.new_order)
-        self.order_button.setObjectName("Primary")
-        header.addWidget(self.order_button)
-        body.addLayout(header)
-
-        self.order_hint = Hint(
-            "Откроется отдельное окно: в нём можно заказать сразу много товаров с "
-            "разными GTIN — список вставляется целиком из Excel.", card)
-        body.addWidget(self.order_hint)
         return card
 
     def _orders_card(self) -> Card:
@@ -406,22 +461,43 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Заказы кодов", card))
         header.addStretch(1)
+        # Заказ — главное действие вкладки, и стоит оно там же, где список его
+        # результатов: отдельная карточка ради одной кнопки отнимала высоту у
+        # самого списка и выталкивала его за нижний край окна.
+        self.order_button = self._action(card, "Заказать коды…", "run",
+                                         self.new_order)
+        self.order_button.setObjectName("Primary")
+        self.order_button.setToolTip(
+            "Откроется отдельное окно: в нём можно заказать сразу много товаров "
+            "с разными GTIN — список вставляется целиком из Excel")
+        header.addWidget(self.order_button)
         self.fetch_button = self._action(card, "Получить коды…", "download",
                                          self.fetch_codes)
-        self.fetch_button.setObjectName("Primary")
         self.fetch_button.setToolTip(
             "Забирает коды из буфера выбранного заказа и сохраняет их на диск. "
             "Коды выдаются безвозвратно")
         header.addWidget(self.fetch_button)
-        self.recover_button = self._action(card, "Восстановить потерянные", "history",
+        self.recover_button = self._action(card, "Восстановить", "history",
                                            self.recover_codes)
         self.recover_button.setToolTip(
             "Возвращает блоки, которые СУЗ уже выдала, а на этом компьютере их нет")
         header.addWidget(self.recover_button)
-        self.orders_button = self._action(card, "Обновить", "refresh",
-                                          self.reload_orders)
+        self.close_order_button = self._action(card, "Закрыть заказ…", "close",
+                                               self.close_order)
+        self.close_order_button.setToolTip(
+            "Закрывает выбранные заказы в СУЗ, когда коды по ним уже получены. "
+            "Несколько заказов выбираются с Ctrl или Shift. Необратимо: после "
+            "закрытия потерянный блок кодов не вернуть")
+        self.close_order_button.setEnabled(False)
+        header.addWidget(self.close_order_button)
+        self.orders_button = self._icon_action(card, "Обновить список заказов",
+                                               "refresh", self.reload_orders)
         header.addWidget(self.orders_button)
         body.addLayout(header)
+
+        # Итог последнего заказа. Пока заказов не отправляли, строка пуста.
+        self.order_hint = Hint("", card)
+        body.addWidget(self.order_hint)
 
         self.orders = QTableWidget(0, 6, card)
         self.orders.setHorizontalHeaderLabels(
@@ -429,13 +505,16 @@ class MarkingPage(QWidget):
              "Кодов доступно"])
         self.orders.verticalHeader().setVisible(False)
         self.orders.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.orders.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.orders.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.orders.setMaximumHeight(170)
+        self.orders.setMinimumHeight(150)
+        self.orders.itemSelectionChanged.connect(self._sync_close_button)
         head = self.orders.horizontalHeader()
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in (1, 2, 3, 4, 5):
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        body.addWidget(self.orders)
+        body.addWidget(self.orders, 1)
 
         self.orders_hint = Hint("", card)
         body.addWidget(self.orders_hint)
@@ -468,10 +547,17 @@ class MarkingPage(QWidget):
         self.batch_status_button.setToolTip(
             "Спрашивает «Честный ЗНАК», чем закончилась проверка отправленного документа")
         header.addWidget(self.batch_status_button)
-        header.addWidget(self._action(card, "Папка с кодами", "folder",
-                                      self.open_batches_folder))
-        header.addWidget(self._action(card, "Обновить", "refresh",
-                                      self.reload_batches))
+        self.batch_delete_button = self._action(card, "Удалить", "trash",
+                                                self.delete_batch)
+        self.batch_delete_button.setToolTip(
+            "Убирает выбранный блок из списка. Файл с кодами не стирается, а "
+            "переезжает в подпапку «deleted» — вернуть его можно руками")
+        self.batch_delete_button.setEnabled(False)
+        header.addWidget(self.batch_delete_button)
+        header.addWidget(self._icon_action(card, "Открыть папку с кодами", "folder",
+                                           self.open_batches_folder))
+        header.addWidget(self._icon_action(card, "Обновить список блоков", "refresh",
+                                           self.reload_batches))
         body.addLayout(header)
 
         self.batches = QTableWidget(0, 5, card)
@@ -737,6 +823,12 @@ class MarkingPage(QWidget):
             "Оставить строки, по которым сверено не всё")
         self.open_only_box.stateChanged.connect(self._fill_progress)
         header.addWidget(self.open_only_box)
+        self.upd_expiry_button = self._action(card, "В срок годности", "calendar",
+                                              self.codes_to_expiry)
+        self.upd_expiry_button.setToolTip(
+            "Перенести отсканированные при сверке коды на вкладку «Срок "
+            "годности»: срок спросится у «Честного ЗНАКа» разом на все коды")
+        header.addWidget(self.upd_expiry_button)
         body.addLayout(header)
 
         self.progress = QTableWidget(0, 6, card)
@@ -848,6 +940,20 @@ class MarkingPage(QWidget):
         button = QPushButton(title, parent)
         button.setIcon(icons.icon(icon))
         button.clicked.connect(handler)
+        return button
+
+    def _icon_action(self, parent: QWidget, tooltip: str, icon: str,
+                     handler: Callable[[], None]) -> QPushButton:
+        """Кнопка без подписи — для второстепенного, что узнаётся по значку.
+
+        В шапках карточек подписи не помещаются в окне минимальной ширины:
+        страница получала горизонтальную прокрутку. Подпись уходит в подсказку.
+        """
+        button = QPushButton(parent)
+        button.setIcon(icons.icon(icon))
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.clicked.connect(lambda _checked=False: handler())
         return button
 
     # --- контур и сертификат ----------------------------------------------------
@@ -1073,6 +1179,9 @@ class MarkingPage(QWidget):
             field.setText(value)
             field.blockSignals(False)
         self._suz_answer = ""
+        # Настроенное соединение не нужно держать развёрнутым: поля нужны один
+        # раз, а место — каждый день. Ненастроенное — наоборот, показано сразу.
+        self._set_suz_open(not saved.stripped().filled)
         self._sync_suz_hint()
         # Заказы относились к прежнему набору реквизитов. Перечитать их здесь
         # нельзя — сюда заходят и при сборке вкладки, до всякой сети, — а
@@ -1080,6 +1189,14 @@ class MarkingPage(QWidget):
         self._orders = []
         self.orders.setRowCount(0)
         self._sync_orders_hint()
+
+    def _toggle_suz(self) -> None:
+        self._set_suz_open(self.suz_form.isHidden())
+
+    def _set_suz_open(self, shown: bool) -> None:
+        """Показывает или прячет поля реквизитов. Подсказка под ними остаётся."""
+        self.suz_form.setVisible(shown)
+        self.suz_toggle.setText("Скрыть реквизиты" if shown else "Реквизиты")
 
     def _on_token_shown(self, shown: bool) -> None:
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Normal if shown
@@ -1162,6 +1279,7 @@ class MarkingPage(QWidget):
         # протухший.
         renewed = credentials.token != self.suz_credentials.stripped().token
         self._show_suz(service.save_suz(credentials, self.contour))
+        self._set_suz_open(False)
         self.notify(
             f"{answer} · токен обновлён по сертификату" if renewed
             else f"{answer} · реквизиты сохранены", ToastKind.SUCCESS)
@@ -1288,6 +1406,7 @@ class MarkingPage(QWidget):
                 # нельзя. Показать их числом без оговорки — обмануть.
                 self.orders.item(row, 5).setForeground(QColor(Palette.DANGER))
         self.orders_button.setEnabled(True)
+        self._sync_close_button()
         self._sync_orders_hint()
 
     def _on_orders_error(self, message: str) -> None:
@@ -1328,6 +1447,23 @@ class MarkingPage(QWidget):
         row = self.orders.currentRow()
         return self._orders[row] if 0 <= row < len(self._orders) else None
 
+    def _selected_orders(self) -> list:
+        """Все выбранные заказы в порядке списка."""
+        rows = sorted({index.row() for index in self.orders.selectionModel()
+                       .selectedRows()}) if self.orders.selectionModel() else []
+        return [self._orders[row] for row in rows if 0 <= row < len(self._orders)]
+
+    def _one_order(self):
+        """Заказ для получения или восстановления: тут нужен ровно один."""
+        if len(self._selected_orders()) > 1:
+            self.notify("Выберите один заказ: коды получают по одному",
+                        ToastKind.WARNING)
+            return None
+        order = self._selected_order()
+        if order is None:
+            self.notify("Выберите заказ в списке", ToastKind.WARNING)
+        return order
+
     def _adopt_credentials(self, credentials: Credentials) -> None:
         """Токен мог обновиться по дороге — в поле должен лежать настоящий."""
         if credentials.token != self.suz_credentials.stripped().token:
@@ -1340,9 +1476,8 @@ class MarkingPage(QWidget):
         Сначала читаются названия и ТН ВЭД товаров — это ничего не расходует, —
         и только потом человеку предлагается решение, которое нельзя отменить.
         """
-        order = self._selected_order()
+        order = self._one_order()
         if order is None:
-            self.notify("Выберите заказ в списке", ToastKind.WARNING)
             return
         if not any(buffer.left > 0 for buffer in order.buffers):
             self.notify("В выбранном заказе нет кодов для получения",
@@ -1400,11 +1535,123 @@ class MarkingPage(QWidget):
         self.reload_batches()
         self.reload_orders()
 
+    def _sync_close_button(self) -> None:
+        closable = [order for order in self._selected_orders() if order.closable]
+        self.close_order_button.setEnabled(bool(closable) and not self._busy)
+        self.close_order_button.setText(
+            f"Закрыть заказы ({len(closable)})…" if len(closable) > 1
+            else "Закрыть заказ…")
+
+    def close_order(self) -> None:
+        """Закрывает выбранные заказы, коды по которым уже получены.
+
+        Закрытие необратимо, а потерянный после него блок не вернуть, поэтому
+        перед вопросом сверяется, всё ли выданное лежит на этом компьютере.
+        Заказов может быть много: вопрос один на всех, а закрываются они по
+        очереди, и отказ по одному не останавливает остальные.
+        """
+        chosen = self._selected_orders()
+        if not chosen:
+            self.notify("Выберите заказ в списке", ToastKind.WARNING)
+            return
+        closable = [order for order in chosen if order.closable]
+        if not closable:
+            self.notify("Закрыть можно открытый заказ, по которому уже получены "
+                        "коды", ToastKind.WARNING)
+            return
+        if not self.thumbprint:
+            self.notify("Закрытие подписывается — выберите сертификат на вкладке "
+                        "«Проверка кодов»", ToastKind.WARNING)
+            return
+        if not self.suz_credentials.stripped().filled:
+            self.notify("Сначала настройте соединение с СУЗ", ToastKind.WARNING)
+            return
+
+        shown = 8
+        lines = [f"{self.contour.title}. Заказов к закрытию: {len(closable)}, "
+                 f"получено кодов: {sum(order.passed for order in closable)}.",
+                 "\n".join(f"· {order.id} — получено {order.passed}"
+                           for order in closable[:shown])]
+        if len(closable) > shown:
+            lines[-1] += f"\n· …и ещё {len(closable) - shown}"
+        if skipped := len(chosen) - len(closable):
+            lines.append(f"\nПропущено {skipped}: заказ уже закрыт или кодов по "
+                         "нему не получали.")
+        unsaved = [order for order in closable
+                   if issue_module.stored_for(order.id) < order.passed]
+        if unsaved:
+            lines.append(
+                f"\nВНИМАНИЕ: у заказов без полного набора кодов на этом "
+                f"компьютере ({', '.join(order.id for order in unsaved[:shown])}"
+                f"{'…' if len(unsaved) > shown else ''}) выданное не всё "
+                "сохранено: сохранено "
+                f"{sum(issue_module.stored_for(order.id) for order in unsaved)} из "
+                f"{sum(order.passed for order in unsaved)}. Остальные после "
+                "закрытия вернуть будет нельзя — сначала нажмите «Восстановить».")
+        if left := sum(order.left for order in closable):
+            lines.append(
+                f"\nВ буфере ещё {left} кодов, которые вы не забирали. "
+                "После закрытия они пропадут.")
+        lines.append("\nЗакрытие нельзя отменить.")
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Закрыть заказы" if len(closable) > 1
+                               else "Закрыть заказ")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText("Закрыть заказы кодов?" if len(closable) > 1
+                        else "Закрыть заказ кодов?")
+        confirm.setInformativeText("\n".join(lines))
+        yes = confirm.addButton(
+            f"Закрыть ({len(closable)})" if len(closable) > 1 else "Закрыть заказ",
+            QMessageBox.ButtonRole.DestructiveRole)
+        cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        confirm.setDefaultButton(cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not yes:
+            return
+
+        self._set_busy(True)
+        self.orders_hint.setStyleSheet("")
+        self.orders_hint.setText(
+            "Закрываем заказы — КриптоПро может спросить пароль…"
+            if len(closable) > 1 else
+            "Закрываем заказ — КриптоПро может спросить пароль…")
+        run_task(
+            service.close_suz_orders,
+            self.suz_credentials, [order.id for order in closable], self.contour,
+            self.thumbprint, self.settings.marking_inn,
+            on_result=self._on_orders_closed,
+            on_error=self._on_close_error,
+        )
+
+    def _on_orders_closed(self, outcome: tuple) -> None:
+        results, credentials = outcome
+        self._set_busy(False)
+        self._adopt_credentials(credentials)
+        failed = [(order_id, error) for order_id, error in results if error]
+        closed = len(results) - len(failed)
+        if closed:
+            self.notify("Заказ закрыт" if closed == 1
+                        else f"Закрыто заказов: {closed}", ToastKind.SUCCESS)
+        self.reload_orders()
+        if failed:
+            # Список перечитывается, и подсказка под ним переписывается сводкой;
+            # про отказы же молчать нельзя — они остаются в уведомлении.
+            details = "; ".join(f"{order_id}: {error}" for order_id, error in failed)
+            self.notify(f"Не закрыто заказов: {len(failed)} из {len(results)}. "
+                        f"{details}", ToastKind.ERROR)
+
+    def _on_close_error(self, message: str) -> None:
+        self._set_busy(False)
+        self.orders_hint.setText(f"Заказ не закрыт: {message}")
+        self.orders_hint.setStyleSheet(f"color: {Palette.DANGER};")
+        self.notify(f"Заказ не закрыт: {message}", ToastKind.ERROR)
+        # Если связь оборвалась, заказ мог закрыться — показать актуальное.
+        self.reload_orders()
+
     def recover_codes(self) -> None:
         """Возвращает блоки, которые СУЗ выдала, а здесь их нет."""
-        order = self._selected_order()
+        order = self._one_order()
         if order is None:
-            self.notify("Выберите заказ в списке", ToastKind.WARNING)
             return
         gtins = [buffer.gtin for buffer in order.buffers
                  if buffer.gtin and buffer.passed > 0]
@@ -1479,6 +1726,7 @@ class MarkingPage(QWidget):
 
     def _sync_batches_hint(self) -> None:
         batch = self._selected_batch()
+        self.batch_delete_button.setEnabled(batch is not None and not self._busy)
         if not self._batches:
             self.batches_hint.setText(
                 "Блоков нет. Выберите заказ на соседней вкладке и нажмите «Получить "
@@ -1502,6 +1750,41 @@ class MarkingPage(QWidget):
             return
         PrintDialog(batch, self).exec()
         self.reload_batches(select=batch.id)
+
+    def delete_batch(self) -> None:
+        """Убирает блок из списка: файл с кодами уезжает в подпапку, а не стирается."""
+        batch = self._selected_batch()
+        if batch is None:
+            self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
+            return
+        lines = [f"{batch.name or batch.gtin} · {batch.total} кодов, напечатано "
+                 f"{batch.printed}."]
+        if batch.printed < batch.total:
+            lines.append(f"\nНе напечатано ещё {batch.left} этикеток.")
+        if not batch.introduced and not batch.doc_id:
+            lines.append("\nВ оборот этот блок не вводился.")
+        lines.append("\nКоды оплачены, а повторно СУЗ их не выдаёт. Файл не "
+                     "стирается: он переедет в подпапку «deleted» рядом с "
+                     "остальными блоками.")
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Удалить блок кодов")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText("Убрать блок из списка?")
+        confirm.setInformativeText("\n".join(lines))
+        yes = confirm.addButton("Удалить", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        confirm.setDefaultButton(cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not yes:
+            return
+        try:
+            issue_module.delete(batch)
+        except OSError as error:
+            self.notify(f"Не удалось удалить блок: {error}", ToastKind.ERROR)
+            return
+        self.reload_batches()
+        self.notify("Блок убран из списка. Файл — в подпапке «deleted»",
+                    ToastKind.SUCCESS)
 
     def _send_problem(self, batch: issue_module.Batch) -> dict[str, str]:
         """Почему этот блок нельзя отправить из программы, по видам документа.
@@ -1863,6 +2146,13 @@ class MarkingPage(QWidget):
             self._focus_scan()
         elif index == EXPIRY_TAB:
             self.expiry_tab.focus_scan()
+        elif index == WITHDRAWAL_TAB:
+            self.withdrawal_tab.prefill_inn()
+            self.withdrawal_tab.focus_scan()
+
+    def _participant_inn(self) -> str:
+        """ИНН, от имени которого уходят документы: вошедшей организации, иначе выбранной."""
+        return (service.current().inn if service.signed_in() else "")             or self.settings.marking_inn
 
     def _focus_scan(self) -> None:
         """Курсор в поле сканирования. Без этого сканер печатает мимо."""
@@ -1993,6 +2283,9 @@ class MarkingPage(QWidget):
                        self.upd_forget_button, self.undo_button,
                        self.restart_button):
             button.setEnabled(session is not None)
+        # Выгружать есть что, только когда хоть один код уже отсканирован.
+        self.upd_expiry_button.setEnabled(
+            session is not None and bool(session.scanned_codes))
 
         if session is None:
             self.scan_hint.setText("")
@@ -2101,6 +2394,30 @@ class MarkingPage(QWidget):
         self.notify(
             f"Перенесено кодов: {len(self._upd.marks)}. "
             "Для проверки нужен вход по сертификату", ToastKind.INFO)
+
+    def codes_to_expiry(self) -> None:
+        """Переносит отсканированные при сверке коды на вкладку «Срок годности».
+
+        Сверка отвечает, то ли приехало, а срок годности — до какого числа оно
+        годно, и смотреть его по тем же вещам удобно сразу, пока они на столе:
+        второй раз сканировать их незачем.
+        """
+        if self._session is None or not self._session.scanned_codes:
+            self.notify("Сначала отсканируйте коды при сверке", ToastKind.WARNING)
+            return
+        # В коде маркировки срока нет, он спрашивается у «Честного ЗНАКа», а для
+        # этого нужен вход. Сказать об этом лучше до переноса, чем строкой
+        # ошибки напротив каждого кода.
+        if not service.signed_in():
+            self.notify("Срок спрашивается у «Честного ЗНАКа» — войдите по "
+                        "сертификату на вкладке «Проверка кодов»", ToastKind.WARNING)
+            return
+        added, skipped = self.expiry_tab.add_codes(
+            self._session.scanned_codes, origin=self._session.document.title)
+        self.tabs.setCurrentIndex(EXPIRY_TAB)
+        tail = f" (уже были в журнале: {skipped})" if skipped else ""
+        self.notify(f"В журнал сроков перенесено кодов: {added}{tail}",
+                    ToastKind.INFO if added else ToastKind.WARNING)
 
     def save_report(self) -> None:
         if self._session is None:
@@ -2336,6 +2653,9 @@ class MarkingPage(QWidget):
         # подписывать нечем.
         self.suz_token_button.setEnabled(bool(self.thumbprint) and not self._busy)
         self.order_button.setEnabled(not self._busy)
+        self._sync_close_button()
+        self.batch_delete_button.setEnabled(
+            self._selected_batch() is not None and not self._busy)
         if not self._busy:
             self.session_hint.setText(self._session_summary())
         # Боевой контур помечается цветом всегда: в песочнице ошибка ничего не
@@ -2368,6 +2688,25 @@ class MarkingPage(QWidget):
                     f"сертификатом.{chosen}")
         return ("Песочница: данные ненастоящие, ошибка ничего не стоит. Для "
                 f"настоящих кодов переключите контур на боевой.{chosen}")
+
+
+def _fit_to_current(tabs: QTabWidget) -> None:
+    """Высота вкладок — по открытой, а не по самой высокой из всех.
+
+    `QTabWidget` берёт размер по всем страницам сразу, и «Проверка кодов» с её
+    тремя карточками тянула вниз и «Заказ кодов»: страница получалась в полтора
+    раза выше окна, прокручивалась, а список заказов оказывался под нижним краем.
+    Скрытым страницам вертикаль объявляется игнорируемой — раскладка стопки их
+    высоту тогда не считает.
+    """
+    current = tabs.currentIndex()
+    for index in range(tabs.count()):
+        page = tabs.widget(index)
+        policy = page.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Preferred if index == current
+                                 else QSizePolicy.Policy.Ignored)
+        page.setSizePolicy(policy)
+    tabs.updateGeometry()
 
 
 def _contour_title(value: str) -> str:

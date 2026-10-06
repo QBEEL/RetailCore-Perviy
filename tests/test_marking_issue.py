@@ -215,6 +215,38 @@ def test_повреждённый_файл_блока_пропускается()
     assert [batch.id for batch in issue.saved()] == ["ok"]
 
 
+def test_удалённый_блок_уходит_из_списка_но_файл_цел():
+    batch = issue.Batch(id="b", gtin=GTIN, codes=[CODE] * 3)
+    issue.save(batch)
+
+    moved = issue.delete(batch)
+
+    assert issue.saved() == []
+    assert issue.load("b") is None
+    # Оплаченные коды не стёрты: их можно вернуть, переложив файл обратно.
+    assert os.path.dirname(moved) == os.path.join(issue.folder(), issue.TRASH)
+    with open(moved, encoding="utf-8") as handle:
+        assert json.load(handle)["codes"] == [CODE] * 3
+
+
+def test_подпапка_удалённых_не_попадает_в_список():
+    issue.save(issue.Batch(id="a", gtin=GTIN, codes=[CODE]))
+    issue.save(issue.Batch(id="b", gtin=GTIN, codes=[CODE]))
+    issue.delete(issue.load("b"))
+
+    assert [batch.id for batch in issue.saved()] == ["a"]
+
+
+def test_сколько_кодов_заказа_сохранено_на_компьютере():
+    issue.save(issue.Batch(id="a", order_id="o1", gtin=GTIN, codes=[CODE] * 4))
+    issue.save(issue.Batch(id="b", order_id="o1", gtin="2", codes=[CODE] * 2))
+    issue.save(issue.Batch(id="c", order_id="o2", gtin=GTIN, codes=[CODE] * 7))
+
+    assert issue.stored_for("o1") == 6
+    assert issue.stored_for("o1", GTIN) == 4
+    assert issue.stored_for("нет") == 0
+
+
 # --- ввод в оборот ----------------------------------------------------------------
 
 def _document(**changes):

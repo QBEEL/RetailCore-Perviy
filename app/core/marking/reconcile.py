@@ -224,6 +224,26 @@ class Reconciliation:
                 if scan.verdict in (Verdict.UNKNOWN, Verdict.BROKEN)]
 
     @property
+    def scanned_codes(self) -> list[str]:
+        """Коды, которые действительно побывали в руках, — в порядке сканирования.
+
+        Сошедшиеся с документом и лишние: срок годности нужен и тем, и другим,
+        вещь-то на складе. Не попадают повторы (тот же экземпляр дважды) и
+        неразобранное — у такого кода нет ни товара, ни серийного номера, и
+        спросить о нём «Честный ЗНАК» нечем.
+        """
+        found: list[str] = []
+        taken: set[str] = set()
+        for scan in self.history:
+            if scan.verdict not in (Verdict.MATCHED, Verdict.UNKNOWN):
+                continue
+            if scan.key in taken:
+                continue
+            taken.add(scan.key)
+            found.append(scan.raw)
+        return found
+
+    @property
     def repeats(self) -> int:
         return sum(1 for scan in self.history if scan.verdict is Verdict.REPEAT)
 

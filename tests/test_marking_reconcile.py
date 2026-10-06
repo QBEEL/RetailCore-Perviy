@@ -443,3 +443,26 @@ def test_без_документа_сканировать_нечем(page):
     assert not page.scan_edit.isEnabled()
     assert not page.upd_report_button.isEnabled()
     assert "Документ не загружен" in page.upd_hint.text()
+
+
+def test_в_срок_годности_уходят_отсканированные_без_повторов_и_мусора(document):
+    """Сошедшиеся и лишние — вещь на складе; повтор и нечитаемое спрашивать нечем."""
+    session = Reconciliation(upd.read(str(document)))
+
+    session.scan(SCANNED)                              # сошёлся
+    session.scan(FIRST)                                # повтор того же экземпляра
+    session.scan("0104680962315457215ZZZZZZZZZZZZ")    # лишний экземпляр
+    session.scan("МУСОР")                              # не разобран
+
+    assert session.scanned_codes == [SCANNED, "0104680962315457215ZZZZZZZZZZZZ"]
+
+
+def test_отменённый_скан_не_попадает_в_выгрузку(document):
+    session = Reconciliation(upd.read(str(document)))
+    session.scan(FIRST)
+    session.scan(SECOND)
+
+    session.undo()
+
+    assert session.scanned_codes == [FIRST]
+    assert Reconciliation(upd.read(str(document))).scanned_codes == []

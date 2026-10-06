@@ -196,6 +196,36 @@ def create_suz_order(request: orders_module.Request, credentials: suz.Credential
         lambda ready: orders_module.create(ready, request, thumbprint, contour))
 
 
+def close_suz_order(credentials: suz.Credentials, order_id: str,
+                    contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+                    inn: str = "") -> tuple[None, suz.Credentials]:
+    """Закрывает заказ кодов. Необратимо: коды из него больше не выдаются."""
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: orders_module.close(ready, order_id, thumbprint, contour))
+
+
+def close_suz_orders(credentials: suz.Credentials, order_ids: Sequence[str],
+                     contour: Contour = Contour.SANDBOX, thumbprint: str = "",
+                     inn: str = "") -> tuple[list[tuple[str, str]], suz.Credentials]:
+    """Закрывает заказы по очереди и возвращает пары «номер и ошибка».
+
+    Пустая ошибка — закрыт. Отказ по одному заказу (уже закрыт, нет прав) не
+    останавливает остальные: человек выбрал пачку, чтобы не нажимать по одному,
+    и бросать её на полпути из-за одного заказа значило бы вернуть ему эту работу.
+    Токен, обновившийся по дороге, передаётся дальше — второй раз входить не нужно.
+    """
+    results: list[tuple[str, str]] = []
+    for order_id in order_ids:
+        try:
+            _, credentials = close_suz_order(credentials, order_id, contour,
+                                             thumbprint, inn)
+            results.append((order_id, ""))
+        except transport.MarkingError as error:
+            results.append((order_id, str(error)))
+    return results, credentials
+
+
 def suz_product_info(credentials: suz.Credentials, order_id: str,
                      contour: Contour = Contour.SANDBOX, thumbprint: str = "",
                      inn: str = "") -> tuple[dict[str, issue.Product], suz.Credentials]:

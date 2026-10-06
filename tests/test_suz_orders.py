@@ -524,3 +524,81 @@ def test_невыбранный_шаблон_назван_невыбранным
     empty = _request(lines=[orders.Line(gtin="046", quantity=1)])
 
     assert "не выбран шаблон кода маркировки" in empty.problems
+
+
+# --- закрытие заказа ------------------------------------------------------------------
+
+def _order(status: str, passed: int, left: int = 0) -> orders.Order:
+    return orders.Order(
+        id="o", status=status,
+        buffers=[orders.Buffer(gtin="1", left=left, passed=passed)])
+
+
+def test_закрыть_можно_открытый_заказ_с_полученными_кодами():
+    assert _order("READY", passed=500).closable
+    # Остаток в буфере не запрещает закрытие — о нём предупреждает окно.
+    assert _order("READY", passed=500, left=100).closable
+
+
+@pytest.mark.parametrize("order", [
+    _order("READY", passed=0, left=500),   # ничего не получено — закрывать нечего
+    _order("CLOSED", passed=500),
+    _order("DECLINED", passed=0),
+    _order("EXPIRED", passed=500),
+    orders.Order(status="READY", buffers=[orders.Buffer(passed=5)]),  # без номера
+])
+def test_закрыть_нельзя_нетронутый_или_уже_завершённый_заказ(order):
+    assert not order.closable
+
+
+def test_закрытие_подписывается_и_идёт_по_пути_из_руководства(answered, monkeypatch):
+    """`POST /api/v3/order/close?omsId=…`, тело `{"orderId": …}`, подпись в `X-Signature`."""
+    calls, state = answered
+    state["body"] = {"omsId": OMS}
+    signed: list = []
+
+    def sign(data, thumbprint, detached=False):
+        signed.append((data, thumbprint, detached))
+        return "подпись-закрытия"
+
+    monkeypatch.setattr(orders.crypto, "sign", sign)
+
+    orders.close(FULL, "заказ-1", "ААББ", Contour.SANDBOX)
+
+    prepared = calls[0]
+    assert prepared.get_method() == "POST"
+    assert prepared.full_url.endswith(f"/api/v3/order/close?omsId={OMS}")
+    assert json.loads(prepared.data) == {"orderId": "заказ-1"}
+    assert prepared.get_header("X-signature") == "подпись-закрытия"
+    assert prepared.get_header("Clienttoken") == FULL.token
+    assert signed[0][1] == "ААББ" and signed[0][2] is True
+    # Подписано ровно то, что ушло.
+    assert signed[0][0].encode("utf-8") == prepared.data
+
+
+def test_без_сертификата_заказ_не_закрывается_и_сеть_не_трогается(answered):
+    calls, _ = answered
+
+    with pytest.raises(transport.MarkingError, match="сертификат не выбран"):
+        orders.close(FULL, "заказ-1", "", Contour.SANDBOX)
+    with pytest.raises(transport.MarkingError, match="Не указан заказ"):
+        orders.close(FULL, " ", "ААББ", Contour.SANDBOX)
+
+    assert calls == []
+
+
+def test_оборванная_связь_не_повторяет_закрытие(monkeypatch):
+    tries = []
+
+    def drop(prepared, tolerate=()):
+        tries.append(prepared)
+        raise transport.Offline("связь оборвалась")
+
+    monkeypatch.setattr(transport, "_send", drop)
+    transport.limiter.reset()
+
+    with pytest.raises(transport.MarkingError) as failure:
+        orders.close(FULL, "заказ-1", "ААББ", Contour.SANDBOX)
+
+    assert len(tries) == 1
+    assert "неизвестно" in str(failure.value)

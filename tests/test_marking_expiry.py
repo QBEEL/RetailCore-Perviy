@@ -574,3 +574,203 @@ def test_настоящий_срок_из_ответа_не_перебивает
 
     assert entry.card.expires == date(2029, 1, 19) and not entry.card.estimated
     assert "расчёт" not in tab.verdict_label.text()
+
+
+PACK_TWO = "0104640470860092215QqWwEe"
+
+
+def _by_code(answers: dict):
+    """Пакетный ответ: на каждый код — свой `CodeInfo`, как отдаёт `ask_gis_many`."""
+    def many(codes):
+        return {code: answers[code] for code in codes if code in answers}
+    return many
+
+
+def test_пачка_кодов_спрашивается_одним_обращением(application, tmp_path):
+    from app.core.settings import AppSettings
+    from app.ui.widgets.expiry_tab import ExpiryTab
+
+    asked: list[list[str]] = []
+
+    def many(codes):
+        asked.append(list(codes))
+        return {code: _info(ANSWER) for code in codes}
+
+    tab = ExpiryTab(AppSettings(_path=tmp_path / "settings.json"), lookup_many=many)
+    added, skipped = tab.add_codes([PACK, PACK_TWO], today=TODAY)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    assert (added, skipped) == (2, 0)
+    assert asked == [[PACK, PACK_TWO]], "обращение одно на всю пачку, а не по коду"
+    assert [entry.card.expires for entry in tab.entries] == [date(2029, 1, 19)] * 2
+    assert all(entry.source == "ГИС МТ" for entry in tab.entries)
+    assert "срок известен у 2 из 2" in tab.hint.text()
+
+
+def test_то_что_уже_в_журнале_повторно_не_добавляется(application, tmp_path):
+    from app.core.settings import AppSettings
+    from app.ui.widgets.expiry_tab import ExpiryTab
+
+    asked: list[list[str]] = []
+    tab = ExpiryTab(AppSettings(_path=tmp_path / "settings.json"),
+                    lookup=lambda code: _info(ANSWER),
+                    lookup_many=lambda codes: asked.append(list(codes)) or {
+                        code: _info(ANSWER) for code in codes})
+    first = tab.accept_scan(PACK, today=TODAY)
+    _wait_until(lambda: not first.pending)
+
+    added, skipped = tab.add_codes([PACK_WITH_TAIL, PACK_TWO, "  ", PACK_TWO], today=TODAY)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    # Тот же экземпляр с хвостом и дважды заданный второй — это по одному разу.
+    assert (added, skipped) == (1, 2)
+    assert len(tab.entries) == 2
+    assert asked == [[PACK_TWO]]
+
+
+def test_код_без_ответа_системы_остаётся_с_объяснением(application, tmp_path):
+    from app.core.settings import AppSettings
+    from app.ui.widgets.expiry_tab import ExpiryTab
+
+    tab = ExpiryTab(AppSettings(_path=tmp_path / "settings.json"),
+                    lookup_many=_by_code({PACK: _info(ANSWER)}))
+    tab.add_codes([PACK, PACK_TWO], today=TODAY)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    by_code = {entry.card.kiz: entry for entry in tab.entries}
+    assert by_code[PACK].card.expires == date(2029, 1, 19)
+    assert by_code[PACK_TWO].card.expires is None
+    assert "не ответил" in by_code[PACK_TWO].card.problems[0]
+    assert "срок известен у 1 из 2" in tab.hint.text()
+
+
+def test_отказ_на_пачке_объясняется_у_каждого_кода(application, tmp_path):
+    from app.core.settings import AppSettings
+    from app.ui.widgets.expiry_tab import ExpiryTab
+
+    def refuse(codes):
+        raise RuntimeError("Нужен вход по сертификату")
+
+    tab = ExpiryTab(AppSettings(_path=tmp_path / "settings.json"), lookup_many=refuse)
+    tab.add_codes([PACK, PACK_TWO], today=TODAY)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    assert all("вход" in entry.card.problems[0].lower() for entry in tab.entries)
+    assert not any(entry.pending for entry in tab.entries)
+
+
+def test_код_со_сроком_в_самом_коде_не_спрашивает_систему(application, tmp_path):
+    from app.core.settings import AppSettings
+    from app.ui.widgets.expiry_tab import ExpiryTab
+
+    asked: list = []
+    tab = ExpiryTab(AppSettings(_path=tmp_path / "settings.json"),
+                    lookup_many=lambda codes: asked.append(codes) or {})
+    with_date = f"{PACK}{GS}17290119{GS}91EE11"
+
+    added, _ = tab.add_codes([with_date], today=TODAY)
+
+    assert added == 1 and asked == []
+    assert tab.entries[0].card.expires == date(2029, 1, 19)
+
+
+# --- УПД прямо в «Срок годности» ----------------------------------------------------------
+
+def _upd_tab(application, tmp_path, monkeypatch, *, signed=True, lookup_many=None):
+    """Вкладка со сроками, УПД на диске и перехваченными уведомлениями."""
+    from app.core.settings import AppSettings
+    from app.ui.widgets import expiry_tab as module
+
+    from tests.test_marking_reconcile import DOCUMENT
+
+    path = tmp_path / "ON_NSCHFDOPPR_2BM-1.xml"
+    path.write_bytes(DOCUMENT.encode("cp1251"))
+    monkeypatch.setattr(module.service, "signed_in", lambda: signed)
+    said: list = []
+    tab = ExpiryTabFactory.make(module, tmp_path, said, lookup_many)
+    return tab, str(path), said
+
+
+class ExpiryTabFactory:
+    @staticmethod
+    def make(module, tmp_path, said, lookup_many):
+        from app.core.settings import AppSettings
+
+        return module.ExpiryTab(AppSettings(_path=tmp_path / "settings.json"),
+                                notify=lambda text, kind: said.append((text, kind)),
+                                lookup_many=lookup_many)
+
+
+def test_упд_целиком_уходит_в_срок_годности_одной_пачкой(application, tmp_path,
+                                                         monkeypatch):
+    from tests.test_marking_reconcile import FIRST, SECOND, THIRD
+
+    asked: list = []
+
+    def many(codes):
+        asked.append(list(codes))
+        return {code: _info(ANSWER) for code in codes}
+
+    tab, path, said = _upd_tab(application, tmp_path, monkeypatch, lookup_many=many)
+
+    assert tab.load_upd(path) == 3
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    assert asked == [[FIRST, SECOND, THIRD]]
+    assert all(entry.card.expires == date(2029, 1, 19) for entry in tab.entries)
+    assert "добавлено кодов: 3" in said[-1][0]
+    # В замечании видно, из какого документа код.
+    assert all("УПД № 3349 от 09.09.2026" in tab._remark(entry) for entry in tab.entries)
+
+
+def test_название_из_упд_остаётся_когда_система_не_ответила(application, tmp_path,
+                                                            monkeypatch):
+    tab, path, _ = _upd_tab(application, tmp_path, monkeypatch,
+                            lookup_many=lambda codes: {})
+
+    tab.load_upd(path)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+
+    titles = sorted(entry.card.title for entry in tab.entries)
+    assert titles == ["Бюстгальтер, какао (M)", "Бюстгальтер, какао (M)",
+                      "Трусы, чёрные (L)"]
+    assert all("не ответил" in entry.card.problems[0] for entry in tab.entries)
+
+
+def test_без_входа_упд_в_сроки_не_грузится(application, tmp_path, monkeypatch):
+    from app.ui.widgets.toast import ToastKind
+
+    asked: list = []
+    tab, path, said = _upd_tab(application, tmp_path, monkeypatch, signed=False,
+                               lookup_many=lambda codes: asked.append(codes) or {})
+
+    assert tab.load_upd(path) == 0
+
+    assert tab.entries == [] and asked == []
+    assert said[-1][1] is ToastKind.WARNING and "войдите" in said[-1][0]
+
+
+def test_не_упд_называется_ошибкой_а_не_молчит(application, tmp_path, monkeypatch):
+    from app.ui.widgets.toast import ToastKind
+
+    tab, _, said = _upd_tab(application, tmp_path, monkeypatch)
+    broken = tmp_path / "не_упд.xml"
+    broken.write_text("<Файл><Документ/></Файл>", encoding="utf-8")
+
+    assert tab.load_upd(str(broken)) == 0
+
+    assert tab.entries == [] and said[-1][1] is ToastKind.ERROR
+
+
+def test_повторная_загрузка_того_же_упд_не_дублирует_журнал(application, tmp_path,
+                                                             monkeypatch):
+    tab, path, said = _upd_tab(
+        application, tmp_path, monkeypatch,
+        lookup_many=lambda codes: {code: _info(ANSWER) for code in codes})
+
+    tab.load_upd(path)
+    _wait_until(lambda: not any(entry.pending for entry in tab.entries))
+    assert tab.load_upd(path) == 0
+
+    assert len(tab.entries) == 3
+    assert "уже были в журнале: 3" in said[-1][0]
