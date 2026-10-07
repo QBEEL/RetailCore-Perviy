@@ -95,6 +95,7 @@ def _payment(row: dict) -> Payment:
         comment=row["comment"],
         # Сервер до статей ДДС этого поля не присылает.
         dds_item=row.get("dds_item") or "",
+        unplanned=bool(row.get("unplanned", False)),
         had_files=bool(row["had_files"]),
         origin=_origin(row["origin"]),
         origin_ref=row["origin_ref"],
@@ -405,6 +406,7 @@ def _for_server(payment: Payment) -> dict[str, Any]:
         "responsible": payment.responsible,
         "author": payment.author,
         "comment": payment.comment,
+        "unplanned": bool(payment.unplanned),
         "had_files": bool(payment.had_files),
         "origin": payment.origin.value,
         "origin_ref": payment.origin_ref,

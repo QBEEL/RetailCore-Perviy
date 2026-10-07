@@ -39,7 +39,7 @@ COLUMNS = (
     "p.id, p.doc_number, p.request_date, p.pay_date, p.amount, p.vat,"
     " p.currency, p.supplier_id, p.recipient, p.recipient_key, p.status,"
     " p.source_status, p.paid_flag, p.operation, p.over_limit, p.priority,"
-    " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.had_files,"
+    " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.unplanned, p.had_files,"
     " p.origin, p.origin_ref, p.created_at, p.updated_at,"
     " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
     " p.amount_before, p.amount_changed_at,"

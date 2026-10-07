@@ -121,6 +121,10 @@ class Payment:
     # Статья ДДС — название из справочника (`dds.items`). Выгрузка 1С её не
     # содержит: ставит тот, кто заводит оплату, и импорт её не затирает.
     dds_item: str = ""
+    # Заявка появилась в 1С, а в приложении на неё плана не было: ни плана
+    # менеджера, ни ручной записи на этого получателя и этот день. Ставит
+    # импорт при создании записи и больше не трогает.
+    unplanned: bool = False
     had_files: bool = False
     origin: PaymentOrigin = PaymentOrigin.MANUAL
     origin_ref: str = ""
@@ -412,6 +416,11 @@ class Day:
         return sum(1 for p in self.payments if p.status is PaymentStatus.OVERDUE)
 
     @property
+    def unplanned(self) -> int:
+        """Сколько оплат дня пришло из 1С без плана в приложении."""
+        return sum(1 for p in self.payments if p.unplanned)
+
+    @property
     def amount_changed(self) -> int:
         """Сколько оплат дня с изменённой суммой — рукой или выгрузкой 1С."""
         return sum(1 for p in self.payments if p.amount_changed)
@@ -613,6 +622,8 @@ class RowChange:
     key: tuple[str, str] = ("", "")
     # Сумма, которую предложила программа, если человек её поправил до записи.
     amount_proposed: float | None = None
+    # Новая заявка, на которую в приложении не было плана.
+    unplanned: bool = False
 
     KINDS = {"new": "Новая", "plan": "Заменит план", "changed": "Изменится"}
 
@@ -661,6 +672,8 @@ class ImportReport:
     # Новые заявки 1С, которые встанут на место уже заведённой ручной или
     # плановой оплаты, а не лягут рядом с ней второй записью.
     adopted: int = 0
+    # Из новых — заявки, на которые плана не было (`Payment.unplanned`).
+    unplanned: int = 0
     same: int = 0
     # Куда уйдут суммы уже лежащих в базе записей — и изменившихся, и занявших
     # место плана: сколько выросло, сколько снизилось и на какие деньги.

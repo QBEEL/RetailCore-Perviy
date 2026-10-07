@@ -69,6 +69,10 @@ COLUMNS: dict[str, str] = {
     "автор": "author",
 }
 
+# Пометка заявки, на которую в приложении не было плана — и в предпросмотре
+# импорта, и в карточке оплаты.
+UNPLANNED_NOTE = "не было запланировано"
+
 # Без этих колонок файл не выгрузка оплат, а что-то другое.
 REQUIRED: tuple[str, ...] = ("doc_number", "request_date", "amount", "recipient")
 
@@ -287,6 +291,22 @@ def parse(
     return payments, skipped
 
 
+def is_unplanned(payment: Payment, existing: dict) -> bool:
+    """Новая заявка 1С без плана в приложении — «не было запланировано».
+
+    Вызывается для заявок, которые не заняли место плана или ручной записи.
+    Два условия, без которых пометка превратилась бы в шум:
+
+    · База уже знает прошлые выгрузки. Первая выгрузка (и выгрузка после
+      удаления данных) приносит всю историю разом, и «не было запланировано»
+      оказалось бы у всех семи тысяч заявок.
+    · Заявка на оплату поставщику. План в приложении ведётся по поставщикам;
+      налоги, аренда и зарплата планом менеджера не бывают, и пометка на них
+      была бы ложной.
+    """
+    return bool(existing) and payment.operation.strip() == SUPPLIER_OPERATION
+
+
 def analyze(
     path: str,
     existing: dict[tuple[str, str], object],
@@ -340,9 +360,12 @@ def analyze(
             report.details.append(_plan_change(candidate, taken[candidate.id]))
     for payment in fresh:
         if id(payment) not in replaced:
+            unplanned = is_unplanned(payment, existing)
+            report.unplanned += unplanned
             report.details.append(RowChange(
                 "new", payment.doc_number, payment.request_date, payment.recipient,
-                payment.amount, fields=_new_fields(payment), key=payment.key))
+                payment.amount, fields=_new_fields(payment), key=payment.key,
+                note=UNPLANNED_NOTE if unplanned else "", unplanned=unplanned))
     report.details.sort(key=lambda row: (
         ("plan", "changed", "new").index(row.kind), -abs(row.delta), row.doc_number))
     report.new = len(fresh) - report.adopted
@@ -609,8 +632,12 @@ def split_changes(
     # исправленная сумма меняла бы пары, которые человек видел в предпросмотре.
     adopted = adoptions(created, candidates)
     taken = {id(payment) for payment in adopted.values()}
-    created = [_with_override(payment, report) for payment in created
-               if id(payment) not in taken]
+    # Пометка — по тому, что база знает сейчас, а не по предпросмотру: между
+    # разбором и подтверждением могли завести ручную запись или импортировать
+    # соседнюю выгрузку.
+    created = [replace(_with_override(payment, report),
+                       unplanned=is_unplanned(payment, existing))
+               for payment in created if id(payment) not in taken]
     return (created, changed,
             [(ident, _with_override(payment, report)) for ident, payment in adopted.items()])
 

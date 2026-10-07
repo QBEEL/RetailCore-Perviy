@@ -38,7 +38,7 @@ IMPORTED_FIELDS: tuple[str, ...] = (
 # Все поля новой записи.
 INSERT_FIELDS: tuple[str, ...] = (
     "doc_number", "request_date", "status", "supplier_id", "comment",
-    "origin", "origin_ref", *IMPORTED_FIELDS,
+    "origin", "origin_ref", "unplanned", *IMPORTED_FIELDS,
 )
 
 
@@ -109,6 +109,9 @@ class ImportPayment(BaseModel):
     had_files: bool = False
     origin: Origin = "import"
     origin_ref: str = ""
+    # Новая заявка, на которую в приложении не было плана. Ставит клиент при
+    # разборе выгрузки; у изменяемых и занимающих место плана не используется.
+    unplanned: bool = False
 
 
 class ImportChange(BaseModel):

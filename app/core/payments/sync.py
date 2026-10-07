@@ -243,6 +243,7 @@ def pack(payment: Payment) -> dict[str, Any]:
         "author": payment.author,
         "comment": payment.comment,
         "dds_item": payment.dds_item,
+        "unplanned": bool(payment.unplanned),
         "had_files": bool(payment.had_files),
         "origin": payment.origin.value,
         "origin_ref": payment.origin_ref,

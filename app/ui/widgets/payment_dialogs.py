@@ -544,7 +544,8 @@ class PaymentDialog(QDialog):
                 f"из 1С: заявка {payment.doc_number}"
                 + (f" от {payment.request_date:%d.%m.%Y}" if payment.request_date else "")
                 + (f" · автор {payment.author}" if payment.author else "")
-                + (" · во вложении 1С есть файлы" if payment.had_files else ""))
+                + (" · во вложении 1С есть файлы" if payment.had_files else "")
+                + (" · не было запланировано" if payment.unplanned else ""))
 
     def _reload_files(self) -> None:
         self.files.clear()
@@ -759,7 +760,8 @@ class ImportDialog(QDialog):
         bar.addWidget(QLabel("Показать:", self.filter_row))
         self.kind_filter = QComboBox(self.filter_row)
         for title, key in (("Всё", ""), ("Заменят план", "plan"), ("Изменятся", "changed"),
-                           ("Сумма изменилась", "amount"), ("Новые", "new")):
+                           ("Сумма изменилась", "amount"), ("Новые", "new"),
+                           ("Не было запланировано", "unplanned")):
             self.kind_filter.addItem(title, key)
         self.kind_filter.currentIndexChanged.connect(self._show_details)
         bar.addWidget(self.kind_filter)
@@ -861,6 +863,8 @@ class ImportDialog(QDialog):
         tiles = [
             ("Прочитано", report.rows, Palette.TEXT_MUTED),
             ("Новых", report.new, Palette.SUCCESS),
+            # Из новых — заявки, которых в приложении никто не планировал.
+            ("Не было запланировано", report.unplanned, Palette.INFO),
             # Заявки, которые встанут на место ручной или плановой оплаты.
             ("Заменят план", report.adopted, Palette.SUCCESS),
             ("Изменится", report.updated, Palette.WARNING),
@@ -897,6 +901,8 @@ class ImportDialog(QDialog):
         rows = self.report.details
         if key == "amount":
             return [row for row in rows if row.delta]
+        if key == "unplanned":
+            return [row for row in rows if row.unplanned]
         return [row for row in rows if not key or row.kind == key]
 
     def _show_details(self) -> None:

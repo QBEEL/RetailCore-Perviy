@@ -185,6 +185,15 @@ class DayCell(QFrame):
 
         # Цвет статьи ДДС — точкой того же размера: Маркетинг розовый, и день с
         # его оплатой виден в сетке, не открывая список. По точке на цвет.
+        # Заявка из 1С без плана в приложении — точкой Palette.INFO: этого цвета
+        # нет ни среди цветов статей, ни среди точек просрочки и правки суммы.
+        self.unplanned = QLabel("", self)
+        self.unplanned.setFixedSize(6, 6)
+        self.unplanned.setStyleSheet(
+            f"background: {Palette.INFO}; border-radius: 3px;")
+        self.unplanned.hide()
+        head.addWidget(self.unplanned)
+
         self.mark_dots: list[QLabel] = []
         for _ in range(MARK_DOTS):
             dot = QLabel("", self)
@@ -221,6 +230,7 @@ class DayCell(QFrame):
             self.detail.setText("")
             self.alert.hide()
             self.changed.hide()
+            self.unplanned.hide()
             self._show_marks(None)
             self._style = "QFrame#DayCell { background: transparent; }"
             self.setStyleSheet(self._style)
@@ -257,6 +267,7 @@ class DayCell(QFrame):
 
         self.alert.setVisible(bool(data is not None and data.overdue and not muted))
         self.changed.setVisible(bool(data is not None and data.amount_changed and not muted))
+        self.unplanned.setVisible(bool(data is not None and data.unplanned and not muted))
         self._show_marks(None if muted else data)
 
         if data is None or not data.count:
@@ -299,6 +310,8 @@ class DayCell(QFrame):
             lines.append(f"просрочено: {data.overdue}")
         if data.amount_changed:
             lines.append(f"сумма изменена: {data.amount_changed}")
+        if data.unplanned:
+            lines.append(f"не было запланировано: {data.unplanned}")
         by_note: dict[str, int] = {}
         for payment in data.payments:
             if note := marks.note_of(payment.dds_item):

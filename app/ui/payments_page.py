@@ -578,6 +578,8 @@ class PaymentsPage(QWidget):
                 # второй строки не стоит.
                 origin = "заменена из 1С" if payment.amount_by_import else "изменена"
                 text += f"\n• сумма {origin}: {payment.amount_change_text}"
+            if payment.unplanned:
+                text += "\n• не было запланировано"
             note = marks.note_of(payment.dds_item)
             if note:
                 # Метка статьи — отдельной строкой, как пометка о сумме: цвет
@@ -778,6 +780,10 @@ class PaymentsPage(QWidget):
                    icon=lambda p: _dot(p)),
             Column("Заметка", lambda p: marks.note_of(p.dds_item), width=120,
                    color=lambda p: _ink(p), tip="Метка статьи ДДС, заданная администратором"),
+            # Заявка появилась в 1С, а плана на неё в приложении не было.
+            Column("План", lambda p: "Не было запланировано" if p.unplanned else "",
+                   width=160, color=lambda p: QColor(Palette.INFO),
+                   tip="Заявку завели в 1С, а плана на неё в приложении не было"),
             Column("Сумма, ₽", lambda p: money(p.amount), width=130,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    color=lambda p: QColor(Palette.WARNING) if p.amount_changed else None,

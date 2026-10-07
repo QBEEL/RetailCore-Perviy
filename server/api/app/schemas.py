@@ -88,6 +88,8 @@ class PaymentOut(BaseModel):
     author: str
     comment: str
     dds_item: str = ""
+    # Заявка из 1С, на которую в приложении не было плана.
+    unplanned: bool = False
     had_files: bool
     origin: Origin
     origin_ref: str

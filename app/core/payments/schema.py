@@ -131,7 +131,14 @@ def _step_3(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE payment ADD COLUMN dds_item TEXT NOT NULL DEFAULT ''")
 
 
-_MIGRATIONS = (_step_1, _step_2, _step_3)
+def _step_4(connection: sqlite3.Connection) -> None:
+    """Пометка «не было запланировано» — как на сервере, миграция 011."""
+    have = {row[1] for row in connection.execute("PRAGMA table_info(payment)")}
+    if "unplanned" not in have:
+        connection.execute("ALTER TABLE payment ADD COLUMN unplanned INTEGER NOT NULL DEFAULT 0")
+
+
+_MIGRATIONS = (_step_1, _step_2, _step_3, _step_4)
 VERSION = len(_MIGRATIONS)
 
 
