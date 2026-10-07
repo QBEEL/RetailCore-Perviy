@@ -121,6 +121,60 @@ def test_план_на_другую_дату_не_спасает(tmp_path, db):
     assert report.unplanned == 1
 
 
+def test_заявка_на_будущий_месяц_не_помечается(tmp_path, db):
+    """Идёт октябрь — план на ноябрь ещё могут не составить."""
+    _import(_file(tmp_path, "первая.csv", _row("IP00-1", "100 000,00", "Альфа ООО")), db)
+
+    report = service.analyze_import(
+        _file(tmp_path, "вторая.csv", _row("IP00-1", "100 000,00", "Альфа ООО"),
+              _row("IP00-2", "50 000,00", "Бета ООО", pay="05.11.2026"),
+              _row("IP00-3", "60 000,00", "Гамма ООО", pay="31.12.2026")),
+        today=TODAY, db_path=db)
+
+    assert report.new == 2 and report.unplanned == 0
+    service.apply_import(report, today=TODAY, db_path=db, link=False)
+    rows = _by_doc(db)
+    assert rows["IP00-2"].unplanned is False and rows["IP00-3"].unplanned is False
+
+
+def test_текущий_и_прошлый_месяц_помечаются_а_следующий_нет(tmp_path, db):
+    _import(_file(tmp_path, "первая.csv", _row("IP00-1", "100 000,00", "Альфа ООО")), db)
+
+    report = service.analyze_import(
+        _file(tmp_path, "вторая.csv", _row("IP00-1", "100 000,00", "Альфа ООО"),
+              _row("IP00-2", "1,00", "А ООО", pay="30.09.2026"),
+              _row("IP00-3", "2,00", "Б ООО", pay="07.10.2026"),
+              _row("IP00-4", "3,00", "В ООО", pay="31.10.2026"),
+              _row("IP00-5", "4,00", "Г ООО", pay="01.11.2026")),
+        today=TODAY, db_path=db)
+
+    flagged = {row.doc_number for row in report.details if row.unplanned}
+    # Весь октябрь — «не закончился» и платёж на его конец уже помечается;
+    # граница проходит по месяцу, а не по сегодняшнему числу.
+    assert flagged == {"IP00-2", "IP00-3", "IP00-4"}
+
+
+def test_граница_месяца_двигается_вместе_с_датой():
+    from app.core.payments.importer import is_unplanned
+
+    base = {("IP", "2026-10-01"): object()}
+    payment = Payment(amount=1.0, recipient="А", pay_date=date(2026, 11, 5),
+                      operation="Оплата поставщику")
+
+    assert not is_unplanned(payment, base, date(2026, 10, 31))
+    assert is_unplanned(payment, base, date(2026, 11, 1))
+    assert is_unplanned(payment, base, date(2026, 12, 15))
+
+
+def test_заявка_без_даты_платежа_помечается_как_раньше():
+    from app.core.payments.importer import is_unplanned
+
+    payment = Payment(amount=1.0, recipient="А", pay_date=None,
+                      operation="Оплата поставщику")
+
+    assert is_unplanned(payment, {("IP", "2026-10-01"): object()}, TODAY)
+
+
 def test_налоги_и_аренда_планом_не_бывают(tmp_path, db):
     _import(_file(tmp_path, "первая.csv", _row("IP00-1", "100 000,00", "Альфа ООО")), db)
 

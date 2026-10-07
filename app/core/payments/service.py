@@ -104,7 +104,7 @@ def apply_import(
     _may_import()
     existing = store.existing_index(db_path)
     created, changed, adopted = importer.split_changes(
-        report, existing, store.adoption_candidates(db_path))
+        report, existing, store.adoption_candidates(db_path), today)
     written, updated, taken = store.apply_import(created, changed, db_path, adopted=adopted)
     report.new, report.updated, report.adopted = written, updated, taken
     report.applied = True

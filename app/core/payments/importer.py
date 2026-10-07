@@ -291,11 +291,11 @@ def parse(
     return payments, skipped
 
 
-def is_unplanned(payment: Payment, existing: dict) -> bool:
+def is_unplanned(payment: Payment, existing: dict, today: date | None = None) -> bool:
     """Новая заявка 1С без плана в приложении — «не было запланировано».
 
     Вызывается для заявок, которые не заняли место плана или ручной записи.
-    Два условия, без которых пометка превратилась бы в шум:
+    Три условия, без которых пометка превратилась бы в шум:
 
     · База уже знает прошлые выгрузки. Первая выгрузка (и выгрузка после
       удаления данных) приносит всю историю разом, и «не было запланировано»
@@ -303,8 +303,18 @@ def is_unplanned(payment: Payment, existing: dict) -> bool:
     · Заявка на оплату поставщику. План в приложении ведётся по поставщикам;
       налоги, аренда и зарплата планом менеджера не бывают, и пометка на них
       была бы ложной.
+    · Платёж не на будущий месяц. Пока идёт октябрь, план на ноябрь ещё могут
+      не составить, и заявка на ноябрь «незапланированной» не является. Месяц
+      платежа сравнивается с текущим целиком, а не по числам: заявка на 1 ноября,
+      заведённая 31 октября, — это уже ноябрь. Платёж без даты месяца не имеет и
+      помечается, как раньше.
     """
-    return bool(existing) and payment.operation.strip() == SUPPLIER_OPERATION
+    if not existing or payment.operation.strip() != SUPPLIER_OPERATION:
+        return False
+    if payment.pay_date is None:
+        return True
+    moment = today or date.today()
+    return (payment.pay_date.year, payment.pay_date.month) <= (moment.year, moment.month)
 
 
 def analyze(
@@ -360,7 +370,7 @@ def analyze(
             report.details.append(_plan_change(candidate, taken[candidate.id]))
     for payment in fresh:
         if id(payment) not in replaced:
-            unplanned = is_unplanned(payment, existing)
+            unplanned = is_unplanned(payment, existing, today)
             report.unplanned += unplanned
             report.details.append(RowChange(
                 "new", payment.doc_number, payment.request_date, payment.recipient,
@@ -601,6 +611,7 @@ def split_changes(
     report: ImportReport,
     existing: dict[tuple[str, str], object],
     candidates: Sequence[Payment] = (),
+    today: date | None = None,
 ) -> tuple[list[Payment], list[tuple[int, Payment]], list[tuple[int, Payment]]]:
     """Делит разобранное на создаваемое, обновляемое и занимающее своё место.
 
@@ -636,7 +647,7 @@ def split_changes(
     # разбором и подтверждением могли завести ручную запись или импортировать
     # соседнюю выгрузку.
     created = [replace(_with_override(payment, report),
-                       unplanned=is_unplanned(payment, existing))
+                       unplanned=is_unplanned(payment, existing, today))
                for payment in created if id(payment) not in taken]
     return (created, changed,
             [(ident, _with_override(payment, report)) for ident, payment in adopted.items()])
