@@ -10,6 +10,7 @@ from .routers import (
     audit,
     auth,
     budgets,
+    dds,
     files,
     imports,
     maintenance,
@@ -43,6 +44,7 @@ app.include_router(audit.router)
 app.include_router(payments.router)
 app.include_router(files.router)
 app.include_router(budgets.router)
+app.include_router(dds.router)
 app.include_router(recipients.router)
 app.include_router(imports.router)
 app.include_router(maintenance.router)

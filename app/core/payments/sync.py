@@ -39,7 +39,8 @@ Progress = Callable[[int, int], None]
 COMPARED: tuple[str, ...] = (
     "pay_date", "amount", "vat", "currency", "supplier_id", "recipient",
     "status", "source_status", "paid_flag", "operation", "over_limit",
-    "priority", "edo_state", "responsible", "comment", "origin", "origin_ref",
+    "priority", "edo_state", "responsible", "comment", "dds_item", "origin",
+    "origin_ref",
 )
 
 # Насколько подробно называть расхождение в отчёте.
@@ -60,6 +61,7 @@ FIELD_TITLES: dict[str, str] = {
     "responsible": "ответственный",
     "comment": "комментарий",
     "origin": "источник",
+    "dds_item": "статья ДДС",
     "origin_ref": "метка источника",
 }
 
@@ -163,6 +165,12 @@ def differences(local: Payment, remote: Payment) -> tuple[str, ...]:
         elif name == "recipient":
             if recipient_key(mine) != recipient_key(theirs):
                 found.append(name)
+        elif name == "dds_item":
+            # Пустая статья у меня — не правка: оплаты из 1С локально статьи не
+            # имеют, а менеджеры на сервере её уже проставили. Стереть чужую
+            # статью выгрузкой нельзя.
+            if mine and mine != theirs:
+                found.append(name)
         elif mine != theirs:
             found.append(name)
     return tuple(found)
@@ -234,6 +242,7 @@ def pack(payment: Payment) -> dict[str, Any]:
         "responsible": payment.responsible,
         "author": payment.author,
         "comment": payment.comment,
+        "dds_item": payment.dds_item,
         "had_files": bool(payment.had_files),
         "origin": payment.origin.value,
         "origin_ref": payment.origin_ref,

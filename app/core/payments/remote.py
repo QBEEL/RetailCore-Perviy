@@ -32,7 +32,7 @@ from .models import (
 )
 from .recipients import recipient_key
 from .safe_files import safe_name
-from .store import Filter
+from .store import NO_DDS_ITEM, Filter
 
 # Куда складываются скачанные вложения. Папка временная по смыслу: файл всегда
 # можно скачать заново, а чистится она вместе с профилем.
@@ -93,6 +93,8 @@ def _payment(row: dict) -> Payment:
         responsible=row["responsible"],
         author=row["author"],
         comment=row["comment"],
+        # Сервер до статей ДДС этого поля не присылает.
+        dds_item=row.get("dds_item") or "",
         had_files=bool(row["had_files"]),
         origin=_origin(row["origin"]),
         origin_ref=row["origin_ref"],
@@ -182,6 +184,7 @@ def _params(selection: Filter | None) -> dict[str, Any]:
         "operation": chosen.operation,
         "over_limit": chosen.over_limit,
         "dated_only": chosen.dated_only or None,
+        "dds_item": chosen.dds_item,
     }
 
 
@@ -202,6 +205,12 @@ def list_payments(
         # «плана нет» от «фильтр не сработал» пользователю было бы нечем.
         allowed = set(selection.origins)
         payments = [payment for payment in payments if payment.origin in allowed]
+    if selection and selection.dds_item:
+        # Сервер без отбора по статье пропустит параметр молча — как и с
+        # источником выше. Лишнее отсекаем здесь, иначе вся выборка выдавала бы
+        # себя за отфильтрованную.
+        wanted = "" if selection.dds_item == NO_DDS_ITEM else selection.dds_item
+        payments = [payment for payment in payments if payment.dds_item == wanted]
     return payments[:limit] if limit else payments
 
 
@@ -235,6 +244,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "amount": payment.amount,
             "vat": payment.vat,
             "priority": payment.priority,
+            "dds_item": payment.dds_item,
         })
     else:
         row = transport.post("/api/payments", {
@@ -252,6 +262,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "responsible": payment.responsible,
             "operation": payment.operation,
             "priority": payment.priority,
+            "dds_item": payment.dds_item,
             # Происхождение передаётся серверу: иначе загруженный план
             # неотличим от созданного вручную, и при следующей загрузке
             # заменять было бы нечего.

@@ -34,7 +34,8 @@ FIELDS: tuple[str, ...] = (
     "doc_number", "request_date", "pay_date", "amount", "vat", "currency",
     "supplier_id", "recipient", "recipient_key", "status", "source_status",
     "paid_flag", "operation", "over_limit", "priority", "edo_state",
-    "responsible", "author", "comment", "had_files", "origin", "origin_ref",
+    "responsible", "author", "comment", "dds_item", "had_files", "origin",
+    "origin_ref",
 )
 
 
@@ -60,6 +61,7 @@ class SyncPayment(BaseModel):
     responsible: str = ""
     author: str = ""
     comment: str = ""
+    dds_item: str = ""
     had_files: bool = False
     origin: Origin = "manual"
     origin_ref: str = ""
@@ -116,8 +118,13 @@ def upload(form: SyncUpload,
             # сумма здесь и есть правка администратора. Помечается так же,
             # как правка в карточке, иначе после выгрузки календарь показал
             # бы изменённую сумму без отметки.
+            #
+            # Статью ДДС пустое значение не стирает: у оплат из 1С локально её
+            # нет, а на сервере её могли уже проставить менеджеры.
             assignments = ", ".join(
-                [f"{name} = %({name})s" for name in FIELDS] + [AMOUNT_MARKS])
+                [f"{name} = %({name})s" if name != "dds_item"
+                 else "dds_item = COALESCE(NULLIF(%(dds_item)s, ''), dds_item)"
+                 for name in FIELDS] + [AMOUNT_MARKS])
             handle.executemany(
                 f"UPDATE payment SET {assignments}, updated_at = now(),"
                 " updated_by = %(user)s WHERE id = %(id)s",

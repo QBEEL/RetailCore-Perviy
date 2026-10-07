@@ -34,6 +34,9 @@ from .models import (
 from . import schema
 from .recipients import recipient_key
 
+# То же, что `dds.NO_ITEM`: store не может импортировать dds, не потянув сеть.
+NO_DDS_ITEM = "none"
+
 DB_FILE = "payments.db"
 FILES_DIR = "payment_files"
 
@@ -99,6 +102,8 @@ class Filter:
     # входит: направления живут на сервере, а оплаты бывают и локальными, —
     # отбирает `directions.by_direction` уже прочитанные строки.
     direction: str = ""
+    # Название статьи ДДС или `dds.NO_ITEM` — оплаты, где статьи нет.
+    dds_item: str = ""
 
     @property
     def active(self) -> bool:
@@ -107,7 +112,7 @@ class Filter:
             or self.supplier_id
             or self.recipient or self.amount_from is not None or self.amount_to is not None
             or self.responsible or self.operation or self.over_limit is not None
-            or self.suppliers_only or self.direction
+            or self.suppliers_only or self.direction or self.dds_item
         )
 
     def where(self) -> tuple[str, list[Any]]:
@@ -157,6 +162,11 @@ class Filter:
         if self.over_limit is not None:
             parts.append("over_limit = ?")
             values.append(int(self.over_limit))
+        if self.dds_item == NO_DDS_ITEM:
+            parts.append("dds_item = ''")
+        elif self.dds_item:
+            parts.append("dds_item = ?")
+            values.append(self.dds_item)
         if self.suppliers_only:
             parts.append("operation = ?")
             values.append(SUPPLIER_OPERATION)
@@ -754,6 +764,7 @@ def _values(payment: Payment, *, imported_only: bool = False) -> dict[str, Any]:
         "responsible": payment.responsible,
         "author": payment.author,
         "comment": payment.comment,
+        "dds_item": payment.dds_item,
         "had_files": int(payment.had_files),
         "origin": payment.origin.value,
         "origin_ref": payment.origin_ref,
@@ -790,6 +801,7 @@ def _payment(row: sqlite3.Row) -> Payment:
         responsible=row["responsible"],
         author=row["author"],
         comment=row["comment"],
+        dds_item=row["dds_item"],
         had_files=bool(row["had_files"]),
         origin=_origin(row["origin"]),
         origin_ref=row["origin_ref"],

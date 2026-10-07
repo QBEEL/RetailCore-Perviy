@@ -37,6 +37,7 @@ ENTITIES = {
     "recipient_link": "привязка получателя",
     "app_user": "учётная запись",
     "database": "база данных",
+    "dds_item": "статья ДДС",
 }
 
 

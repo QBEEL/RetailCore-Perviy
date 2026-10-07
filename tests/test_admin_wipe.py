@@ -97,7 +97,7 @@ def test_необновлённый_сервер_не_выдаётся_за_пу
     answers["/api/maintenance/scope"] = transport.ServerError("Not Found", 404)
 
     page = AdminPage(AppSettings(), lambda *_: None)
-    page._apply(([], [], [], [], [], admin.scope()))
+    page._apply(([], [], [], [], [], admin.scope(), []))
 
     assert "не обновлена" in page.scope_label.text()
     assert "Данных в базе нет" not in page.scope_label.text()

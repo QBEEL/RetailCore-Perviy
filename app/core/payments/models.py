@@ -118,6 +118,9 @@ class Payment:
     responsible: str = ""
     author: str = ""
     comment: str = ""
+    # Статья ДДС — название из справочника (`dds.items`). Выгрузка 1С её не
+    # содержит: ставит тот, кто заводит оплату, и импорт её не затирает.
+    dds_item: str = ""
     had_files: bool = False
     origin: PaymentOrigin = PaymentOrigin.MANUAL
     origin_ref: str = ""

@@ -8,11 +8,12 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QComboBox,
+    QCompleter,
     QDoubleSpinBox,
     QSpinBox,
     QWidget,
@@ -101,3 +102,99 @@ class SelectBox(QComboBox):
 
     def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         pass_wheel(self, event)
+
+
+class _WordsFilter(QSortFilterProxyModel):
+    """Оставляет строки, где встречается каждое набранное слово — в любом порядке.
+
+    Стандартный QCompleter ищет подстроку целиком, и «поставщику бьюти» не
+    нашло бы «Оплата поставщику (бьюти)»: между словами стоит скобка.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._words: list[str] = []
+
+    def set_text(self, text: str) -> None:
+        self._words = _fold(text).split()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row: int, parent) -> bool:  # type: ignore[no-untyped-def]
+        title = _fold(str(self.sourceModel().index(row, 0, parent).data() or ""))
+        return all(word in title for word in self._words)
+
+
+def _fold(text: str) -> str:
+    """Регистр и «ё» не мешают поиску: «Ремонт» находится по «ремонт», «ёлка» по «елка»."""
+    return text.casefold().replace("ё", "е")
+
+
+class SearchSelect(SelectBox):
+    """Выбор из длинного списка с поиском: набираешь слова — список сужается.
+
+    Сохранить можно только то, что есть в списке: `value()` отдаёт название из
+    списка или пустую строку, а набранное мимо списка видно по
+    `has_unmatched_text()`. Иначе в оплату попала бы «статья», которой нет ни в
+    справочнике, ни в отчётах.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(*args, **kwargs)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._words = _WordsFilter(self)
+        self._words.setSourceModel(self.model())
+        completer = QCompleter(self._words, self)
+        # Отбор делает свой фильтр: встроенный проверяет только начало строки.
+        completer.setCompletionMode(QCompleter.CompletionMode.UnfilteredPopupCompletion)
+        completer.setMaxVisibleItems(12)
+        self.setCompleter(completer)
+        # Названия длиннее поля: список шире него, иначе вместо отличий в конце
+        # названия («бьюти» и «фэшн») виден один и тот же обрезанный хвост.
+        completer.popup().setMinimumWidth(560)
+        self.view().setMinimumWidth(560)
+        self.lineEdit().setPlaceholderText("Начните вводить для поиска")
+        self.lineEdit().textEdited.connect(self._words.set_text)
+        completer.activated[str].connect(self._chosen)
+        # Ушли из поля с недописанным текстом — возвращаем выбранное: в поле
+        # должно стоять то, что действует.
+        self.lineEdit().editingFinished.connect(self._restore)
+        self.activated.connect(lambda _: self._words.set_text(""))
+
+    def set_items(self, titles: list[str], current: str = "") -> None:
+        """Заменяет список. Текущая статья, которой в списке нет, остаётся:
+        оплату со старой статьёй нельзя открыть и молча лишить её."""
+        titles = list(titles)
+        if current and current not in titles:
+            titles.insert(0, current)
+        self.clear()
+        self.addItems(titles)
+        for row, title in enumerate(titles):
+            self.setItemData(row, title, Qt.ItemDataRole.ToolTipRole)
+        self.set_value(current)
+
+    def set_value(self, title: str) -> None:
+        index = self.findText(title, Qt.MatchFlag.MatchFixedString)
+        if index >= 0:
+            self.setCurrentIndex(index)
+        else:
+            self.setCurrentIndex(-1)
+            self.lineEdit().clear()
+        self._words.set_text("")
+
+    def value(self) -> str:
+        """Выбранное название; пусто, если ничего не выбрано."""
+        index = self.findText(self.currentText(), Qt.MatchFlag.MatchFixedString)
+        return self.itemText(index) if index >= 0 else ""
+
+    def has_unmatched_text(self) -> bool:
+        """В поле набрано что-то, чего нет в списке."""
+        return bool(self.currentText().strip()) and not self.value()
+
+    def _chosen(self, title: str) -> None:
+        self.set_value(title)
+
+    def _restore(self) -> None:
+        if self.has_unmatched_text() and not self.completer().popup().isVisible():
+            index = self.currentIndex()
+            self.setEditText(self.itemText(index) if index >= 0 else "")

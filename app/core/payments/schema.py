@@ -124,7 +124,14 @@ def _step_2(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE payment ADD COLUMN {name} {kind}")
 
 
-_MIGRATIONS = (_step_1, _step_2)
+def _step_3(connection: sqlite3.Connection) -> None:
+    """Статья ДДС оплаты — как на сервере, миграция 009."""
+    have = {row[1] for row in connection.execute("PRAGMA table_info(payment)")}
+    if "dds_item" not in have:
+        connection.execute("ALTER TABLE payment ADD COLUMN dds_item TEXT NOT NULL DEFAULT ''")
+
+
+_MIGRATIONS = (_step_1, _step_2, _step_3)
 VERSION = len(_MIGRATIONS)
 
 

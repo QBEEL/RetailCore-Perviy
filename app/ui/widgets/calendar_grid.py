@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from ...core.payments import DEFAULT_DAY_LEVELS, Day, DayLevel, Payment, WEEKDAYS
 from ..theme import Metrics, Palette
+from . import marks
 
 # Цвет уровня: сумма и фон клетки. Зелёный не выделяется вовсе — спокойный
 # день не должен притягивать взгляд.
@@ -49,6 +50,10 @@ LEVEL_COLORS: dict[DayLevel, tuple[str, str]] = {
 # Сторона кружка с числом дня. Нечётной она быть не должна: радиус считается
 # половиной, и на нечётной кружок выходит скошенным.
 DAY_BADGE = 18
+
+# Сколько цветных точек статей ДДС помещается в клетке. Больше трёх клетка
+# превращалась в гирлянду, а цветов на практике два-три.
+MARK_DOTS = 3
 
 MIME_PAYMENT = "application/x-retailcore-payment"
 
@@ -177,6 +182,16 @@ class DayCell(QFrame):
             f"background: {Palette.WARNING}; border-radius: 3px;")
         self.changed.hide()
         head.addWidget(self.changed)
+
+        # Цвет статьи ДДС — точкой того же размера: Маркетинг розовый, и день с
+        # его оплатой виден в сетке, не открывая список. По точке на цвет.
+        self.mark_dots: list[QLabel] = []
+        for _ in range(MARK_DOTS):
+            dot = QLabel("", self)
+            dot.setFixedSize(6, 6)
+            dot.hide()
+            head.addWidget(dot)
+            self.mark_dots.append(dot)
         head.addStretch(1)
 
         self.total = QLabel("", self)
@@ -206,6 +221,7 @@ class DayCell(QFrame):
             self.detail.setText("")
             self.alert.hide()
             self.changed.hide()
+            self._show_marks(None)
             self._style = "QFrame#DayCell { background: transparent; }"
             self.setStyleSheet(self._style)
             self.setToolTip("")
@@ -241,6 +257,7 @@ class DayCell(QFrame):
 
         self.alert.setVisible(bool(data is not None and data.overdue and not muted))
         self.changed.setVisible(bool(data is not None and data.amount_changed and not muted))
+        self._show_marks(None if muted else data)
 
         if data is None or not data.count:
             self.total.setText("")
@@ -258,6 +275,21 @@ class DayCell(QFrame):
         self.detail.setText("\n".join(name[:22] for name in names))
         self.setToolTip(self._tooltip(data, level))
 
+    def _show_marks(self, data: Day | None) -> None:
+        """Точки цветов статей ДДС, которые есть среди оплат дня."""
+        colors: list[QColor] = []
+        if data is not None:
+            for payment in data.payments:
+                color = marks.color_of(payment.dds_item)
+                if color is not None and color.name() not in {c.name() for c in colors}:
+                    colors.append(color)
+        for index, dot in enumerate(self.mark_dots):
+            if index < len(colors):
+                dot.setStyleSheet(f"background: {colors[index].name()}; border-radius: 3px;")
+                dot.show()
+            else:
+                dot.hide()
+
     def _tooltip(self, data: Day, level: DayLevel) -> str:
         lines = [
             f"{data.day:%d.%m.%Y} · {level.title}",
@@ -267,6 +299,11 @@ class DayCell(QFrame):
             lines.append(f"просрочено: {data.overdue}")
         if data.amount_changed:
             lines.append(f"сумма изменена: {data.amount_changed}")
+        by_note: dict[str, int] = {}
+        for payment in data.payments:
+            if note := marks.note_of(payment.dds_item):
+                by_note[note] = by_note.get(note, 0) + 1
+        lines.extend(f"● {note}: {count}" for note, count in by_note.items())
         lines.append("")
         for payment in data.payments[:8]:
             line = f"{money(payment.amount)} ₽ — {payment.title} ({payment.status.title})"

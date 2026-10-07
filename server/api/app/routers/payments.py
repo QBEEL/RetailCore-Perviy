@@ -30,12 +30,16 @@ from ..security import User
 
 router = APIRouter(prefix="/api/payments", tags=["Оплаты"])
 
+# Отбор «оплаты без статьи ДДС». Значение зарезервировано: в справочнике такой
+# статьи быть не должно, и клиент шлёт то же слово.
+NO_DDS_ITEM = "none"
+
 # Столбцы платежа в порядке, ожидаемом PaymentOut.
 COLUMNS = (
     "p.id, p.doc_number, p.request_date, p.pay_date, p.amount, p.vat,"
     " p.currency, p.supplier_id, p.recipient, p.recipient_key, p.status,"
     " p.source_status, p.paid_flag, p.operation, p.over_limit, p.priority,"
-    " p.edo_state, p.responsible, p.author, p.comment, p.had_files,"
+    " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.had_files,"
     " p.origin, p.origin_ref, p.created_at, p.updated_at,"
     " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
     " p.amount_before, p.amount_changed_at,"
@@ -71,7 +75,8 @@ AMOUNT_MARKS = (
 
 # Правки, разрешённые обычному пользователю. Поля из выгрузки 1С сюда не входят:
 # их перезапишет следующий импорт, и правка всё равно пропадёт.
-EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "vat", "priority")
+EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "vat",
+            "priority", "dds_item")
 
 
 def _conditions(
@@ -79,7 +84,7 @@ def _conditions(
     statuses: list[str], origins: list[str], supplier_id: int, recipient_key: str,
     amount_from: float | None, amount_to: float | None,
     responsible: str, operation: str, over_limit: bool | None,
-    dated_only: bool,
+    dated_only: bool, dds_item: str = "",
 ) -> tuple[str, list[Any]]:
     parts: list[str] = []
     values: list[Any] = []
@@ -127,6 +132,11 @@ def _conditions(
     if over_limit is not None:
         parts.append("p.over_limit = %s")
         values.append(over_limit)
+    if dds_item == NO_DDS_ITEM:
+        parts.append("p.dds_item = ''")
+    elif dds_item:
+        parts.append("p.dds_item = %s")
+        values.append(dds_item)
     return (" AND ".join(parts) if parts else "TRUE"), values
 
 
@@ -157,10 +167,12 @@ def list_payments(
     over_limit: bool | None = None,
     dated_only: bool = False,
     mine: bool = False,
+    dds_item: str = "",
 ) -> list[PaymentOut]:
     where, values = _conditions(
         text, start, end, statuses, origins, supplier_id, recipient_key,
-        amount_from, amount_to, responsible, operation, over_limit, dated_only)
+        amount_from, amount_to, responsible, operation, over_limit, dated_only,
+        dds_item)
     if mine and not user.is_admin:
         where += " AND p.responsible = ANY(%s)"
         values.append(list(user.responsible))
@@ -296,26 +308,42 @@ def create_payment(form: PaymentIn,
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Создать оплату на другого ответственного нельзя")
 
+    _check_dds_item(form.dds_item)
     created = db.fetch_one(
         "INSERT INTO payment (pay_date, amount, vat, currency, supplier_id,"
         "  recipient, recipient_key, status, operation, priority, comment,"
-        "  responsible, author, origin, origin_ref, updated_by)"
+        "  dds_item, responsible, author, origin, origin_ref, updated_by)"
         " VALUES (%s, %s, %s, %s, %s, %s, COALESCE(NULLIF(%s, ''), lower(btrim(%s))),"
-        "         %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (form.pay_date, form.amount, form.vat, form.currency, form.supplier_id,
          form.recipient, form.recipient_key.strip(), form.recipient,
          form.status, form.operation,
-         form.priority, form.comment, responsible, user.full_name,
+         form.priority, form.comment, form.dds_item.strip(),
+         responsible, user.full_name,
          form.origin, form.origin_ref, user.id))
     _record(user, "payment", created["id"], "create",
             {"recipient": form.recipient})
     return get_payment(created["id"], user)
 
 
+def _check_dds_item(title: str) -> None:
+    """Статья должна быть из справочника: опечатка в отчёте о деньгах — это
+    отдельная «статья», которой нет ни в одной выгрузке. Пустая — допустима."""
+    title = title.strip()
+    if title and not db.fetch_one(
+            "SELECT 1 FROM dds_item WHERE lower(title) = lower(%s)", (title,)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Статьи ДДС «{title}» нет в справочнике")
+
+
 def _changes(form: PaymentPatch) -> dict[str, Any]:
     """Переданные поля правки. Не переданные в словарь не попадают."""
     given = form.model_dump(exclude_unset=True)
     values = {name: given[name] for name in EDITABLE if name in given}
+    if "dds_item" in values:
+        values["dds_item"] = (values["dds_item"] or "").strip()
+        _check_dds_item(values["dds_item"])
     if form.clear_pay_date:
         values["pay_date"] = None
     # Отметка об оплате должна следовать за статусом, иначе отчёты разойдутся:

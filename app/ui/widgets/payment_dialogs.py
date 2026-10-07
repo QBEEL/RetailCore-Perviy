@@ -46,6 +46,7 @@ from ...core.payments import (
     STATUS_ORDER,
     SupplierStats,
     analytics,
+    dds,
     duplicates,
     importer,
     planning,
@@ -67,7 +68,7 @@ from .calendar_grid import money
 from .common import Divider, Hint, SectionTitle
 from .file_picker import CSV_FILTER, FilePicker
 from .table import Column, DataTable
-from .inputs import DecimalInput, SelectBox
+from .inputs import DecimalInput, SearchSelect, SelectBox
 
 STATUS_COLORS: dict[PaymentStatus, str] = {
     PaymentStatus.PAID: Palette.SUCCESS,
@@ -176,11 +177,13 @@ class PaymentDialog(QDialog):
         recipients: list[str] | None = None,
         responsible: list[str] | None = None,
         operations: list[str] | None = None,
+        dds_items: list[str] | None = None,
         db_path: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.payment = payment
+        self._dds_items = list(dds_items) if dds_items else list(dds.BUILTIN_ITEMS)
         self.db_path = db_path
         self.setWindowTitle("Оплата" if payment.id else "Новая оплата")
         self.setMinimumWidth(760)
@@ -283,6 +286,12 @@ class PaymentDialog(QDialog):
         self.operation.setEditable(True)
         self.operation.addItems(operations or ["Оплата поставщику"])
         form.addRow("Операция", self.operation)
+
+        self.dds_item = SearchSelect(self)
+        self.dds_item.setToolTip(
+            "Статья движения денег. Выберите из списка или найдите по словам "
+            "из названия — порядок слов не важен")
+        form.addRow("Статья ДДС", self.dds_item)
 
         column.addLayout(form)
 
@@ -408,7 +417,7 @@ class PaymentDialog(QDialog):
             return
         for widget in (self.recipient, self.amount, self.vat, self.vat_rate,
                        self.pay_date, self.status, self.responsible,
-                       self.operation, self.comment,
+                       self.operation, self.dds_item, self.comment,
                        self.attach_button, self.detach_button):
             widget.setEnabled(False)
         self.save_button.setEnabled(False)
@@ -523,6 +532,11 @@ class PaymentDialog(QDialog):
         self.status.setCurrentIndex(max(self.status.findData(payment.status.value), 0))
         self.responsible.setCurrentText(payment.responsible or store.current_user())
         self.operation.setCurrentText(payment.operation or "Оплата поставщику")
+        # У новой оплаты статья — по направлению менеджера, у открытой —
+        # какая записана: пустую у старой оплаты за него не выбирают.
+        self.dds_item.set_items(
+            self._dds_items,
+            payment.dds_item or ("" if payment.id else dds.default_item()))
         self.comment.setPlainText(payment.comment)
         self._reload_files()
         if payment.doc_number:
@@ -599,12 +613,17 @@ class PaymentDialog(QDialog):
         payment.paid_flag = payment.status is PaymentStatus.PAID
         payment.responsible = self.responsible.currentText().strip()
         payment.operation = self.operation.currentText().strip()
+        payment.dds_item = self.dds_item.value()
         payment.comment = self.comment.toPlainText().strip()
         if not payment.id and payment.origin is PaymentOrigin.IMPORT:
             payment.origin = PaymentOrigin.MANUAL
         return payment
 
     def _accept(self) -> None:
+        if self.dds_item.has_unmatched_text():
+            self.error.setText("Статьи ДДС нет в списке: выберите её из выпадающего списка "
+                               "или очистите поле")
+            return
         payment = self.result_payment()
         if payment.amount <= 0:
             self.error.setText("Укажите сумму больше нуля")

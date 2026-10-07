@@ -58,6 +58,8 @@ class PaymentIn(BaseModel):
     responsible: str = ""
     operation: str = ""
     priority: str = ""
+    # Статья ДДС — название из справочника `dds_item`; пусто — не указана.
+    dds_item: str = ""
     # Происхождение задаёт клиент: план из Excel нужно отличать от записи,
     # заведённой руками, — по нему при следующей загрузке ищется прошлый план.
     origin: Origin = "manual"
@@ -85,6 +87,7 @@ class PaymentOut(BaseModel):
     responsible: str
     author: str
     comment: str
+    dds_item: str = ""
     had_files: bool
     origin: Origin
     origin_ref: str
@@ -111,8 +114,29 @@ class PaymentPatch(BaseModel):
     amount: float | None = None
     vat: float | None = None
     priority: str | None = None
+    dds_item: str | None = None
     # Отдельный признак: иначе нельзя отличить «убрать дату» от «не трогать».
     clear_pay_date: bool = False
+
+
+class DdsItemIn(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+
+
+class DdsItemOut(BaseModel):
+    id: int
+    title: str
+    # «#RRGGBB» или пусто; метка — короткая подпись рядом с оплатой.
+    color: str = ""
+    note: str = ""
+
+
+class DdsMarkIn(BaseModel):
+    """Цвет и метка для нескольких статей сразу."""
+
+    ids: list[int] = Field(min_length=1, max_length=500)
+    color: str = Field(default="", pattern=r"^(#[0-9A-Fa-f]{6})?$")
+    note: str = Field(default="", max_length=60)
 
 
 class BulkPatch(BaseModel):

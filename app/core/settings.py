@@ -69,6 +69,9 @@ class AppSettings:
     # пришлось бы тому, кто один раз решил, что она мешает.
     payment_filters_open: bool = True
     payment_import_seen: str = ""
+    # Человек отметил «Больше не показывать» у напоминания про статью ДДС в
+    # заявках на маркетинг: оно показывается при входе в «Оплаты», пока не отмечено.
+    payment_dds_notice_hidden: bool = False
     # Адрес общей базы оплат. Пустой означает работу со своей локальной базой —
     # так приложение вело себя до появления сервера, и так оно продолжает
     # работать у того, кому общий доступ не нужен.
@@ -283,6 +286,7 @@ class AppSettings:
         self.payment_filters_open = bool(
             data.get("payment_filters_open", self.payment_filters_open))
         self.payment_import_seen = str(data.get("payment_import_seen", ""))
+        self.payment_dds_notice_hidden = bool(data.get("payment_dds_notice_hidden", False))
         self.payment_local_base = bool(data.get("payment_local_base", False))
         # Отсутствие ключа и пустая строка — разные вещи: ключа нет у того, кто
         # ещё не входил, и ему подставляется общий адрес; пустую строку
@@ -389,6 +393,7 @@ class AppSettings:
             "payment_import_reminder": self.payment_import_reminder,
             "payment_filters_open": self.payment_filters_open,
             "payment_import_seen": self.payment_import_seen,
+            "payment_dds_notice_hidden": self.payment_dds_notice_hidden,
             "payment_local_base": self.payment_local_base,
             "payment_server": self.payment_server,
             "payment_login": self.payment_login,

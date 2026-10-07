@@ -6,11 +6,12 @@ from typing import Any, Callable, Sequence
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QSize,
     QSortFilterProxyModel,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence, QPainter, QTextDocument
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -44,6 +45,7 @@ class Column:
         color: Callable[[Any], QColor | None] | None = None,
         highlight: bool = False,
         tip: str = "",
+        icon: Callable[[Any], QIcon | None] | None = None,
     ) -> None:
         self.title = title
         # Подсказка к заголовку и имя в меню колонок — для коротких заголовков
@@ -55,6 +57,8 @@ class Column:
         self.align = align
         self.color = color
         self.highlight = highlight
+        # Значок слева от текста ячейки — например, цветной кружок.
+        self.icon = icon
 
 
 class ObjectTableModel(QAbstractTableModel):
@@ -66,6 +70,7 @@ class ObjectTableModel(QAbstractTableModel):
         self._items: list[Any] = []
         self._terms: list[str] = []
         self._status: Callable[[Any], str] | None = None
+        self._row_tint: Callable[[Any], QColor | None] | None = None
 
     def set_items(self, items: Sequence[Any]) -> None:
         self.beginResetModel()
@@ -85,6 +90,13 @@ class ObjectTableModel(QAbstractTableModel):
                 self.index(len(self._items) - 1, len(self._columns) - 1),
                 [ROLE_TERMS],
             )
+
+    def set_row_tint(self, provider: Callable[[Any], QColor | None] | None) -> None:
+        """Подсветка всей строки: цвет фона для оплаты или None."""
+        self._row_tint = provider
+        if self._items:
+            self.dataChanged.emit(self.index(0, 0),
+                                  self.index(len(self._items) - 1, len(self._columns) - 1))
 
     def set_status_provider(self, provider: Callable[[Any], str] | None) -> None:
         self._status = provider
@@ -121,6 +133,10 @@ class ObjectTableModel(QAbstractTableModel):
             return int(column.align)
         if role == Qt.ItemDataRole.ForegroundRole and column.color:
             return column.color(item)
+        if role == Qt.ItemDataRole.DecorationRole and column.icon:
+            return column.icon(item)
+        if role == Qt.ItemDataRole.BackgroundRole and self._row_tint:
+            return self._row_tint(item)
         if role == ROLE_SORT:
             return column.sort_key(item)
         if role == ROLE_TERMS:
@@ -213,10 +229,13 @@ class HighlightDelegate(QStyledItemDelegate):
         # текста выходил бы за её пределы.
         document.setTextWidth(-1)
 
+        # Значок (кружок оплаты) стиль уже нарисовал слева — текст идёт за ним.
+        shift = (option.decorationSize.width() + 6
+                 if option.features & QStyleOptionViewItem.ViewItemFeature.HasDecoration else 0)
         painter.save()
         painter.setClipRect(option.rect)
         painter.translate(
-            option.rect.left() + 8,
+            option.rect.left() + 8 + shift,
             option.rect.top() + (option.rect.height() - document.size().height()) / 2,
         )
         document.drawContents(painter)
@@ -251,6 +270,7 @@ class DataTable(QTableView):
         self.setModel(self.proxy)
 
         self.setItemDelegate(HighlightDelegate(self))
+        self.setIconSize(QSize(8, 8))
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)

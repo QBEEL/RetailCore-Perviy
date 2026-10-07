@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTabWidget,
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.payments import admin, data, transport
+from ..core.payments import admin, data, dds, transport
 from ..core.payments.admin import Account, Entry, Scope
 from ..core.suppliers import directory
 from ..core.settings import AppSettings
@@ -33,7 +34,9 @@ from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.account_dialogs import AccountDialog, PasswordShown
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title
+from .widgets import marks
 from .widgets.database_dialogs import WipeDialog
+from .widgets.dds_dialog import DdsMarkDialog
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 
@@ -59,6 +62,7 @@ class AdminPage(QWidget):
         self._known: list[str] = []
         self._directions: list[tuple[str, str]] = []
         self._claims: list[directory.Entry] = []
+        self._dds_items: list[dds.DdsItem] = []
         self._scope = Scope()
         self._loaded = False
 
@@ -97,6 +101,7 @@ class AdminPage(QWidget):
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._accounts_tab(), "Учётные записи")
         self.tabs.addTab(self._claims_tab(), "Закрепление поставщиков")
+        self.tabs.addTab(self._dds_tab(), "Статьи ДДС")
         self.tabs.addTab(self._journal_tab(), "Журнал изменений")
         self.tabs.addTab(self._maintenance_tab(), "Обслуживание")
         root.addWidget(self.tabs, 1)
@@ -194,6 +199,65 @@ class AdminPage(QWidget):
         layout.addLayout(actions)
         return page
 
+    def _dds_tab(self) -> QWidget:
+        """Справочник статей ДДС: поиск по списку и добавление новой статьи."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+
+        layout.addWidget(Hint(
+            "Из этого списка менеджер выбирает статью при создании оплаты. "
+            "Новая статья появится у всех сразу. Удалить или переименовать "
+            "статью нельзя: её название уже записано в оплатах. Кнопка «Цвет и "
+            "метка» красит оплаты статьи: в таблице и календаре у них появляется "
+            "цветной кружок, а рядом — метка, например «Маркетинг»."))
+
+        add_row = QHBoxLayout()
+        self.dds_new = QLineEdit(page)
+        self.dds_new.setPlaceholderText("Название новой статьи")
+        self.dds_new.setMaxLength(300)
+        self.dds_new.returnPressed.connect(self.add_dds_item)
+        add_row.addWidget(self.dds_new, 1)
+        self.dds_add_button = QPushButton("Добавить статью", page)
+        self.dds_add_button.setObjectName("Primary")
+        self.dds_add_button.setIcon(icons.icon("plus"))
+        self.dds_add_button.clicked.connect(self.add_dds_item)
+        add_row.addWidget(self.dds_add_button)
+        layout.addLayout(add_row)
+
+        self.dds_search = QLineEdit(page)
+        self.dds_search.setPlaceholderText("Поиск по списку статей")
+        self.dds_search.setClearButtonEnabled(True)
+        layout.addWidget(self.dds_search)
+
+        self.dds_table = DataTable([
+            Column("Статья ДДС", lambda item: item.title, 520, highlight=True,
+                   icon=lambda item: _dot(item)),
+            Column("Цвет", lambda item: _color_name(item), 120),
+            Column("Метка", lambda item: item.note, 200,
+                   color=lambda item: _ink(item)),
+        ], page)
+        self.dds_table.model_.set_row_tint(_tint)
+        self.dds_search.textChanged.connect(self._filter_dds)
+        layout.addWidget(self.dds_table, 1)
+
+        actions = QHBoxLayout()
+        self.dds_mark_button = QPushButton("Цвет и метка…", page)
+        self.dds_mark_button.setIcon(icons.icon("edit"))
+        self.dds_mark_button.setToolTip(
+            "Покрасить выбранные статьи и задать метку. Выделить несколько — "
+            "Ctrl или Shift")
+        self.dds_mark_button.clicked.connect(self.mark_dds_items)
+        actions.addWidget(self.dds_mark_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.dds_hint = QLabel("", page)
+        self.dds_hint.setObjectName("Hint")
+        layout.addWidget(self.dds_hint)
+        return page
+
     def _journal_tab(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
@@ -273,7 +337,8 @@ class AdminPage(QWidget):
         self.offline.setVisible(not available)
         self.tabs.setVisible(available)
         for button in (self.new_button, self.refresh_button,
-                       self.edit_button, self.reset_button,
+                       self.edit_button, self.reset_button, self.dds_add_button,
+                       self.dds_mark_button,
                        self.fix_button, self.reject_button,
                        self.wipe_button):
             button.setEnabled(available)
@@ -285,11 +350,13 @@ class AdminPage(QWidget):
 
     def _apply(self, payload: tuple) -> None:
         (self.accounts, self.entries, self._known,
-         self._directions, self._claims, self._scope) = payload
+         self._directions, self._claims, self._scope, self._dds_items) = payload
         self._loaded = True
         self.accounts_table.set_items(self.accounts)
         self.journal_table.set_items(self.entries)
         self.claims_table.set_items(self._claims)
+        self.dds_table.set_items(self._dds_items)
+        self._filter_dds(self.dds_search.text())
 
         people = {p.full_name for entry in self._claims
                   for p in entry.assigned if not p.fixed}
@@ -383,6 +450,66 @@ class AdminPage(QWidget):
         PasswordShown(account.login, password, self).exec()
         self.reload()
 
+    # --- статьи ДДС -----------------------------------------------------------
+
+    def _filter_dds(self, text: str) -> None:
+        self.dds_table.proxy.set_text(text)
+        self.dds_table.model_.set_terms([t for t in text.split() if len(t) > 1])
+        shown = self.dds_table.proxy.rowCount()
+        total = len(self._dds_items)
+        self.dds_hint.setText(
+            f"статей: {total}" if shown == total else f"показано {shown} из {total}")
+
+    def add_dds_item(self) -> None:
+        title = dds.clean(self.dds_new.text())
+        if not title:
+            self.notify("Введите название статьи", ToastKind.INFO)
+            return
+        known = next((item.title for item in self._dds_items
+                      if item.title.casefold() == title.casefold()), "")
+        if known:
+            self.notify(f"Статья «{known}» уже есть в списке", ToastKind.WARNING)
+            return
+        self.dds_add_button.setEnabled(False)
+        run_task(lambda: dds.add(title),
+                 on_result=self._dds_added, on_error=self._dds_failed)
+
+    def mark_dds_items(self) -> None:
+        chosen = [item for item in self.dds_table.selected_items()
+                  if isinstance(item, dds.DdsItem)]
+        if not chosen:
+            self.notify("Выберите статьи в таблице", ToastKind.INFO)
+            return
+        if any(not item.id for item in chosen):
+            self.notify("Серверная часть не обновлена — цвета ей ещё неизвестны",
+                        ToastKind.WARNING)
+            return
+        dialog = DdsMarkDialog(chosen, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        color, note = dialog.result_mark()
+        ids = [item.id for item in chosen]
+        run_task(lambda: dds.set_mark(ids, color, note),
+                 on_result=lambda count: self._dds_marked(count, color, note),
+                 on_error=self._dds_failed)
+
+    def _dds_marked(self, count: int, color: str, note: str) -> None:
+        what = "пометка снята" if not (color or note) else "цвет и метка заданы"
+        self.notify(f"Статей: {count}, {what}", ToastKind.SUCCESS)
+        self.reload()
+
+    def _dds_added(self, title: str) -> None:
+        self.dds_new.clear()
+        self.dds_add_button.setEnabled(True)
+        self.notify(f"Статья «{title}» добавлена", ToastKind.SUCCESS)
+        # Поиск сбрасывается: добавленную статью иначе скрыл бы прежний фильтр.
+        self.dds_search.clear()
+        self.reload()
+
+    def _dds_failed(self, message: str) -> None:
+        self.dds_add_button.setEnabled(True)
+        self.notify(message, ToastKind.ERROR)
+
     # --- закрепление поставщиков ----------------------------------------------
 
     def _chosen_claims(self) -> list[directory.Entry]:
@@ -463,6 +590,26 @@ class AdminPage(QWidget):
         self.notify(message, ToastKind.ERROR)
 
 
+def _dot(item: dds.DdsItem):
+    color = QColor(item.color) if item.color else None
+    return marks.dot_icon(color) if color and color.isValid() else None
+
+
+def _tint(item: dds.DdsItem):
+    color = QColor(item.color) if item.color else None
+    return marks.tint(color) if color and color.isValid() else None
+
+
+def _ink(item: dds.DdsItem):
+    color = QColor(item.color) if item.color else None
+    return marks.ink(color) if color and color.isValid() else None
+
+
+def _color_name(item: dds.DdsItem) -> str:
+    return next((name for name, code in dds.COLORS if code.upper() == item.color.upper()),
+                item.color)
+
+
 def _load_all() -> tuple:
     """Учётки, журнал, имена из 1С, направления, заявки и объём базы.
 
@@ -475,7 +622,7 @@ def _load_all() -> tuple:
                   if item.for_people]
     claims = directory.pending_claims().items
     return (admin.accounts(), admin.journal(), known, directions, claims,
-            admin.scope())
+            admin.scope(), dds.catalog())
 
 
 def _reject(drafts: list[tuple[str, list[int]]]) -> int:

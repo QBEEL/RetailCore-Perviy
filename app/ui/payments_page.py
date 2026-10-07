@@ -14,7 +14,7 @@ import os
 from datetime import date, timedelta
 from typing import Callable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -52,6 +52,7 @@ from ..core.payments import (
     Stats,
     SuggestionKind,
     analytics,
+    dds,
     planning,
     service,
     transport,
@@ -72,6 +73,7 @@ from ..core.workbook import write_sheet
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
+from .widgets import marks
 from .widgets.calendar_grid import (
     DayPaymentList,
     LevelLegend,
@@ -82,7 +84,8 @@ from .widgets.calendar_grid import (
 )
 from .widgets.charts import ChartBox
 from .widgets.common import Card, Divider, Hint, SectionTitle, Subtitle, Title
-from .widgets.inputs import DecimalInput, SelectBox
+from .widgets.inputs import DecimalInput, SearchSelect, SelectBox
+from .widgets.notice_dialog import NoticeDialog
 from .widgets.payment_dialogs import (
     STATUS_COLORS,
     BudgetDialog,
@@ -321,6 +324,14 @@ class PaymentsPage(QWidget):
 
         second = QHBoxLayout()
         second.setSpacing(8)
+        # Статья ДДС — с поиском: в справочнике больше ста статей, и искать
+        # нужную по списку глазами дольше, чем набрать пару слов.
+        self.dds_filter = SearchSelect(self.filters_body)
+        self.dds_filter.addItem("Все статьи ДДС", "")
+        self.dds_filter.setMinimumWidth(300)
+        self.dds_filter.setToolTip("Отбор по статье ДДС. Начните вводить слова из названия")
+        second.addWidget(self.dds_filter)
+        second.addSpacing(Metrics.GAP)
         second.addWidget(QLabel("Сумма от", self.filters_body))
         self.amount_from = DecimalInput(self.filters_body)
         self.amount_to = DecimalInput(self.filters_body)
@@ -369,6 +380,7 @@ class PaymentsPage(QWidget):
             self.direction_filter,
             self.status_filter, self.period_filter, self.origin_filter,
             self.supplier_filter, self.responsible_filter, self.operation_filter,
+            self.dds_filter,
         )
 
     def _toggle_filters(self, opened: bool) -> None:
@@ -387,7 +399,7 @@ class PaymentsPage(QWidget):
             (self.direction_filter, "направление"),
             (self.status_filter, "статус"), (self.origin_filter, "источник"),
             (self.supplier_filter, "поставщик"), (self.responsible_filter, "ответственный"),
-            (self.operation_filter, "операция"),
+            (self.operation_filter, "операция"), (self.dds_filter, "статья ДДС"),
         ):
             if box.currentData():
                 names.append(f"{label}: {box.currentText()}")
@@ -566,8 +578,17 @@ class PaymentsPage(QWidget):
                 # второй строки не стоит.
                 origin = "заменена из 1С" if payment.amount_by_import else "изменена"
                 text += f"\n• сумма {origin}: {payment.amount_change_text}"
+            note = marks.note_of(payment.dds_item)
+            if note:
+                # Метка статьи — отдельной строкой, как пометка о сумме: цвет
+                # на кружке без подписи не расшифровывается.
+                text += f"\n● {note}"
             item = QListWidgetItem(text)
             item.setForeground(QColor(STATUS_COLORS[payment.status]))
+            if color := marks.color_of(payment.dds_item):
+                # Только подсветка: значок делал строку выше соседних и был
+                # крупнее точек в клетке календаря.
+                item.setBackground(marks.tint(color))
             self.day_list.addItem(self.day_list.mark(item, payment))
 
     def _day_selection_changed(self) -> None:
@@ -722,6 +743,7 @@ class PaymentsPage(QWidget):
 
         self.table = DataTable(self._columns(), page)
         self.table.item_activated.connect(self.open_payment)
+        self.table.model_.set_row_tint(_tint)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         layout.addWidget(self.table, 1)
 
@@ -750,7 +772,12 @@ class PaymentsPage(QWidget):
         return [
             Column("Дата", lambda p: f"{p.pay_date:%d.%m.%Y}" if p.pay_date else "—",
                    width=96, sort_key=lambda p: p.pay_date or date.min),
-            Column("Поставщик", lambda p: p.title, width=250, highlight=True),
+            # Кружок перед поставщиком и подпись рядом — цвет и метку статьи ДДС
+            # задаёт администратор; у оплат без пометки их просто нет.
+            Column("Поставщик", lambda p: p.title, width=250, highlight=True,
+                   icon=lambda p: _dot(p)),
+            Column("Заметка", lambda p: marks.note_of(p.dds_item), width=120,
+                   color=lambda p: _ink(p), tip="Метка статьи ДДС, заданная администратором"),
             Column("Сумма, ₽", lambda p: money(p.amount), width=130,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    color=lambda p: QColor(Palette.WARNING) if p.amount_changed else None,
@@ -781,6 +808,7 @@ class PaymentsPage(QWidget):
                    sort_key=lambda p: _terms_days(p)),
             Column("Ответственный", lambda p: p.responsible, width=170, highlight=True),
             Column("Операция", lambda p: p.operation, width=170),
+            Column("Статья ДДС", lambda p: p.dds_item, width=230, highlight=True),
             Column("НДС, ₽", lambda p: money(p.vat) if p.vat else "", width=110,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    sort_key=lambda p: p.vat),
@@ -1521,6 +1549,8 @@ class PaymentsPage(QWidget):
             selection.operation = name
         if code := self.direction_filter.currentData():
             selection.direction = code
+        if title := self.dds_filter.currentData():
+            selection.dds_item = title
         return selection
 
     def reload(self) -> None:
@@ -1663,6 +1693,20 @@ class PaymentsPage(QWidget):
                 box.addItem(value, value)
             box.setCurrentIndex(max(box.findData(current), 0))
             box.blockSignals(False)
+        self._fill_dds_filter(known.get("dds_items", []))
+
+    def _fill_dds_filter(self, titles: list[str]) -> None:
+        """Список статей отбора: все, «без статьи» и сами статьи."""
+        box = self.dds_filter
+        current = box.currentData()
+        box.blockSignals(True)
+        box.clear()
+        box.addItem("Все статьи ДДС", "")
+        box.addItem("Без статьи", dds.NO_ITEM)
+        for title in titles:
+            box.addItem(title, title)
+        box.setCurrentIndex(max(box.findData(current), 0))
+        box.blockSignals(False)
 
     def restore(self) -> None:
         """Первое открытие страницы: читает базу и напоминает про импорт."""
@@ -1672,6 +1716,8 @@ class PaymentsPage(QWidget):
         self._load_directions()
         self.reload()
         self._remind_import()
+        # Не сразу: раздел ещё открывается, и окно поверх него мешало бы показу.
+        QTimer.singleShot(400, self._remind_dds_item)
 
     def invalidate(self) -> None:
         """Забыть загруженное: следующее открытие раздела перечитает базу.
@@ -1697,6 +1743,28 @@ class PaymentsPage(QWidget):
             return
         self.notify("Вход не выполнен — показаны оплаты из локальной базы",
                     ToastKind.WARNING)
+
+    def _remind_dds_item(self) -> None:
+        """Напоминание про статью ДДС в заявках на маркетинг.
+
+        Показывается при первом открытии раздела за запуск, пока человек не
+        отметил «Больше не показывать». Закрыть окно можно через десять секунд.
+        """
+        if self.settings.payment_dds_notice_hidden or not self.isVisible():
+            return
+        dialog = NoticeDialog(
+            "Статья ДДС в заявках на маркетинг",
+            "При создании заявки на <b>маркетинг</b> обязательно выберите "
+            "<b>«Статью ДДС»</b>.<br><br>"
+            "По умолчанию в новой заявке стоит «Оплата поставщику (бьюти)» или "
+            "«(фэшн)» — для маркетинга её нужно заменить на нужную статью, "
+            "например «Маркетинг (ГПН)» или «Маркетинг (Адвент)». От статьи "
+            "зависят цвет и метка оплаты в календаре и таблице.",
+            parent=self)
+        dialog.exec()
+        if dialog.hide_forever():
+            self.settings.payment_dds_notice_hidden = True
+            self.settings.save()
 
     def _remind_import(self) -> None:
         """Напоминание о свежей выгрузке — раз в неделю, по понедельникам."""
@@ -1900,6 +1968,7 @@ class PaymentsPage(QWidget):
             recipients=known.get("recipients", []),
             responsible=known.get("responsible", []),
             operations=known.get("operations", []),
+            dds_items=known.get("dds_items", []),
             parent=self)
         if not dialog.exec():
             return
@@ -1927,6 +1996,25 @@ class PaymentsPage(QWidget):
         self._refresh_current_tab()
 
 
+def _dot(payment: Payment):
+    """Кружок цвета статьи ДДС. У неокрашенных — пустое место, если окрашенные
+    есть: иначе названия поставщиков в таблице стояли бы не по одной линии."""
+    color = marks.color_of(payment.dds_item)
+    if color:
+        return marks.dot_icon(color)
+    return marks.blank_icon() if marks.has_marks() else None
+
+
+def _tint(payment: Payment):
+    color = marks.color_of(payment.dds_item)
+    return marks.tint(color) if color else None
+
+
+def _ink(payment: Payment):
+    color = marks.color_of(payment.dds_item)
+    return marks.ink(color) if color else None
+
+
 def _load_all(
     selection: Filter,
 ) -> tuple[list[Payment], dict[str, list[str]], int]:
@@ -1940,7 +2028,12 @@ def _load_all(
         rows = by_direction(
             rows, selection.direction, directory.direction_keys(known),
             {item.code for item in known if not item.for_people})
-    return rows, store.known_values(), overdue
+    known = store.known_values()
+    # Справочник статей ДДС едет вместе с остальными списками карточки: сеть
+    # здесь уже занята фоновой задачей, и отдельный поход при открытии
+    # карточки заставил бы её ждать.
+    known["dds_items"] = [item.title for item in dds.catalog()]
+    return rows, known, overdue
 
 
 def _direction_hint(items: list) -> str:
