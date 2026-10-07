@@ -13,6 +13,12 @@
 пара «GTIN и серийный номер» у одной и той же вещи совпадёт всегда, как бы её
 ни сняли. Разбором занимается `codes`, здесь только сведение двух списков.
 
+Поставщик на объёмно-сортовом учёте (ОСУ) экземпляры не перечисляет: в строке
+стоит GTIN и количество. Тогда сверяется товар и счёт: скан засчитывается
+строке с тем же GTIN, пока в ней есть место, а вещь сверх количества — лишняя.
+Подлинность конкретного экземпляра такая сверка не подтверждает — для этого
+коды спрашивают у «Честного ЗНАКа».
+
 Отмена последнего скана — не украшение. Сканер стреляет по соседней коробке
 чаще, чем хотелось бы, и без отмены единственный выход из ошибки — начать
 сверку заново.
@@ -83,7 +89,7 @@ class LineProgress:
 
     @property
     def expected(self) -> int:
-        return len(self.line.marks)
+        return self.line.expected
 
     @property
     def left(self) -> int:
@@ -136,6 +142,12 @@ class Reconciliation:
                 self.repeated_in_document.append(mark.value)
                 continue
             self.expected[key] = (line, mark)
+        # Строки, переданные по счёту (ОСУ): по GTIN из кода находится строка,
+        # а экземпляр засчитывается, пока в ней остаётся место.
+        self.counted: dict[str, list[Line]] = {}
+        for line in document.lines:
+            if line.counted > 0 and line.gtin14:
+                self.counted.setdefault(line.gtin14, []).append(line)
         self.seen: dict[str, Scan] = {}
         self.history: list[Scan] = []
 
@@ -162,11 +174,37 @@ class Reconciliation:
         if not code.valid:
             reason = code.problems[0] if code.problems else "код не разобран"
             scan = Scan(raw=text, key=key, verdict=Verdict.BROKEN, note=reason)
+        elif lines := self.counted.get(code.gtin):
+            scan = self._scan_counted(text, key, lines)
         else:
             scan = Scan(raw=text, key=key, verdict=Verdict.UNKNOWN,
                         note=self._why_unknown(code))
         self.history.append(scan)
         return scan
+
+    def _scan_counted(self, text: str, key: str, lines: list[Line]) -> Scan:
+        """Скан товара, переданного по счёту: засчитать, пока в строке есть место."""
+        if key in self.seen:
+            return Scan(raw=text, key=key, verdict=Verdict.REPEAT,
+                        line=self.seen[key].line,
+                        note="этот экземпляр уже сверяли")
+        taken = self._taken()
+        for line in lines:
+            if taken.get(line.number, 0) < line.expected:
+                scan = Scan(raw=text, key=key, verdict=Verdict.MATCHED, line=line)
+                self.seen[key] = scan
+                return scan
+        total = sum(line.counted for line in lines)
+        return Scan(raw=text, key=key, verdict=Verdict.UNKNOWN, line=lines[0],
+                    note=f"по документу этого товара {total} шт., эта — сверх")
+
+    def _taken(self) -> dict[str, int]:
+        """Сколько экземпляров уже засчитано каждой строке."""
+        counted: dict[str, int] = {}
+        for scan in self.seen.values():
+            if scan.line is not None:
+                counted[scan.line.number] = counted.get(scan.line.number, 0) + 1
+        return counted
 
     def _why_unknown(self, code: codes_module.Code) -> str:
         """Почему кода нет в документе — насколько это видно отсюда.
@@ -198,16 +236,18 @@ class Reconciliation:
 
     @property
     def progress(self) -> list[LineProgress]:
-        counted: dict[str, int] = {}
-        for key in self.seen:
-            line, _ = self.expected[key]
-            counted[line.number] = counted.get(line.number, 0) + 1
+        counted = self._taken()
         return [LineProgress(line=line, scanned=counted.get(line.number, 0))
                 for line in self.document.marked_lines]
 
     @property
     def total(self) -> int:
-        return len(self.expected)
+        return len(self.expected) + self.document.counted
+
+    @property
+    def by_count(self) -> list[Scan]:
+        """Экземпляры, засчитанные по товару и счёту (ОСУ), в порядке сканирования."""
+        return [scan for key, scan in self.seen.items() if key not in self.expected]
 
     @property
     def done(self) -> int:
@@ -260,8 +300,10 @@ class Reconciliation:
     @property
     def summary(self) -> str:
         if not self.history:
+            tail = (" Часть товара передана по количеству (ОСУ): сверяется "
+                    "товар и счёт, а не экземпляр." if self.document.counted else "")
             return (f"К сверке {self.total} кодов по {len(self.document.marked_lines)} "
-                    "строкам. Сканируйте первую вещь.")
+                    f"строкам. Сканируйте первую вещь.{tail}")
         parts = [f"сверено {self.done} из {self.total}"]
         if self.left:
             parts.append(f"осталось {self.left}")
@@ -359,6 +401,14 @@ def _codes_sheet(sheet, session: Reconciliation) -> None:
         for column, value in enumerate(values, start=1):
             cell = workbook_module.as_text(sheet.cell(row=row, column=column, value=value))
             cell.fill = DONE_FILL if found else TROUBLE_FILL
+        row += 1
+
+    for scan in session.by_count:
+        values = (scan.line.number, scan.line.title, scan.key,
+                  "Сверен по количеству", "в документе экземпляры не перечислены (ОСУ)")
+        for column, value in enumerate(values, start=1):
+            cell = workbook_module.as_text(sheet.cell(row=row, column=column, value=value))
+            cell.fill = DONE_FILL
         row += 1
 
     for scan in session.extra:

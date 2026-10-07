@@ -294,6 +294,10 @@ class DataTable(QTableView):
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         header.customContextMenuRequested.connect(self._column_menu)
         self._size_columns()
+        for signal in (self.proxy.modelReset, self.proxy.rowsInserted,
+                       self.proxy.rowsRemoved, self.proxy.layoutChanged):
+            signal.connect(self._sync_scrollbar)
+        self._sync_scrollbar()
 
         self.doubleClicked.connect(self._emit_activated)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -317,6 +321,16 @@ class DataTable(QTableView):
         for index in range(len(columns)):
             self.setColumnHidden(index, False)
         self._size_columns()
+
+    def _sync_scrollbar(self, *_args) -> None:
+        """Полоса прокрутки вбок — только когда есть что прокручивать.
+
+        Ширины колонок заданы под данные и в сумме шире окна. Пока строк нет,
+        полоса под пустой таблицей ничего не листает и выглядит поломкой.
+        """
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if self.proxy.rowCount()
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
     def _size_columns(self) -> None:
         header = self.horizontalHeader()

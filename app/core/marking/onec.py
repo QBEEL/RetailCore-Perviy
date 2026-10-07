@@ -392,6 +392,15 @@ def build_rows(matches: Sequence[LineMatch], session: Reconciliation,
             report.skipped_codes += 1
             continue
         rows.append((item.code, item.feature, mark.value))
+    # Товар, переданный по количеству (ОСУ): кодов в документе нет, и в 1С
+    # идут те, что сняты сканером, — в виде кода идентификации.
+    for scan in session.by_count:
+        item = ready.get(scan.line.number)
+        if item is None:
+            skipped[scan.line.number] = scan.line
+            report.skipped_codes += 1
+            continue
+        rows.append((item.code, item.feature, scan.key))
     report.rows = len(rows)
     report.skipped_lines = list(skipped.values())
     return rows, report

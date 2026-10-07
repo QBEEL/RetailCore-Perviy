@@ -273,6 +273,49 @@ def test_по_умолчанию_предлагается_перемаркиро
     assert not dialog.remark_box.isHidden()
 
 
+def _replace_dialog(batch, first: int, previous=("old-code",)):
+    dialog = IntroduceDialog(batch, "250101802801", Contour.SANDBOX, "",
+                             previous=previous, fixed_range=(first, first + 1))
+    dialog.country_edit.setText("643")
+    return dialog
+
+
+def test_замена_кода_берёт_ровно_один_код_и_ведёт_старый_в_предыдущие(
+        application, batch):
+    batch.printed = 3
+    dialog = _replace_dialog(batch, 2, previous=("old-code",))
+
+    document = dialog.document
+
+    assert document.kind == "remark"
+    assert list(document.codes) == [CODES[2]]
+    assert document.previous == ("old-code",)
+    assert not dialog.scope_box.isEnabled() and not dialog.kind_box.isEnabled()
+
+
+def test_замена_с_начала_блока_отмечает_введённым_только_свой_код(
+        application, batch, monkeypatch):
+    dialog = _replace_dialog(batch, 0)
+    monkeypatch.setattr(dialog, "_confirm_send", lambda document: True)
+
+    dialog._send()
+
+    assert dialog.action == "send" and dialog.covered == 1
+
+
+def test_замена_из_середины_не_объявляет_введёнными_ожидающие_коды(
+        application, batch, monkeypatch):
+    """Коды 0 и 1 напечатаны, но не отправлены: замена кода 2 их не закрывает."""
+    batch.printed = 2
+    batch.introduced_count = 0
+    dialog = _replace_dialog(batch, 2)
+    monkeypatch.setattr(dialog, "_confirm_send", lambda document: True)
+
+    dialog._send()
+
+    assert dialog.covered == 0
+
+
 def test_документ_перемаркировки_собирается_из_полей_окна(application, batch):
     batch.printed = 5
     issue.save(batch)

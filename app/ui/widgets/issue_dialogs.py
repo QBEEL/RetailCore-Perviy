@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from typing import Sequence
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QPixmap
@@ -453,12 +454,22 @@ class IntroduceDialog(QDialog):
 
     def __init__(self, batch: issue.Batch, inn: str, contour,
                  send_problem: "str | dict[str, str]" = "",
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, *,
+                 previous: Sequence[str] = (),
+                 fixed_range: tuple[int, int] | None = None) -> None:
+        """`previous` и `fixed_range` — для замены одного кода из проверки.
+
+        `fixed_range` — какие коды блока вводятся, [от, до): вместо выбора
+        «напечатанные/все» берётся ровно он, а документ остаётся
+        перемаркировкой. `previous` — старые КИ, идущие в том же порядке.
+        """
         super().__init__(parent)
         self.setWindowTitle("Ввод в оборот")
         self.setModal(True)
         self.setMinimumWidth(640)
         self.batch = batch
+        self._fixed_range = fixed_range
+        self._previous = tuple(previous)
         self._contour = contour
         # Почему отправить нельзя: не выполнен вход, не тот контур, группа без
         # поддержки. Пусто — можно. Файл сохранить можно всегда. Причины разные
@@ -510,6 +521,13 @@ class IntroduceDialog(QDialog):
         self.scope_box.addItem(f"Весь блок — {self.batch.total}", "all")
         if not waiting:
             self.scope_box.setCurrentIndex(1 if printed else 2)
+        if self._fixed_range is not None:
+            first, last = self._fixed_range
+            self.scope_box.clear()
+            self.scope_box.addItem(f"Заменяющие коды — {last - first}", "fixed")
+            self.scope_box.setEnabled(False)
+            self.kind_box.setCurrentIndex(self.kind_box.findData("remark"))
+            self.kind_box.setEnabled(False)
         form.addRow("Какие коды", self.scope_box)
         root.addLayout(form)
 
@@ -551,6 +569,8 @@ class IntroduceDialog(QDialog):
             "Предыдущие КИ — по одному в строке, в том же порядке, что и новые. "
             "Для причины KM_SPOILED можно оставить пустым")
         self.previous_edit.setMaximumHeight(70)
+        if self._previous:
+            self.previous_edit.setPlainText("\n".join(self._previous))
         remark.addRow("Предыдущие КИ", self.previous_edit)
 
         document = QHBoxLayout()
@@ -639,6 +659,8 @@ class IntroduceDialog(QDialog):
 
     def _range(self) -> tuple[int, int]:
         """Какие коды блока берутся: [от, до)."""
+        if self._fixed_range is not None:
+            return self._fixed_range
         printed = min(self.batch.printed, self.batch.total)
         sent = min(self.batch.introduced_count, self.batch.total)
         scope = self.scope_box.currentData()
@@ -784,6 +806,11 @@ class IntroduceDialog(QDialog):
             return
         self._remember(document)
         issue.save(self.batch)
-        self.covered = self._range()[1]
+        start, end = self._range()
+        # Блок отмечается «введён» с начала и до `covered`. Замена одного кода
+        # из середины блока не вправе объявить введёнными напечатанные до него,
+        # но ещё не отправленные: они остаются в очереди.
+        self.covered = end if self._fixed_range is None \
+            or start <= self.batch.introduced_count else self.batch.introduced_count
         self.action = "send"
         self.accept()

@@ -61,6 +61,8 @@ NAMES = {
     "marking": "mdi6.barcode-scan",
     "certificate": "mdi6.certificate-outline",
     "close": "mdi6.close",
+    "expand": "mdi6.arrow-expand-vertical",
+    "collapse": "mdi6.arrow-collapse-vertical",
 }
 
 

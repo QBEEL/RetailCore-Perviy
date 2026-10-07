@@ -29,6 +29,7 @@ True API — оттуда сведения о кодах. В СУЗ, котор�
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Callable, Sequence
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -84,6 +86,7 @@ from .widgets.expiry_tab import ExpiryTab
 from .widgets.issue_dialogs import IntroduceDialog, IssueDialog, PrintDialog
 from .widgets.order_dialog import OrderDialog, _plural
 from .widgets.marking_dialogs import (
+    CodeInfoDialog,
     NomenclatureDialog,
     OrderConfirmDialog,
     OrganisationDialog,
@@ -91,9 +94,9 @@ from .widgets.marking_dialogs import (
 from .widgets.toast import ToastKind
 from .widgets.withdrawal_tab import WithdrawalTab
 
-# Сколько строк результата показывать. Проверяют тысячами, а глазами смотрят на
-# несоответствия — их отбирает переключатель «только замечания».
-RESULT_LIMIT = 500
+# Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
+# занимает то, что осталось от окна, и на тысяче кодов это пять строк.
+RESULT_EXPANDED_HEIGHT = 640
 
 # Пауза перед пересчётом сводки по кодам. Сканер вводит код посимвольно, и
 # разбор на каждое нажатие превратил бы одну пачку в тысячу разборов.
@@ -111,6 +114,20 @@ ORDER_TAB = 2
 EXPIRY_TAB = 3
 # Вывод из оборота добавлен следом по той же причине.
 WITHDRAWAL_TAB = 4
+
+# Что делает открытая подвкладка и что ей нужно — одной строкой под заголовком.
+TAB_SUBTITLES: dict[int, str] = {
+    CHECK_TAB: "Спрашивает «Честный ЗНАК», чей код и в обороте ли он. Нужен вход "
+               "по сертификату.",
+    RECONCILE_TAB: "Сравнивает коды из УПД с этикетками на товаре. Ни входа, ни "
+                   "сети не нужно.",
+    ORDER_TAB: "Заказ кодов идёт через СУЗ: у неё свои реквизиты, сертификатом в "
+               "неё не входят.",
+    EXPIRY_TAB: "Срок годности читается из QR, а для кода маркировки спрашивается "
+                "у «Честного ЗНАКа».",
+    WITHDRAWAL_TAB: "Документ о выводе уходит в «Честный ЗНАК» от имени "
+                    "организации. Отменить его нельзя.",
+}
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
 # косится краем глаза, и различать ответы он должен цветом, а не чтением.
@@ -187,6 +204,9 @@ class MarkingPage(QWidget):
         self._crypto_available = True
         self._batch = codes_module.Batch()
         self._result: list[CodeInfo] = []
+        # Коды в том порядке, в каком они стоят в таблице результата: с
+        # переключателем «только замечания» номер строки не равен номеру кода.
+        self._shown: list[CodeInfo] = []
         self._journal: list[Operation] = []
         # Последний ответ СУЗ на проверку связи. Держится отдельно от реквизитов:
         # он относится к тому, что было в полях в момент проверки, и правка поля
@@ -226,13 +246,10 @@ class MarkingPage(QWidget):
         root.setSpacing(Metrics.GAP)
 
         root.addWidget(Title("Маркировка", self))
-        root.addWidget(Subtitle(
-            "Проверка кодов спрашивает «Честный ЗНАК», что он знает о коде, и "
-            "требует входа по сертификату. Заказ кодов идёт через СУЗ и требует "
-            "её реквизитов — это разные системы и разные способы представиться. "
-            "Сверка с УПД не требует ни входа, ни сети: документ и этикетки "
-            "сравниваются здесь.",
-            self))
+        # Одна строка про открытую подвкладку. Общий абзац про все пять сразу
+        # занимал две строки и на каждой вкладке был на четыре пятых не о ней.
+        self.subtitle = Subtitle(TAB_SUBTITLES[CHECK_TAB], self)
+        root.addWidget(self.subtitle)
 
         # Подвкладки, а не одна длинная страница: работы здесь три, и они не
         # пересекаются. Проверка кодов идёт через ГИС МТ по сертификату, заказ —
@@ -638,6 +655,12 @@ class MarkingPage(QWidget):
         self.problems_box = QCheckBox("Только замечания", card)
         self.problems_box.stateChanged.connect(self._fill_result)
         header.addWidget(self.problems_box)
+        self.result_expand = self._action(card, "Развернуть", "expand",
+                                          self._toggle_result)
+        self.result_expand.setToolTip(
+            "Растянуть таблицу по высоте, чтобы видеть больше строк. "
+            "Двойной щелчок по строке открывает сведения о коде")
+        header.addWidget(self.result_expand)
         body.addLayout(header)
 
         tiles = QHBoxLayout()
@@ -658,6 +681,7 @@ class MarkingPage(QWidget):
         self.result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result.setAlternatingRowColors(True)
+        self.result.cellDoubleClicked.connect(self._on_result_activated)
         head = self.result.horizontalHeader()
         # Код, состояние и владелец показываются целиком: обрезанное «Выве…»
         # вместо «Выведен из оборота» превращает главную колонку в загадку.
@@ -736,15 +760,6 @@ class MarkingPage(QWidget):
             header.addWidget(button)
         body.addLayout(header)
 
-        tiles = QHBoxLayout()
-        tiles.setSpacing(Metrics.GAP)
-        self.tile_upd_lines = MetricTile("Позиций", Palette.INFO, card)
-        self.tile_upd_codes = MetricTile("Кодов в документе", Palette.PRIMARY, card)
-        for tile in (self.tile_upd_lines, self.tile_upd_codes):
-            tiles.addWidget(tile, 1)
-        tiles.addStretch(2)
-        body.addLayout(tiles)
-
         self.upd_hint = Hint("", card)
         body.addWidget(self.upd_hint)
         return card
@@ -781,22 +796,32 @@ class MarkingPage(QWidget):
         self.scan_edit.returnPressed.connect(self.accept_scan)
         body.addWidget(self.scan_edit)
 
+        # Плашка ответа появляется с первым сканом: пустая, она держала под
+        # полем полосу в полсотни пикселей, а место нужно таблице позиций.
         self.verdict_label = QLabel("", card)
         self.verdict_label.setWordWrap(True)
         self.verdict_label.setMinimumHeight(46)
         self.verdict_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.verdict_label.hide()
         body.addWidget(self.verdict_label)
 
-        tiles = QHBoxLayout()
+        # Цифры документа и хода сверки стоят одним рядом и появляются вместе
+        # с документом: шесть нулей в два ряда до загрузки УПД только отодвигали
+        # таблицу позиций за край окна.
+        self.scan_tiles = QWidget(card)
+        tiles = QHBoxLayout(self.scan_tiles)
+        tiles.setContentsMargins(0, 0, 0, 0)
         tiles.setSpacing(Metrics.GAP)
+        self.tile_upd_lines = MetricTile("Позиций", Palette.INFO, card)
+        self.tile_upd_codes = MetricTile("Кодов в документе", Palette.PRIMARY, card)
         self.tile_scanned = MetricTile("Сверено", Palette.SUCCESS, card)
         self.tile_left = MetricTile("Осталось", Palette.PRIMARY, card)
         self.tile_extra = MetricTile("Лишних", Palette.DANGER, card)
         self.tile_scan_repeats = MetricTile("Повторов", Palette.WARNING, card)
-        for tile in (self.tile_scanned, self.tile_left, self.tile_extra,
-                     self.tile_scan_repeats):
+        for tile in (self.tile_upd_lines, self.tile_upd_codes, self.tile_scanned,
+                     self.tile_left, self.tile_extra, self.tile_scan_repeats):
             tiles.addWidget(tile, 1)
-        body.addLayout(tiles)
+        body.addWidget(self.scan_tiles)
 
         self.sound_box = QCheckBox("Звук при расхождении", card)
         self.sound_box.setToolTip(
@@ -829,6 +854,11 @@ class MarkingPage(QWidget):
             "Перенести отсканированные при сверке коды на вкладку «Срок "
             "годности»: срок спросится у «Честного ЗНАКа» разом на все коды")
         header.addWidget(self.upd_expiry_button)
+        self.progress_expand = self._action(card, "Развернуть", "expand",
+                                            self._toggle_progress)
+        self.progress_expand.setToolTip(
+            "Растянуть таблицу по высоте, чтобы видеть больше позиций документа")
+        header.addWidget(self.progress_expand)
         body.addLayout(header)
 
         self.progress = QTableWidget(0, 6, card)
@@ -1818,12 +1848,16 @@ class MarkingPage(QWidget):
         if batch is None:
             self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
             return
+        self._introduce(batch)
+
+    def _introduce(self, batch: issue_module.Batch, previous: Sequence[str] = (),
+                   fixed_range: tuple[int, int] | None = None) -> None:
         # Документ отправляется от имени организации, под которой выполнен вход:
         # её ИНН и подставляется. Набирать его руками значит ошибиться в цифре.
         inn = (service.current().inn if service.signed_in() else "") \
             or self.settings.marking_inn
         dialog = IntroduceDialog(batch, inn, self.contour, self._send_problem(batch),
-                                 self)
+                                 self, previous=previous, fixed_range=fixed_range)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if not accepted:
             self.reload_batches(select=batch.id)
@@ -2062,12 +2096,123 @@ class MarkingPage(QWidget):
         return (bool(item.problems) or not item.found or not item.state.sellable
                 or (bool(item.owner_inn) and not item.ours))
 
+    def _toggle_result(self) -> None:
+        self._toggle_table(self.result, self.result_expand)
+
+    def _toggle_progress(self) -> None:
+        self._toggle_table(self.progress, self.progress_expand)
+
+    @staticmethod
+    def _toggle_table(table: QTableWidget, button: QPushButton) -> None:
+        """Растягивает таблицу по высоте или возвращает её прежний размер."""
+        expanded = table.minimumHeight() == 0
+        table.setMinimumHeight(RESULT_EXPANDED_HEIGHT if expanded else 0)
+        button.setText("Свернуть" if expanded else "Развернуть")
+        button.setIcon(icons.icon("collapse" if expanded else "expand"))
+        table.updateGeometry()
+
+    def _on_result_activated(self, row: int, _column: int) -> None:
+        if not 0 <= row < len(self._shown):
+            return
+        info = self._shown[row]
+        full = self._full_code(info)
+        dialog = CodeInfoDialog(info, self, print_blocked="" if full else (
+            "Нет криптохвоста: в таблице только код идентификации, а этикетка без "
+            "ключа проверки — «сомнительный товар». Отсканируйте код с товара в "
+            "поле кодов и проверьте заново — тогда его можно напечатать"))
+        dialog.exec()
+        if dialog.action == CodeInfoDialog.PRINT:
+            self._print_code(info, full)
+        elif dialog.action == CodeInfoDialog.REMARK:
+            self._remark_code(info)
+        elif dialog.action == CodeInfoDialog.WITHDRAW:
+            self._withdraw_code(info)
+
+    def _full_code(self, info: CodeInfo) -> str:
+        """Код вместе с криптохвостом, если он на этом компьютере есть.
+
+        В ответе проверки хвоста нет: перед запросом он отрезается, а «Честный
+        ЗНАК» его не возвращает. Взять его можно только там, где код был целым:
+        в поле кодов, если его сняли сканером с товара, или в блоке, полученном
+        из СУЗ. В кодах из УПД хвоста не бывает вовсе.
+        """
+        wanted = codes_module.parse(info.code).identity
+        if not all(wanted):
+            return ""
+        for code in self._batch.codes:
+            if code.identity == wanted and code.full:
+                return code.full
+        for batch in self._batches:
+            if batch.gtin != wanted[0]:
+                continue
+            for raw in batch.codes:
+                code = codes_module.parse(raw)
+                if code.identity == wanted and code.full:
+                    return code.full
+        return ""
+
+    def _print_code(self, info: CodeInfo, full: str) -> None:
+        """Печать этикетки с этим кодом, например взамен порванной.
+
+        Печатается только код с криптохвостом (`full`). Блок собирается в
+        памяти и без `id`: на диск он не пишется, и в списке блоков кодов из
+        СУЗ от одной допечатанной этикетки ничего не появится.
+        """
+        if not full:
+            return
+        batch = issue_module.Batch(
+            created=datetime.now().isoformat(timespec="seconds"), gtin=info.gtin,
+            name=info.product_name, codes=[full])
+        PrintDialog(batch, self).exec()
+
+    def _withdraw_code(self, info: CodeInfo) -> None:
+        """Переносит код на вкладку «Вывод из оборота». Отправки отсюда нет."""
+        if self.withdrawal_tab.add_code(info.code, quiet=True) == "broken":
+            self.notify("Код не разобран и в список вывода не попал",
+                        ToastKind.WARNING)
+            return
+        self.tabs.setCurrentIndex(WITHDRAWAL_TAB)
+        self.withdrawal_tab.focus_scan()
+
+    def _remark_code(self, info: CodeInfo) -> None:
+        """Замена кода новым: печать нового из блока СУЗ и документ «Перемаркировка».
+
+        Новым берётся первый ещё не напечатанный код блока с тем же GTIN: печать
+        сдвигает счётчик, поэтому один код дважды не достанется. Старый код
+        уходит в «Предыдущие КИ» документа.
+        """
+        found = [batch for batch in self._batches
+                 if batch.gtin == info.gtin and batch.left]
+        if not found:
+            self.notify("Для замены нужны непечатанные коды этого товара. Закажите "
+                        "их на вкладке «Заказ кодов».", ToastKind.WARNING)
+            return
+        batch = found[0]
+        if len(found) > 1:
+            titles = [item.title for item in found]
+            chosen, accepted = QInputDialog.getItem(
+                self, "Перемаркировка", "Из какого блока взять новый код:",
+                titles, 0, False)
+            if not accepted:
+                return
+            batch = found[titles.index(chosen)]
+        index = batch.printed
+        dialog = PrintDialog(batch, self)
+        dialog.count.setValue(1)
+        dialog.exec()
+        self.reload_batches(select=batch.id)
+        if batch.printed <= index:
+            return
+        self._introduce(batch, previous=(info.code,), fixed_range=(index, index + 1))
+
     def _fill_result(self) -> None:
         shown = [item for item in self._result
                  if not self.problems_box.isChecked() or self._troubled(item)]
-        limited = shown[:RESULT_LIMIT]
-        self.result.setRowCount(len(limited))
-        for row, item in enumerate(limited):
+        self._shown = shown
+        # Тысячи строк с перерисовкой на каждую ячейку заметно подвешивают окно.
+        self.result.setUpdatesEnabled(False)
+        self.result.setRowCount(len(shown))
+        for row, item in enumerate(shown):
             owner = item.owner_name or item.owner_inn or "—"
             if item.owner_inn and not item.ours:
                 owner = f"{owner} · чужой"
@@ -2085,17 +2230,16 @@ class MarkingPage(QWidget):
                 if column == 2:
                     cell.setForeground(QColor(_state_color(item)))
                 self.result.setItem(row, column, cell)
+        self.result.setUpdatesEnabled(True)
         if not self._result:
             self.result_hint.setText(
                 "Проверка спрашивает «Честный ЗНАК» о каждом коде: чей он, в "
                 "обороте ли и не выведен ли уже.")
             return
         troubled = sum(1 for item in self._result if self._troubled(item))
-        tail = (f", показаны первые {RESULT_LIMIT}"
-                if len(shown) > RESULT_LIMIT else "")
         self.result_hint.setText(
             f"Проверено кодов: {len(self._result)} · требуют внимания: {troubled}"
-            f"{tail}")
+            f" · двойной щелчок по строке покажет сведения о коде")
 
     # --- журнал --------------------------------------------------------------------
 
@@ -2142,6 +2286,7 @@ class MarkingPage(QWidget):
     # --- сверка с документом ----------------------------------------------------
 
     def _on_tab_changed(self, index: int) -> None:
+        self.subtitle.setText(TAB_SUBTITLES.get(index, ""))
         if index == RECONCILE_TAB:
             self._focus_scan()
         elif index == EXPIRY_TAB:
@@ -2255,11 +2400,13 @@ class MarkingPage(QWidget):
             f"color: {color}; background: {background}; font-size: 15px;"
             f" font-weight: 600; border-radius: {Metrics.RADIUS}px;"
             " padding: 10px 14px;")
+        self.verdict_label.show()
         if not scan.verdict.good and self.sound_box.isChecked():
             QApplication.beep()
 
     def _clear_verdict(self, text: str = "") -> None:
         self.verdict_label.setText(text)
+        self.verdict_label.setVisible(bool(text))
         self.verdict_label.setStyleSheet(
             f"color: {Palette.TEXT_MUTED}; padding: 10px 14px;" if text else "")
 
@@ -2268,7 +2415,7 @@ class MarkingPage(QWidget):
         session = self._session
         document = self._upd
         self.tile_upd_lines.set_value(len(document.marked_lines) if document else 0)
-        self.tile_upd_codes.set_value(len(document.marks) if document else 0)
+        self.tile_upd_codes.set_value(document.expected if document else 0)
         self.tile_scanned.set_value(session.done if session else 0)
         self.tile_left.set_value(session.left if session else 0)
         self.tile_extra.set_value(len(session.extra) if session else 0)
@@ -2279,6 +2426,9 @@ class MarkingPage(QWidget):
             "Документ не загружен. Нужен тот же XML, что пришёл по ЭДО, — он "
             "лежит в папке с документом рядом с печатной формой.")
         self.scan_edit.setEnabled(session is not None)
+        self.scan_tiles.setVisible(session is not None)
+        self.sound_box.setVisible(session is not None)
+        self.scan_hint.setVisible(session is not None)
         for button in (self.upd_check_button, self.upd_report_button,
                        self.upd_forget_button, self.undo_button,
                        self.restart_button):
@@ -2386,13 +2536,23 @@ class MarkingPage(QWidget):
         """
         if self._upd is None:
             return
-        text = "\n".join(mark.value for _, mark in self._upd.marks)
+        codes = [mark.value for _, mark in self._upd.marks]
+        # Товар, переданный по количеству (ОСУ), в документе кодов не имеет:
+        # спросить можно только о тех экземплярах, что уже сняты сканером.
+        if self._session is not None:
+            codes += [scan.raw for scan in self._session.by_count]
+        if not codes:
+            self.notify("В документе нет кодов экземпляров — товар передан по "
+                        "количеству. Сначала отсканируйте его при сверке",
+                        ToastKind.WARNING)
+            return
+        text = "\n".join(codes)
         existing = self.codes_edit.toPlainText().strip()
         self.codes_edit.setPlainText(f"{existing}\n{text}" if existing else text)
         self._reparse()
         self.tabs.setCurrentIndex(CHECK_TAB)
         self.notify(
-            f"Перенесено кодов: {len(self._upd.marks)}. "
+            f"Перенесено кодов: {len(codes)}. "
             "Для проверки нужен вход по сертификату", ToastKind.INFO)
 
     def codes_to_expiry(self) -> None:

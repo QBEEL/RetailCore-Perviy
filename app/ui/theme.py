@@ -227,7 +227,7 @@ QPushButton#Danger:hover {{ background: {Palette.DANGER_SOFT}; }}
 QPushButton#Ghost {{ background: transparent; border: none; padding: 6px 8px; color: {Palette.TEXT_MUTED}; }}
 QPushButton#Ghost:hover {{ background: {Palette.SURFACE_ALT}; color: {Palette.TEXT}; }}
 
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {{
     background: {Palette.SURFACE};
     border: 1px solid {Palette.BORDER_STRONG};
     border-radius: {Metrics.RADIUS_SM}px;
@@ -235,14 +235,16 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     selection-background-color: {Palette.SELECTION};
     selection-color: {Palette.TEXT};
 }}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QDateEdit:focus {{
     border-color: {Palette.PRIMARY};
 }}
 /* Заблокированное поле должно читаться как заблокированное. Правило было
    только для QLineEdit, из-за чего в карточке чужой оплаты список, сумма и
    комментарий выглядели обычными, хотя не принимали ввод. */
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled,
-QDoubleSpinBox:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
+QDoubleSpinBox:disabled, QDateEdit:disabled, QPlainTextEdit:disabled,
+QTextEdit:disabled {{
     background: {Palette.SURFACE_ALT};
     color: {Palette.TEXT_FAINT};
     border-color: {Palette.BORDER};
@@ -250,6 +252,10 @@ QDoubleSpinBox:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
 QLineEdit#Path {{ font-family: {_MONO_FONTS}; font-size: 12px; }}
 
 QComboBox::drop-down {{ border: none; width: 22px; }}
+/* Поле даты с календарём — то же поле со стрелкой, что и список: без этих
+   правил оно рисовалось системным, ниже и с прямыми углами. */
+QDateEdit::drop-down {{ border: none; width: 22px; }}
+QDateEdit::down-arrow {{ image: url("{_CHEVRON_DOWN}"); width: 9px; height: 9px; }}
 QComboBox QAbstractItemView {{
     background: {Palette.SURFACE};
     border: 1px solid {Palette.BORDER};
@@ -418,7 +424,24 @@ QDialog {{ background: {Palette.BG}; }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
 
-QTabWidget::pane {{ border: none; }}
+/* Вкладки — подписи с чертой под открытой, а не серые ярлычки: рядом с
+   карточками системные вкладки выглядели деталью из другой программы.
+   Начертание у открытой то же, что у остальных: ширину вкладки Qt считает
+   по обычному шрифту, и жирная подпись обрезалась бы. */
+QTabWidget::pane {{ border: none; border-top: 1px solid {Palette.BORDER}; }}
+QTabBar {{ qproperty-drawBase: 0; background: transparent; }}
+QTabBar::tab {{
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    margin-right: 2px;
+    font-weight: 500;
+    color: {Palette.TEXT_MUTED};
+}}
+QTabBar::tab:hover {{ color: {Palette.TEXT}; border-bottom-color: {Palette.BORDER_STRONG}; }}
+QTabBar::tab:selected {{ color: {Palette.PRIMARY}; border-bottom-color: {Palette.PRIMARY}; }}
+QTabBar::tab:disabled {{ color: {Palette.TEXT_FAINT}; }}
 QGroupBox {{
     background: {Palette.SURFACE};
     border: 1px solid {Palette.BORDER};

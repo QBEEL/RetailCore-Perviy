@@ -17,13 +17,16 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -33,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.marking import Organisation
+from ...core.marking import CodeInfo, Organisation
 from .. import icons
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
@@ -252,6 +255,112 @@ class OrderConfirmDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+
+class CodeInfoDialog(QDialog):
+    """Всё, что известно о коде: товар, владелец, состояние и ответ ГИС МТ.
+
+    В таблице проверки названия и замечания обрезаются по ширине колонки, а код
+    показан сокращённо. Окно по двойному щелчку отдаёт то же без обрезки, чтобы
+    код можно было прочитать и скопировать целиком.
+
+    Здесь же — что с кодом можно сделать дальше. Окно само ничего не выполняет:
+    оно запоминает выбор в `action` и закрывается, а печатает, переносит на
+    вкладку вывода или готовит перемаркировку страница — у неё есть вход,
+    контур и блоки кодов.
+    """
+
+    PRINT = "print"
+    REMARK = "remark"
+    WITHDRAW = "withdraw"
+
+    def __init__(self, info: CodeInfo, parent: QWidget | None = None, *,
+                 print_blocked: str = "") -> None:
+        """`print_blocked` — почему этикетку напечатать нельзя; пусто — можно."""
+        super().__init__(parent)
+        self.setWindowTitle("Информация о коде")
+        self.setMinimumWidth(560)
+        self.action = ""
+        self._print_blocked = print_blocked
+        self._build(info)
+
+    def _choose(self, action: str) -> None:
+        self.action = action
+        self.accept()
+
+    def _build(self, info: CodeInfo) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
+        root.setSpacing(Metrics.GAP)
+        root.addWidget(SectionTitle(info.product_name or "Название товара неизвестно"))
+
+        owner = info.owner_name or "—"
+        if info.owner_inn:
+            owner = f"{owner} (ИНН {info.owner_inn})"
+            if not info.ours:
+                owner += " · чужой"
+        expires = info.expires_at.strftime("%d.%m.%Y") if info.expires_at else "—"
+        rows = (
+            ("Состояние", info.state.title),
+            ("GTIN", info.gtin or "—"),
+            ("Серийный номер", info.serial or "—"),
+            ("Владелец", owner),
+            ("Срок годности", expires),
+            ("Замечания", "\n".join(info.problems) or "—"),
+            ("Код", info.code or "—"),
+        )
+        form = QFormLayout()
+        form.setHorizontalSpacing(Metrics.GAP)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        for title, text in rows:
+            value = QLabel(text, self)
+            value.setWordWrap(True)
+            # Код и ИНН копируют в 1С и в письма поставщику, поэтому текст
+            # выделяется мышью.
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            form.addRow(f"{title}:", value)
+        root.addLayout(form)
+
+        if info.raw:
+            root.addWidget(Hint("Ответ «Честного ЗНАКа» как он пришёл:", self))
+            answer = QPlainTextEdit(self)
+            answer.setReadOnly(True)
+            answer.setPlainText(json.dumps(info.raw, ensure_ascii=False, indent=2,
+                                           default=str))
+            answer.setMinimumHeight(140)
+            root.addWidget(answer, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(9)
+        self.print_button = self._action_button(
+            "Печатать", "export", self.PRINT, self._print_blocked)
+        self.remark_button = self._action_button(
+            "Перемаркировка…", "refresh", self.REMARK,
+            "" if info.gtin else "Код не разобран: неизвестен товар")
+        self.withdraw_button = self._action_button(
+            "Вывод из оборота…", "trash", self.WITHDRAW,
+            "" if info.state.sellable else
+            "Код не в обороте: выводить из оборота нечего")
+        actions.addWidget(self.print_button)
+        actions.addWidget(self.remark_button)
+        actions.addWidget(self.withdraw_button)
+        actions.addStretch(1)
+        close = QPushButton("Закрыть", self)
+        close.clicked.connect(self.reject)
+        actions.addWidget(close)
+        root.addLayout(actions)
+
+    def _action_button(self, title: str, icon: str, action: str,
+                       blocked: str) -> QPushButton:
+        """Кнопка действия; если действие невозможно, подсказка говорит почему."""
+        button = QPushButton(title, self)
+        button.setIcon(icons.icon(icon))
+        button.setAutoDefault(False)
+        button.setEnabled(not blocked)
+        if blocked:
+            button.setToolTip(blocked)
+        button.clicked.connect(lambda _checked=False: self._choose(action))
+        return button
 
 
 class NomenclatureDialog(QDialog):

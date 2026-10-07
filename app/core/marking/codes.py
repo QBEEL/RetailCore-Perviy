@@ -109,6 +109,27 @@ class Code:
         return f"01{self.gtin}21{self.serial}"
 
     @property
+    def full(self) -> str:
+        """Код для печати: код идентификации и криптохвост через разделители.
+
+        Пусто, если хвоста нет. Этикетка без ключа и значения проверки читается
+        сканером, но подлинность не подтверждает: приложение «Честного ЗНАКа»
+        отвечает на неё «сомнительный товар». Разделители ставятся заново —
+        сканер их часто не выдаёт, а в символе они обязательны.
+        """
+        if not self.valid or not any(self.fields.get(name)
+                                     for name in ("91", "92", "93")):
+            return ""
+        names = list(self.fields)
+        parts: list[str] = []
+        for index, name in enumerate(names):
+            parts.append(f"{name}{self.fields[name]}")
+            # Разделитель закрывает поле переменной длины, если оно не последнее.
+            if name not in FIXED_LENGTH and index < len(names) - 1:
+                parts.append(GS)
+        return "".join(parts)
+
+    @property
     def ean13(self) -> str:
         """GTIN-14 → EAN-13, каким он лежит в каталоге и в прайсах.
 

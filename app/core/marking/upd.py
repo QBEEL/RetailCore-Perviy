@@ -13,6 +13,10 @@
 несёт название, количество и цену, вложенный `ДопСведТов` — код товара, а коды
 экземпляров сидят ещё уровнем ниже, в `НомСредИдентТов`.
 
+Поставщик на объёмно-сортовом учёте (ОСУ) экземпляры не перечисляет: в том же
+узле вместо кодов стоит `КолВедМарк` — сколько маркированных единиц товара с
+этим GTIN передано. Такая строка тоже сверяется, только по товару и счёту.
+
 Кодировка почти всегда windows-1251, и объявлена она в самом файле — разбор
 читает её оттуда, а не угадывает. Это тот случай, когда догадка обошлась бы
 дороже: cp1251, прочитанный как utf-8, даёт не ошибку, а мусор вместо названий.
@@ -62,10 +66,24 @@ class Line:
     price: float = 0.0
     total: float = 0.0
     marks: list[Mark] = field(default_factory=list)
+    # Объёмно-сортовой учёт: сколько маркированных единиц передано без
+    # перечисления экземпляров. Ноль — строка с кодами или без маркировки.
+    counted: int = 0
 
     @property
     def marked(self) -> bool:
-        return bool(self.marks)
+        return bool(self.marks) or self.counted > 0
+
+    @property
+    def expected(self) -> int:
+        """Сколько маркированных единиц за строкой: по кодам и по счёту."""
+        return len(self.marks) + self.counted
+
+    @property
+    def gtin14(self) -> str:
+        """GTIN в том виде, в каком он стоит в коде маркировки, — 14 цифр."""
+        digits = "".join(char for char in self.gtin if char.isdigit())
+        return digits.zfill(14) if digits else ""
 
     @property
     def shortage(self) -> int:
@@ -78,7 +96,7 @@ class Line:
         """
         if not self.marked:
             return 0
-        return max(0, int(round(self.quantity)) - len(self.marks))
+        return max(0, int(round(self.quantity)) - self.expected)
 
     @property
     def title(self) -> str:
@@ -108,6 +126,16 @@ class Document:
         return [line for line in self.lines if line.marked]
 
     @property
+    def counted(self) -> int:
+        """Сколько единиц передано по счёту (ОСУ), без кодов экземпляров."""
+        return sum(line.counted for line in self.lines)
+
+    @property
+    def expected(self) -> int:
+        """Сколько всего маркированных единиц предстоит сверить."""
+        return len(self.marks) + self.counted
+
+    @property
     def title(self) -> str:
         number = self.number or "без номера"
         return f"УПД № {number} от {self.date}" if self.date else f"УПД № {number}"
@@ -120,7 +148,10 @@ class Document:
             inn = f", ИНН {self.seller_inn}" if self.seller_inn else ""
             parts.append(f"поставщик: {self.seller}{inn}")
         parts.append(f"строк с маркировкой: {len(self.marked_lines)}")
-        parts.append(f"кодов: {len(self.marks)}")
+        if self.marks or not self.counted:
+            parts.append(f"кодов: {len(self.marks)}")
+        if self.counted:
+            parts.append(f"по количеству (ОСУ): {self.counted} шт.")
         if shortage := sum(line.shortage for line in self.lines):
             parts.append(f"кодов не хватает на {shortage} шт. товара")
         return " · ".join(parts)
@@ -136,10 +167,11 @@ def read(path: str) -> Document:
     if not document.lines:
         raise UpdProblem(
             "В документе нет ни одной строки товара — похоже, это не УПД")
-    if not document.marks:
+    if not document.expected:
         raise UpdProblem(
-            "В документе нет кодов маркировки. Сверять нечего: поставщик их "
-            "не указал, и это повод вернуть документ на уточнение")
+            "В документе нет ни кодов маркировки, ни количества маркированного "
+            "товара. Сверять нечего: поставщик их не указал, и это повод "
+            "вернуть документ на уточнение")
     return document
 
 
@@ -226,7 +258,9 @@ def _line(node: ET.Element) -> Line:
     for child in node.iter():
         tag = _tag(child)
         if tag == "ДопСведТов" and not line.gtin:
-            line.gtin = child.get("КодТов", "")
+            line.gtin = child.get("КодТов", "") or child.get("ГТИН", "")
+        elif tag == "НомСредИдентТов":
+            line.counted += int(_number(child.get("КолВедМарк")))
         elif tag in MARK_TAGS and (value := (child.text or "").strip()):
             line.marks.append(Mark(value=value, kind=MARK_TAGS[tag]))
     return line

@@ -232,6 +232,8 @@ class WithdrawalTab(QWidget):
         self.verdict_label.setWordWrap(True)
         self.verdict_label.setMinimumHeight(46)
         self.verdict_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        # Пустая плашка места не занимает: она появляется с первым сканом.
+        self.verdict_label.hide()
         body.addWidget(self.verdict_label)
 
         tiles = QHBoxLayout()
@@ -337,6 +339,7 @@ class WithdrawalTab(QWidget):
         """Ответ на скан: цвет во всю ширину, а при замечании — ещё и звук."""
         colour, background = RESULT_COLOURS[kind]
         self.verdict_label.setText(text)
+        self.verdict_label.show()
         self.verdict_label.setStyleSheet(
             f"color: {colour}; background: {background}; font-size: 18px;"
             f" font-weight: 700; border-radius: {Metrics.RADIUS}px;"
@@ -396,6 +399,7 @@ class WithdrawalTab(QWidget):
         self._repeats = self._broken = 0
         self.verdict_label.setText("")
         self.verdict_label.setStyleSheet("")
+        self.verdict_label.hide()
         self._sync()
         self.focus_scan()
 

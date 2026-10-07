@@ -126,7 +126,101 @@ def test_документ_без_кодов_отвергается_с_объяс
     with pytest.raises(upd.UpdProblem) as problem:
         upd.read(str(path))
 
-    assert "нет кодов маркировки" in str(problem.value)
+    assert "ни кодов маркировки" in str(problem.value)
+
+
+# --- объёмно-сортовой учёт: GTIN и количество вместо кодов экземпляров -----------------
+
+# Строки, как их пишет поставщик на ОСУ: GTIN отдельным атрибутом, в
+# «НомСредИдентТов» — только количество. Первая строка без маркировки вовсе.
+OSU = DOCUMENT[:DOCUMENT.index("<ТаблСчФакт>")] + """<ТаблСчФакт>
+      <СведТов НомСтр="1" НаимТов="Карандаш для глаз" НаимЕдИзм="шт" КолТов="20.00">
+        <ДопСведТов ПрТовРаб="1" КодТов="4640047020027"/>
+      </СведТов>
+      <СведТов НомСтр="2" НаимТов="Тушь для ресниц (чз)" НаимЕдИзм="шт" КолТов="2.00">
+        <ДопСведТов ПрТовРаб="1" КодТов="4640047021567" ГТИН="04640047021567">
+          <НомСредИдентТов КолВедМарк="2"/>
+        </ДопСведТов>
+      </СведТов>
+      <СведТов НомСтр="3" НаимТов="База под тени (чз)" НаимЕдИзм="шт" КолТов="1.00">
+        <ДопСведТов ПрТовРаб="1" КодТов="4640047021499" ГТИН="04640047021499">
+          <НомСредИдентТов КолВедМарк="1"/>
+        </ДопСведТов>
+      </СведТов>
+    </ТаблСчФакт>
+  </Документ>
+</Файл>
+"""
+
+MASCARA = "010464004702156721"
+BASE = "010464004702149921"
+
+
+@pytest.fixture
+def osu(tmp_path) -> Reconciliation:
+    path = tmp_path / "ON_NSCHFDOPPR_osu.xml"
+    path.write_bytes(OSU.encode("cp1251"))
+    return Reconciliation(upd.read(str(path)))
+
+
+def test_упд_по_осу_читается_по_gtin_и_количеству(osu):
+    document = osu.document
+
+    assert [line.number for line in document.marked_lines] == ["2", "3"]
+    assert document.marks == [] and document.counted == 3
+    assert document.marked_lines[0].gtin14 == "04640047021567"
+    assert osu.total == 3
+    assert "по количеству (ОСУ): 3 шт." in document.summary
+
+
+def test_скан_по_осу_засчитывается_строке_с_тем_же_gtin(osu):
+    scan = osu.scan(f"{MASCARA}Serial1{GS}91EE11{GS}92abcd")
+
+    assert scan.verdict is Verdict.MATCHED and scan.line.number == "2"
+    assert [(item.line.number, item.scanned, item.expected)
+            for item in osu.progress] == [("2", 1, 2), ("3", 0, 1)]
+
+
+def test_экземпляр_сверх_количества_по_осу_лишний(osu):
+    osu.scan(f"{MASCARA}Serial1")
+    osu.scan(f"{MASCARA}Serial2")
+
+    extra = osu.scan(f"{MASCARA}Serial3")
+
+    assert extra.verdict is Verdict.UNKNOWN and "сверх" in extra.note
+    assert osu.done == 2 and len(osu.extra) == 1
+
+
+def test_повтор_по_осу_не_занимает_место_в_строке(osu):
+    osu.scan(f"{MASCARA}Serial1")
+
+    again = osu.scan(f"{MASCARA}Serial1{GS}91EE11{GS}92abcd")
+
+    assert again.verdict is Verdict.REPEAT
+    assert osu.done == 1 and osu.left == 2
+
+
+def test_сверка_по_осу_сходится_и_отмена_возвращает_место(osu):
+    osu.scan(f"{MASCARA}Serial1")
+    osu.scan(f"{MASCARA}Serial2")
+    osu.scan(f"{BASE}Serial9")
+    assert osu.complete
+
+    osu.undo()
+
+    assert not osu.complete and osu.left == 1
+    assert osu.scan(f"{BASE}Other").verdict is Verdict.MATCHED
+
+
+def test_акт_сверки_по_осу_перечисляет_отсканированное(osu, tmp_path):
+    from openpyxl import load_workbook
+
+    osu.scan(f"{MASCARA}Serial1")
+    path = reconcile.save_report(osu, str(tmp_path / "акт.xlsx"))
+
+    rows = list(load_workbook(path)["Коды"].iter_rows(values_only=True))
+    assert (rows[1][0], rows[1][2], rows[1][3]) == (
+        "2", f"{MASCARA}Serial1", "Сверен по количеству")
 
 
 def test_нехватка_кодов_в_документе_видна_до_сканирования(tmp_path):

@@ -282,10 +282,13 @@ class ExpiryTab(QWidget):
         self.verdict_label.setWordWrap(True)
         self.verdict_label.setMinimumHeight(64)
         self.verdict_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        # Пустая плашка места не занимает: она появляется с первым сканом.
+        self.verdict_label.hide()
         body.addWidget(self.verdict_label)
 
         self.detail_label = QLabel("", card)
         self.detail_label.setWordWrap(True)
+        self.detail_label.hide()
         body.addWidget(self.detail_label)
 
         self.hint = Hint(
@@ -442,6 +445,10 @@ class ExpiryTab(QWidget):
                       "сертификату на вкладке «Проверка кодов»", ToastKind.WARNING)
             return 0
         pairs = document.marks
+        if not pairs:
+            self._say("В документе нет кодов экземпляров: товар передан по "
+                      "количеству (ОСУ). Сканируйте коды с товара", ToastKind.WARNING)
+            return 0
         added, skipped = self.add_codes(
             [mark.value for _, mark in pairs], origin=document.title,
             names={mark.value: line.name for line, mark in pairs})
@@ -560,6 +567,7 @@ class ExpiryTab(QWidget):
         if entry.repeat:
             text = "Уже сканировали · " + text
         self.verdict_label.setText(text)
+        self.verdict_label.show()
         self.verdict_label.setStyleSheet(
             f"color: {color}; background: {background}; font-size: 20px;"
             f" font-weight: 700; border-radius: {Metrics.RADIUS}px;"
@@ -573,6 +581,7 @@ class ExpiryTab(QWidget):
         if card.produced:
             facts.append(f"произведён {card.produced:%d.%m.%Y}")
         self.detail_label.setText(" · ".join(facts) if card.name or card.gtin else "")
+        self.detail_label.setVisible(bool(self.detail_label.text()))
         self.hint.setText(" ".join(card.problems)
                           if card.problems else
                           "Срок читается из самого QR. Для кода маркировки с упаковки "
@@ -593,7 +602,9 @@ class ExpiryTab(QWidget):
         self.entries.clear()
         self.verdict_label.setText("")
         self.verdict_label.setStyleSheet("")
+        self.verdict_label.hide()
         self.detail_label.setText("")
+        self.detail_label.hide()
         self._refresh_table()
         self.focus_scan()
 

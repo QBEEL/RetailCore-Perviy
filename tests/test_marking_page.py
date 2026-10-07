@@ -18,7 +18,7 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QThreadPool
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from app.core.marking.codes import GS
 from app.core.marking.crypto import Certificate
@@ -45,6 +45,8 @@ MARIA = Organisation(inn="254009895745", name="ИП Саух Мария Нико
 # Настоящий по строению код парфюмерии — тот же, что в тестах разбора.
 PERFUME = f"010460123456789321Abc123XyZ{GS}91EE10{GS}92signature=="
 OTHER = f"010460123456789321Zzz999{GS}91EE11"
+# Тот же код, каким он возвращается из проверки: без криптохвоста.
+KI = "010460123456789321Abc123XyZ"
 
 
 @pytest.fixture(scope="module")
@@ -455,6 +457,272 @@ def test_только_замечания_отбирает_строки(applicati
 
     assert page.result.rowCount() == 1
     assert page.tile_missing._value.text() == "1"
+
+
+def test_результат_показывает_все_коды_без_обрезки(application, tmp_path, stub):
+    """В документе бывает больше тысячи кодов, и глазами просят увидеть каждый."""
+    page = _page(application, tmp_path)
+
+    page._show_result([_info(f"code-{number}") for number in range(1200)])
+
+    assert page.result.rowCount() == 1200
+    assert "показаны первые" not in page.result_hint.text()
+
+
+def test_двойной_щелчок_открывает_сведения_о_коде(application, tmp_path, stub, monkeypatch):
+    """С отбором «только замечания» номер строки не равен номеру кода."""
+    from app.ui import marking_page
+
+    opened: list[CodeInfo] = []
+
+    class Spy:
+        action = ""
+        PRINT, REMARK, WITHDRAW = (marking_page.CodeInfoDialog.PRINT,
+                                   marking_page.CodeInfoDialog.REMARK,
+                                   marking_page.CodeInfoDialog.WITHDRAW)
+
+        def __init__(self, info, parent=None, **_):
+            opened.append(info)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(marking_page, "CodeInfoDialog", Spy)
+    page = _page(application, tmp_path)
+    broken = _info(OTHER, found=False, valid=False, state=CodeState.UNKNOWN)
+    page._show_result([_info(PERFUME), broken])
+    page.problems_box.setChecked(True)
+
+    page._on_result_activated(0, 1)
+
+    assert opened == [broken]
+
+
+def test_таблицу_результата_можно_развернуть(application, tmp_path, stub):
+    page = _page(application, tmp_path)
+
+    page.result_expand.click()
+    assert page.result.minimumHeight() > 0
+    assert page.result_expand.text() == "Свернуть"
+
+    page.result_expand.click()
+    assert page.result.minimumHeight() == 0
+
+
+def _choose_in_dialog(monkeypatch, action: str) -> None:
+    """Подменяет окно кода: пользователь сразу нажимает нужную кнопку."""
+    from app.ui import marking_page
+
+    class Chosen(marking_page.CodeInfoDialog):
+        def exec(self):
+            self.action = action
+            return 1
+
+    monkeypatch.setattr(marking_page, "CodeInfoDialog", Chosen)
+
+
+def test_вывод_из_оборота_переносит_код_на_вкладку_вывода(
+        application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+
+    _choose_in_dialog(monkeypatch, "withdraw")
+    page = _page(application, tmp_path)
+    page._show_result([_info(PERFUME)])
+
+    page._on_result_activated(0, 0)
+
+    assert page.withdrawal_tab.codes == [PERFUME]
+    assert page.tabs.currentIndex() == marking_page.WITHDRAWAL_TAB
+
+
+def test_печать_кода_идёт_блоком_в_памяти(application, tmp_path, stub, monkeypatch):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    shown: list = []
+
+    class Spy:
+        def __init__(self, batch, parent=None):
+            shown.append(batch)
+
+        def exec(self):
+            return 0
+
+    saved: list = []
+    monkeypatch.setattr(issue, "save", lambda batch: saved.append(batch))
+    monkeypatch.setattr(marking_page, "PrintDialog", Spy)
+    _choose_in_dialog(monkeypatch, "print")
+    page = _page(application, tmp_path)
+    # Сканер отдал код без разделителей, а проверка вернула его без хвоста.
+    page.codes_edit.setPlainText(PERFUME.replace(GS, ""))
+    page._reparse()
+    page._show_result([_info(KI)])
+
+    page._on_result_activated(0, 0)
+    issue.mark_printed(shown[0], 1)
+
+    assert shown[0].codes == [PERFUME] and shown[0].id == ""
+    assert saved == []
+
+
+def test_код_без_криптохвоста_не_печатается(application, tmp_path, stub, monkeypatch):
+    """Этикетка без ключа проверки — «сомнительный товар» в приложении ЧЗ."""
+    from app.ui import marking_page
+
+    seen: list = []
+
+    class Spy(marking_page.CodeInfoDialog):
+        def exec(self):
+            seen.append(self.print_button.isEnabled())
+            self.action = "print"
+            return 1
+
+    printed: list = []
+    monkeypatch.setattr(marking_page, "CodeInfoDialog", Spy)
+    monkeypatch.setattr(marking_page, "PrintDialog",
+                        lambda *args, **kwargs: printed.append(args))
+    page = _page(application, tmp_path)
+    page._batches = []
+    page.codes_edit.setPlainText(KI)
+    page._reparse()
+    page._show_result([_info(KI)])
+
+    page._on_result_activated(0, 0)
+
+    assert seen == [False] and printed == []
+
+
+def test_криптохвост_берётся_из_блока_суз(application, tmp_path, stub):
+    from app.core.marking import issue
+
+    page = _page(application, tmp_path)
+    page._batches = [issue.Batch(id="b1", gtin="04601234567893", codes=[PERFUME])]
+
+    assert page._full_code(_info(KI)) == PERFUME
+
+
+def test_перемаркировка_без_блока_с_кодами_объясняет_что_делать(
+        application, tmp_path, stub, monkeypatch):
+    _choose_in_dialog(monkeypatch, "remark")
+    page = _page(application, tmp_path)
+    page._batches = []
+    toasts: list = []
+    page.notify = lambda text, kind: toasts.append(text)
+    page._show_result([_info(PERFUME, gtin="04650139031961")])
+
+    page._on_result_activated(0, 0)
+
+    assert toasts and "Заказ кодов" in toasts[0]
+
+
+def test_перемаркировка_печатает_новый_код_и_ведёт_старый_в_предыдущие(
+        application, tmp_path, stub, monkeypatch):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    batch = issue.Batch(id="b1", gtin="04650139031961", name="Духи",
+                        codes=["new-1", "new-2"], printed=1)
+    introduced: list = []
+
+    class PrintSpy:
+        def __init__(self, target, parent=None):
+            self.target = target
+            self.count = type("Spin", (), {"setValue": lambda s, v: None})()
+
+        def exec(self):
+            self.target.printed += 1
+            return 0
+
+    class IntroduceSpy:
+        def __init__(self, target, inn, contour, problem, parent=None, *,
+                     previous=(), fixed_range=None):
+            introduced.append((target, tuple(previous), fixed_range))
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(marking_page, "PrintDialog", PrintSpy)
+    monkeypatch.setattr(marking_page, "IntroduceDialog", IntroduceSpy)
+    monkeypatch.setattr(marking_page.MarkingPage, "reload_batches",
+                        lambda self, select="": None)
+    _choose_in_dialog(monkeypatch, "remark")
+    page = _page(application, tmp_path)
+    page._batches = [batch]
+    page._show_result([_info(PERFUME, gtin="04650139031961")])
+
+    page._on_result_activated(0, 0)
+
+    assert introduced == [(batch, (PERFUME,), (1, 2))]
+
+
+def test_перемаркировка_без_печати_ничего_не_вводит(
+        application, tmp_path, stub, monkeypatch):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    batch = issue.Batch(id="b1", gtin="04650139031961", codes=["new-1"])
+    introduced: list = []
+
+    class PrintSpy:
+        def __init__(self, target, parent=None):
+            self.count = type("Spin", (), {"setValue": lambda s, v: None})()
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(marking_page, "PrintDialog", PrintSpy)
+    monkeypatch.setattr(marking_page.MarkingPage, "_introduce",
+                        lambda self, *args, **kwargs: introduced.append(args))
+    monkeypatch.setattr(marking_page.MarkingPage, "reload_batches",
+                        lambda self, select="": None)
+    _choose_in_dialog(monkeypatch, "remark")
+    page = _page(application, tmp_path)
+    page._batches = [batch]
+    page._show_result([_info(PERFUME, gtin="04650139031961")])
+
+    page._on_result_activated(0, 0)
+
+    assert introduced == []
+
+
+def test_окно_кода_кнопки_зависят_от_состояния(application):
+    from app.ui.widgets.marking_dialogs import CodeInfoDialog
+
+    live = CodeInfoDialog(_info(PERFUME, gtin="04650139031961"))
+    retired = CodeInfoDialog(_info(PERFUME, gtin="04650139031961",
+                                   state=CodeState.RETIRED))
+
+    assert live.withdraw_button.isEnabled()
+    assert not retired.withdraw_button.isEnabled()
+    assert retired.withdraw_button.toolTip()
+    assert retired.print_button.isEnabled() and retired.remark_button.isEnabled()
+
+    live.remark_button.click()
+    assert live.action == CodeInfoDialog.REMARK
+
+
+def test_позиции_документа_можно_развернуть(application, tmp_path, stub):
+    page = _page(application, tmp_path)
+
+    page.progress_expand.click()
+    assert page.progress.minimumHeight() > 0
+    assert page.progress_expand.text() == "Свернуть"
+    assert page.result.minimumHeight() == 0
+
+    page.progress_expand.click()
+    assert page.progress.minimumHeight() == 0
+
+
+def test_окно_кода_показывает_владельца_и_ответ(application):
+    from app.ui.widgets.marking_dialogs import CodeInfoDialog
+
+    item = _info(PERFUME, raw={"productName": "Духи"}, owner_name="ИП Пример")
+
+    dialog = CodeInfoDialog(item)
+
+    texts = [label.text() for label in dialog.findChildren(QLabel)]
+    assert any("ИП Пример" in text for text in texts)
+    assert any(PERFUME == text for text in texts)
 
 
 def test_проверка_попадает_в_журнал(application, tmp_path, stub):
@@ -1081,7 +1349,7 @@ def _intro_page(application, tmp_path, stub, monkeypatch, *, action="send", grou
     seen: dict = {"dialogs": [], "sent": []}
 
     class FakeIntro:
-        def __init__(self, batch, inn, contour, send_problem="", parent=None):
+        def __init__(self, batch, inn, contour, send_problem="", parent=None, **_):
             seen["dialogs"].append({"inn": inn, "problem": send_problem})
             self.saved_path = "C:/x.xml"
             self.covered = 5

@@ -356,9 +356,14 @@ def stored_for(order_id: str, gtin: str = "") -> int:
 
 
 def mark_printed(batch: Batch, printed: int) -> None:
-    """Запоминает, сколько этикеток ушло на принтер. Назад не откатывается."""
+    """Запоминает, сколько этикеток ушло на принтер. Назад не откатывается.
+
+    Блок без `id` существует только в памяти (печать одного кода из проверки):
+    писать его на диск незачем, а файл с пустым именем стал бы мусором.
+    """
     batch.printed = max(batch.printed, min(printed, batch.total))
-    save(batch)
+    if batch.id:
+        save(batch)
 
 
 def mark_introduced(batch: Batch) -> None:
