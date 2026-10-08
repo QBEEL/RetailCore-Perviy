@@ -78,6 +78,19 @@ class Certificate:
         return _field(self.subject, "ИНН") or _field(self.subject, "ИННЮЛ")
 
     @property
+    def person(self) -> tuple[str, str, str]:
+        """Фамилия, имя и отчество владельца — из полей SN и G квалифицированного
+        сертификата. Подписант документа должен совпасть с ними буква в букву."""
+        given = _field(self.subject, "G").split()
+        return (_field(self.subject, "SN"), given[0] if given else "",
+                " ".join(given[1:]))
+
+    @property
+    def position(self) -> str:
+        """Должность владельца (поле T); у сертификата ИП её обычно нет."""
+        return _field(self.subject, "T")
+
+    @property
     def expired(self) -> bool:
         return bool(self.valid_to and self.valid_to.timestamp()
                     < datetime.now().timestamp())
@@ -180,12 +193,14 @@ def find(thumbprint: str) -> Certificate | None:
     return None
 
 
-def sign(data: str, thumbprint: str, detached: bool = False) -> str:
+def sign(data: str | bytes, thumbprint: str, detached: bool = False) -> str:
     """Подпись CAdES-BES над строкой. Возвращает base64.
 
     `data` — то, что нужно подписать: строка сервера при входе или тело запроса
     при заказе. Подписывается её содержимое, а не base64-представление, поэтому
     перед подписью оно кодируется, а COM-объекту сообщается, что вход — base64.
+    Строка подписывается в UTF-8, байты — как есть: УПД по формату ФНС лежит в
+    windows-1251, и подпись обязана сойтись с байтами файла, а не с его текстом.
 
     Вид подписи зависит от того, кто её проверяет, и «правильного» одного нет:
 
@@ -225,7 +240,8 @@ def sign(data: str, thumbprint: str, detached: bool = False) -> str:
 
         signed = _dispatch("CAdESCOM.CadesSignedData")
         signed.ContentEncoding = _BASE64_TO_BINARY
-        signed.Content = base64.b64encode(data.encode("utf-8")).decode()
+        content = data if isinstance(data, bytes) else data.encode("utf-8")
+        signed.Content = base64.b64encode(content).decode()
 
         try:
             signature = signed.SignCades(signer, _CADES_BES,

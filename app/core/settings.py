@@ -110,6 +110,13 @@ class AppSettings:
     # название для показа. Товар тот же самый от поставки к поставке, и второй
     # раз спрашивать о нём незачем.
     marking_onec_links: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Продажа с выводом из оборота (УПД). Реквизиты продавца и подписанта, ставка
+    # НДС и причина вывода — одни на рабочее место; покупатели помнятся по ИНН, а
+    # название, цена, страна и декларация товара — по GTIN: продают одно и то же
+    # одним и тем же, и второй раз вписывать всё это незачем.
+    marking_sale_seller: dict[str, str] = field(default_factory=dict)
+    marking_sale_buyers: dict[str, dict[str, str]] = field(default_factory=dict)
+    marking_sale_items: dict[str, dict[str, str]] = field(default_factory=dict)
     # Туннель через свой сервер включён и поднимается при запуске. Сама ссылка
     # с идентификатором пользователя здесь не хранится: см. core/vpn/manager.py.
     vpn_enabled: bool = False
@@ -328,6 +335,9 @@ class AppSettings:
             for key, item in (data.get("marking_onec_links") or {}).items()
             if isinstance(item, dict) and item.get("code")
         }
+        self.marking_sale_seller = _strings(data.get("marking_sale_seller"))
+        self.marking_sale_buyers = _string_tables(data.get("marking_sale_buyers"))
+        self.marking_sale_items = _string_tables(data.get("marking_sale_items"))
         self.vpn_enabled = bool(data.get("vpn_enabled", False))
         self.vpn_server = str(data.get("vpn_server", ""))
 
@@ -408,6 +418,9 @@ class AppSettings:
             "marking_shelf_brands": self.marking_shelf_brands,
             "marking_onec_catalog": self.marking_onec_catalog,
             "marking_onec_links": self.marking_onec_links,
+            "marking_sale_seller": self.marking_sale_seller,
+            "marking_sale_buyers": self.marking_sale_buyers,
+            "marking_sale_items": self.marking_sale_items,
             "vpn_enabled": self.vpn_enabled,
             "vpn_server": self.vpn_server,
         }
@@ -421,6 +434,22 @@ def _remember(recent: list[str], path: str) -> None:
         recent.remove(path)
     recent.insert(0, path)
     del recent[MAX_RECENT:]
+
+
+def _strings(value: object) -> dict[str, str]:
+    """Словарь «имя → строка» из файла настроек; чужое отбрасывается."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(item) for key, item in value.items()
+            if isinstance(item, (str, int, float)) and not isinstance(item, bool)}
+
+
+def _string_tables(value: object) -> dict[str, dict[str, str]]:
+    """«Ключ → словарь строк» — покупатели по ИНН, товары по GTIN."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): _strings(item) for key, item in value.items()
+            if isinstance(item, dict)}
 
 
 def _role(value: object) -> FieldRole | None:

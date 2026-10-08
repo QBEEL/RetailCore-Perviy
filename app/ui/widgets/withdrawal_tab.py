@@ -306,7 +306,7 @@ class WithdrawalTab(QWidget):
 
     def add_code(self, text: str, *, quiet: bool = False) -> str:
         """Добавляет код в список. Возвращает `added`, `repeat` или `broken`."""
-        text = (text or "").strip()
+        text = codes_module.from_keyboard((text or "").strip())
         parsed = codes_module.parse(text)
         if not text or not parsed.valid or not parsed.ki:
             self._broken += 1

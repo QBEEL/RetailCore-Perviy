@@ -260,7 +260,7 @@ def parse_card(text: str) -> Card:
     bare = codes_module.parse(value) if "\n" not in value and value.startswith("01") else None
     if bare is not None and bare.valid:
         card.bare = card.kiz == "" and not card.name
-        card.kiz = card.kiz or value
+        card.kiz = card.kiz or codes_module.from_keyboard(value)
         card.gtin = card.gtin or bare.gtin
         if card.expires is None:
             card.expires = _from_ai17(bare.fields.get("17", ""))

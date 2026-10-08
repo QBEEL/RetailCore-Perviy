@@ -53,13 +53,17 @@ HOSTS: dict[tuple[str, Contour], str] = {
     ("trueapi4", Contour.SANDBOX): "https://markirovka.sandbox.crptech.ru",
     ("suz", Contour.PRODUCTION): "https://suzgrid.crpt.ru",
     ("suz", Contour.SANDBOX): "https://suz.sandbox.crptech.ru",
+    # «ЭДО Лайт» — бесплатный оператор ЭДО самого ЦРПТ. Адреса — из документации
+    # API ЭДО Лайт; токен у него тот же, что выдаёт True API при входе.
+    ("edo", Contour.PRODUCTION): "https://edo-gismt.crpt.ru",
+    ("edo", Contour.SANDBOX): "https://edo.sandbox.crptech.ru",
 }
 
 
 # Префикс пути у каждой системы свой. True API живёт под третьей версией, а не
 # под четвёртой: по `/api/v4` оба хоста отвечают 403.
 PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api",
-          "trueapi4": "/api/v4/true-api", "suz": "/api/v3"}
+          "trueapi4": "/api/v4/true-api", "suz": "/api/v3", "edo": "/api/v1"}
 
 
 def configure(system: str, contour: Contour, host: str) -> None:
@@ -178,6 +182,7 @@ def request(
     params: dict[str, Any] | None = None,
     body: Any = None,
     text_body: str | None = None,
+    raw_body: tuple[bytes, str] | None = None,
     token: str = "",
     headers: dict[str, str] | None = None,
     retries: int = len(RETRY_DELAYS),
@@ -201,9 +206,14 @@ def request(
     Нужен там, где тело подписано: подпись считается по конкретным байтам, и
     собрать их второй раз — значит однажды собрать иначе и получить «подпись
     невалидна» без единой подсказки, почему.
+
+    `raw_body` — готовые байты и их тип: так уходит файл формой
+    `multipart/form-data` в «ЭДО Лайт».
     """
     data, sending = None, {"Accept": "application/json"}
-    if text_body is not None:
+    if raw_body is not None:
+        data, sending["Content-Type"] = raw_body
+    elif text_body is not None:
         data = text_body.encode("utf-8")
         sending["Content-Type"] = "application/json"
     elif body is not None:
@@ -310,6 +320,9 @@ def _failure(code: int, payload: bytes = b"") -> MarkingError:
             detail = _listed(answer.get("globalErrors"))
         if not detail:
             detail = _listed(answer.get("fieldErrors"))
+        # «ЭДО Лайт» кладёт причины в `errors`: [{"error_message": "…"}].
+        if not detail:
+            detail = _listed(answer.get("errors"))
     if code == 401:
         return AuthRequired(
             detail or "Требуется вход по сертификату — токен истёк или отозван.",
@@ -335,7 +348,8 @@ def _listed(errors: Any) -> str:
         if not isinstance(item, dict):
             continue
         text = str(item.get("error") or item.get("fieldError")
-                   or item.get("errorMessage") or "").strip()
+                   or item.get("errorMessage") or item.get("error_message")
+                   or item.get("message") or "").strip()
         if not text:
             continue
         if name := item.get("fieldName"):
@@ -363,7 +377,8 @@ def get(system: str, path: str, *, contour: Contour = Contour.SANDBOX,
 
 def post(system: str, path: str, *, contour: Contour = Contour.SANDBOX,
          params: dict | None = None, body: Any = None,
-         text_body: str | None = None, token: str = "",
+         text_body: str | None = None,
+         raw_body: tuple[bytes, str] | None = None, token: str = "",
          headers: dict[str, str] | None = None,
          retries: int = len(RETRY_DELAYS),
          tolerate: tuple[int, ...] = ()) -> Any:
@@ -374,5 +389,6 @@ def post(system: str, path: str, *, contour: Contour = Contour.SANDBOX,
     второй заказ и вторые деньги.
     """
     return request("POST", system, path, contour=contour, params=params,
-                   body=body, text_body=text_body, token=token, headers=headers,
-                   retries=retries, tolerate=tolerate)
+                   body=body, text_body=text_body, raw_body=raw_body,
+                   token=token, headers=headers, retries=retries,
+                   tolerate=tolerate)

@@ -209,3 +209,39 @@ def test_пустые_строки_отбрасываются():
 def test_по_пробелам_не_делим():
     """Внутри кода пробел встречается, и деление по нему разорвало бы код."""
     assert split_lines("AAA BBB") == ["AAA BBB"]
+
+
+# Клавиатура как она есть: та же клавиша в английской и в русской раскладке.
+# Так сканер «печатает» код, когда в Windows включена русская раскладка.
+_US = ("qwertyuiop[]asdfghjkl;'zxcvbnm,./`"
+       "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~@#$^&|")
+_RU = ("йцукенгшщзхъфывапролджэячсмитьбю.ё"
+       "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,Ё\"№;:?/")
+
+
+def _russian(text: str) -> str:
+    return text.translate(str.maketrans(_US, _RU))
+
+
+def test_код_в_русской_раскладке_возвращается_латиницей():
+    # Пробный код с брюк, как его набрал сканер при русской раскладке.
+    assert codes.from_keyboard("0102901449269226215Щ904(ЦШюЖШИИ") == \
+        "0102901449269226215O904(WI.:IBB"
+    typed = _russian(SCANNED)
+    assert typed != SCANNED and "/" not in typed
+    assert codes.from_keyboard(typed) == SCANNED
+    assert parse(typed).ki == SCANNED_KI and for_request(typed) == SCANNED_KI
+    assert split_lines(f"{typed}\n{_russian(PERFUME)}") == [SCANNED, PERFUME]
+
+
+def test_латинский_код_не_перекладывается():
+    # Точка и двоеточие в латинском коде — свои, а не русская раскладка.
+    assert codes.from_keyboard("0102901449269226215O904(WI.:IBB") == \
+        "0102901449269226215O904(WI.:IBB"
+    assert codes.from_keyboard("") == ""
+
+
+def test_русский_текст_не_код_не_перекладывается():
+    assert codes.from_keyboard("совсем не код") == "совсем не код"
+    # Признак символики в русской раскладке — тоже узнаётся.
+    assert codes.from_keyboard("ъв2" + _russian(PERFUME)) == "]d2" + PERFUME

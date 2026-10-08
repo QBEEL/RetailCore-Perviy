@@ -65,6 +65,7 @@ from ..core.marking import (
     Credentials,
     GROUPS,
     Operation,
+    OperationKind,
     Organisation,
     codes as codes_module,
 )
@@ -92,6 +93,7 @@ from .widgets.marking_dialogs import (
     OrganisationDialog,
 )
 from .widgets.toast import ToastKind
+from .widgets.sale_tab import SaleTab
 from .widgets.withdrawal_tab import WithdrawalTab
 
 # Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
@@ -114,6 +116,8 @@ ORDER_TAB = 2
 EXPIRY_TAB = 3
 # Вывод из оборота добавлен следом по той же причине.
 WITHDRAWAL_TAB = 4
+# Продажа организации с выводом из оборота через УПД — последней, по той же причине.
+SALE_TAB = 5
 
 # Что делает открытая подвкладка и что ей нужно — одной строкой под заголовком.
 TAB_SUBTITLES: dict[int, str] = {
@@ -127,6 +131,8 @@ TAB_SUBTITLES: dict[int, str] = {
                 "у «Честного ЗНАКа».",
     WITHDRAWAL_TAB: "Документ о выводе уходит в «Честный ЗНАК» от имени "
                     "организации. Отменить его нельзя.",
+    SALE_TAB: "УПД уходит покупателю через «ЭДО Лайт»; коды выбывают из оборота, "
+              "когда он подпишет документ.",
 }
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
@@ -272,6 +278,14 @@ class MarkingPage(QWidget):
             inn=self._participant_inn)
         self.withdrawal_tab.journal_changed.connect(self.reload_journal)
         self.tabs.addTab(self.withdrawal_tab, icons.icon("export"), "Вывод из оборота")
+        # Продажа организации для её нужд: УПД с признаком вывода из оборота. Ей,
+        # как и выводу, нужны контур, сертификат и ИНН этой страницы.
+        self.sale_tab = SaleTab(
+            self.settings, self.notify, self,
+            contour=lambda: self.contour, thumbprint=lambda: self.thumbprint,
+            inn=self._participant_inn)
+        self.sale_tab.journal_changed.connect(self.reload_journal)
+        self.tabs.addTab(self.sale_tab, icons.icon("price"), "Продажа")
         # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
         # в поле сканирования при открытии вкладки — не удобство, а условие
         # работы: иначе первый же код уедет в поле поиска или в никуда.
@@ -2269,7 +2283,9 @@ class MarkingPage(QWidget):
         self._sync_journal_hint()
 
     def _sync_journal_hint(self) -> None:
-        waiting = sum(1 for operation in self._journal if operation.status.pending)
+        # УПД продажи сюда не входят: их статус спрашивается на вкладке «Продажа».
+        waiting = sum(1 for operation in self._journal if operation.status.pending
+                      and operation.kind is not OperationKind.SHIP)
         if waiting and not service.STATUS_POLLING_READY:
             # Молчать об этом нельзя: операция висит не потому, что ГИС МТ
             # думает, а потому, что спросить её приложение пока не умеет.
@@ -2294,6 +2310,9 @@ class MarkingPage(QWidget):
         elif index == WITHDRAWAL_TAB:
             self.withdrawal_tab.prefill_inn()
             self.withdrawal_tab.focus_scan()
+        elif index == SALE_TAB:
+            self.sale_tab.reload_sent()
+            self.sale_tab.focus_scan()
 
     def _participant_inn(self) -> str:
         """ИНН, от имени которого уходят документы: вошедшей организации, иначе выбранной."""
@@ -2352,7 +2371,7 @@ class MarkingPage(QWidget):
         Оставленный в нём код сканер допишет своим, и следующая вещь окажется
         «не разобрана» по нашей вине.
         """
-        text = self.scan_edit.text().strip()
+        text = codes_module.from_keyboard(self.scan_edit.text().strip())
         self.scan_edit.clear()
         if self._session is None:
             if text:

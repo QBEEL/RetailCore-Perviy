@@ -145,9 +145,45 @@ class Code:
         return f"{self.gtin} · {self.serial}" if self.gtin else self.raw[:32]
 
 
+# Сканер «печатает» код как клавиатура, и при русской раскладке Windows
+# превращает клавиши в кириллицу: `21abc` приходит как `21фис`. В коде
+# маркировки кириллицы не бывает — набор GS1 только латинский, — поэтому
+# русская буква в коде значит одно: раскладка была русской, и знаки
+# возвращаются по клавишам, на которых стоят. Знаки препинания тоже: в русской
+# раскладке на клавише «/» точка, на Shift+4 — «;» и так далее. Цифры, «%»,
+# «*», скобки, «-», «_», «+», «=» и «!» в обеих раскладках одни и те же.
+_RUSSIAN_KEYS = str.maketrans(
+    "йцукенгшщзхъфывапролджэячсмитьбюё"
+    "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ"
+    "\"№;:?.,/",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,.`"
+    "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~"
+    "@#$^&/?|",
+)
+_CYRILLIC = re.compile("[а-яА-ЯёЁ№]")
+
+
+def from_keyboard(text: str) -> str:
+    """Код, набранный сканером при русской раскладке, — обратно латиницей.
+
+    Код без кириллицы не меняется: перекладывать его знаки препинания нельзя,
+    точка в нём — это точка. С кириллицей перекладывается вся строка, иначе
+    «/» осталась бы точкой. Но только если вышел код — латиница, начатая
+    цифрами идентификатора: русский текст, который кодом не был, остаётся
+    как есть, чтобы человек увидел то, что вставил.
+    """
+    if not text or not _CYRILLIC.search(text):
+        return text
+    converted = text.translate(_RUSSIAN_KEYS)
+    start = next((len(marker) for marker in SYMBOLOGY if converted.startswith(marker)), 0)
+    if not converted.isascii() or not converted[start:start + 2].isdigit():
+        return text
+    return converted
+
+
 def normalize(text: str) -> str:
     """Приводит код к виду, пригодному для разбора."""
-    value = (text or "").strip()
+    value = from_keyboard((text or "").strip())
     for alias in GS_ALIASES:
         value = value.replace(alias, GS)
     for marker in SYMBOLOGY:
@@ -338,4 +374,5 @@ def split_lines(text: str) -> list[str]:
     таблицы разделителем оказывается что угодно. Внутри самого кода перевода
     строки быть не может, а вот пробел — может, поэтому по пробелам не делим.
     """
-    return [line for line in re.split(r"[\r\n\t]+", text or "") if line.strip()]
+    return [from_keyboard(line) for line in re.split(r"[\r\n\t]+", text or "")
+            if line.strip()]
