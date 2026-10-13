@@ -34,7 +34,8 @@ FIELDS: tuple[str, ...] = (
     "doc_number", "request_date", "pay_date", "amount", "vat", "currency",
     "supplier_id", "recipient", "recipient_key", "status", "source_status",
     "paid_flag", "operation", "over_limit", "priority", "edo_state",
-    "responsible", "author", "comment", "dds_item", "unplanned", "had_files",
+    "responsible", "author", "comment", "dds_item", "instead_of", "unplanned",
+    "had_files",
     "origin", "origin_ref",
 )
 
@@ -62,6 +63,7 @@ class SyncPayment(BaseModel):
     author: str = ""
     comment: str = ""
     dds_item: str = ""
+    instead_of: str = ""
     unplanned: bool = False
     had_files: bool = False
     origin: Origin = "manual"
@@ -127,6 +129,7 @@ def upload(form: SyncUpload,
             # ставит свой импорт, а сервер мог поставить её раньше.
             keep = {
                 "dds_item": "dds_item = COALESCE(NULLIF(%(dds_item)s, ''), dds_item)",
+                "instead_of": "instead_of = COALESCE(NULLIF(%(instead_of)s, ''), instead_of)",
                 "unplanned": "unplanned = (unplanned OR %(unplanned)s)",
             }
             assignments = ", ".join(

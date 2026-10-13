@@ -138,7 +138,14 @@ def _step_4(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE payment ADD COLUMN unplanned INTEGER NOT NULL DEFAULT 0")
 
 
-_MIGRATIONS = (_step_1, _step_2, _step_3, _step_4)
+def _step_5(connection: sqlite3.Connection) -> None:
+    """Оплата «вместо другого поставщика» — как на сервере, миграция 012."""
+    have = {row[1] for row in connection.execute("PRAGMA table_info(payment)")}
+    if "instead_of" not in have:
+        connection.execute("ALTER TABLE payment ADD COLUMN instead_of TEXT NOT NULL DEFAULT ''")
+
+
+_MIGRATIONS = (_step_1, _step_2, _step_3, _step_4, _step_5)
 VERSION = len(_MIGRATIONS)
 
 

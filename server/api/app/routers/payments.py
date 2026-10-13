@@ -39,7 +39,8 @@ COLUMNS = (
     "p.id, p.doc_number, p.request_date, p.pay_date, p.amount, p.vat,"
     " p.currency, p.supplier_id, p.recipient, p.recipient_key, p.status,"
     " p.source_status, p.paid_flag, p.operation, p.over_limit, p.priority,"
-    " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.unplanned, p.had_files,"
+    " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.instead_of, p.unplanned,"
+    " p.had_files,"
     " p.origin, p.origin_ref, p.created_at, p.updated_at,"
     " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
     " p.amount_before, p.amount_changed_at,"
@@ -76,7 +77,7 @@ AMOUNT_MARKS = (
 # Правки, разрешённые обычному пользователю. Поля из выгрузки 1С сюда не входят:
 # их перезапишет следующий импорт, и правка всё равно пропадёт.
 EDITABLE = ("pay_date", "status", "comment", "supplier_id", "amount", "vat",
-            "priority", "dds_item")
+            "priority", "dds_item", "instead_of")
 
 
 def _conditions(
@@ -92,8 +93,8 @@ def _conditions(
         like = f"%{text.strip()}%"
         parts.append("(p.recipient ILIKE %s OR p.doc_number ILIKE %s"
                      " OR p.comment ILIKE %s OR p.responsible ILIKE %s"
-                     " OR p.author ILIKE %s)")
-        values.extend([like] * 5)
+                     " OR p.author ILIKE %s OR p.instead_of ILIKE %s)")
+        values.extend([like] * 6)
     if start:
         parts.append("p.pay_date >= %s")
         values.append(start)
@@ -312,14 +313,15 @@ def create_payment(form: PaymentIn,
     created = db.fetch_one(
         "INSERT INTO payment (pay_date, amount, vat, currency, supplier_id,"
         "  recipient, recipient_key, status, operation, priority, comment,"
-        "  dds_item, responsible, author, origin, origin_ref, updated_by)"
+        "  dds_item, instead_of, responsible, author, origin, origin_ref,"
+        "  updated_by)"
         " VALUES (%s, %s, %s, %s, %s, %s, COALESCE(NULLIF(%s, ''), lower(btrim(%s))),"
-        "         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (form.pay_date, form.amount, form.vat, form.currency, form.supplier_id,
          form.recipient, form.recipient_key.strip(), form.recipient,
          form.status, form.operation,
          form.priority, form.comment, form.dds_item.strip(),
-         responsible, user.full_name,
+         form.instead_of.strip(), responsible, user.full_name,
          form.origin, form.origin_ref, user.id))
     _record(user, "payment", created["id"], "create",
             {"recipient": form.recipient})
@@ -344,6 +346,8 @@ def _changes(form: PaymentPatch) -> dict[str, Any]:
     if "dds_item" in values:
         values["dds_item"] = (values["dds_item"] or "").strip()
         _check_dds_item(values["dds_item"])
+    if "instead_of" in values:
+        values["instead_of"] = (values["instead_of"] or "").strip()
     if form.clear_pay_date:
         values["pay_date"] = None
     # Отметка об оплате должна следовать за статусом, иначе отчёты разойдутся:

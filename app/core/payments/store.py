@@ -123,8 +123,8 @@ class Filter:
             like = f"%{self.text.strip()}%"
             parts.append(
                 "(recipient LIKE ? OR doc_number LIKE ? OR comment LIKE ?"
-                " OR responsible LIKE ? OR author LIKE ?)")
-            values.extend([like] * 5)
+                " OR responsible LIKE ? OR author LIKE ? OR instead_of LIKE ?)")
+            values.extend([like] * 6)
         if self.start:
             parts.append("pay_date <> '' AND pay_date >= ?")
             values.append(self.start.isoformat())
@@ -765,6 +765,7 @@ def _values(payment: Payment, *, imported_only: bool = False) -> dict[str, Any]:
         "author": payment.author,
         "comment": payment.comment,
         "dds_item": payment.dds_item,
+        "instead_of": payment.instead_of,
         "unplanned": int(payment.unplanned),
         "had_files": int(payment.had_files),
         "origin": payment.origin.value,
@@ -803,6 +804,7 @@ def _payment(row: sqlite3.Row) -> Payment:
         author=row["author"],
         comment=row["comment"],
         dds_item=row["dds_item"],
+        instead_of=row["instead_of"],
         unplanned=bool(row["unplanned"]),
         had_files=bool(row["had_files"]),
         origin=_origin(row["origin"]),

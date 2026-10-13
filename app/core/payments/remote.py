@@ -95,6 +95,8 @@ def _payment(row: dict) -> Payment:
         comment=row["comment"],
         # Сервер до статей ДДС этого поля не присылает.
         dds_item=row.get("dds_item") or "",
+        # Сервер до «оплат вместо другого» этого поля не присылает.
+        instead_of=row.get("instead_of") or "",
         unplanned=bool(row.get("unplanned", False)),
         had_files=bool(row["had_files"]),
         origin=_origin(row["origin"]),
@@ -246,6 +248,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "vat": payment.vat,
             "priority": payment.priority,
             "dds_item": payment.dds_item,
+            "instead_of": payment.instead_of,
         })
     else:
         row = transport.post("/api/payments", {
@@ -264,6 +267,7 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "operation": payment.operation,
             "priority": payment.priority,
             "dds_item": payment.dds_item,
+            "instead_of": payment.instead_of,
             # Происхождение передаётся серверу: иначе загруженный план
             # неотличим от созданного вручную, и при следующей загрузке
             # заменять было бы нечего.

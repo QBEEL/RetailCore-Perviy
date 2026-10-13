@@ -60,6 +60,8 @@ class PaymentIn(BaseModel):
     priority: str = ""
     # Статья ДДС — название из справочника `dds_item`; пусто — не указана.
     dds_item: str = ""
+    # Оплачен вместо другого поставщика: название того, кого заменили.
+    instead_of: str = ""
     # Происхождение задаёт клиент: план из Excel нужно отличать от записи,
     # заведённой руками, — по нему при следующей загрузке ищется прошлый план.
     origin: Origin = "manual"
@@ -88,6 +90,7 @@ class PaymentOut(BaseModel):
     author: str
     comment: str
     dds_item: str = ""
+    instead_of: str = ""
     # Заявка из 1С, на которую в приложении не было плана.
     unplanned: bool = False
     had_files: bool
@@ -117,6 +120,7 @@ class PaymentPatch(BaseModel):
     vat: float | None = None
     priority: str | None = None
     dds_item: str | None = None
+    instead_of: str | None = None
     # Отдельный признак: иначе нельзя отличить «убрать дату» от «не трогать».
     clear_pay_date: bool = False
 

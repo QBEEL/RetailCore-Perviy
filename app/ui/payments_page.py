@@ -54,6 +54,7 @@ from ..core.payments import (
     analytics,
     dds,
     planning,
+    replacement,
     service,
     transport,
 )
@@ -580,6 +581,8 @@ class PaymentsPage(QWidget):
                 text += f"\n• сумма {origin}: {payment.amount_change_text}"
             if payment.unplanned:
                 text += "\n• не было запланировано"
+            if payment.instead_of:
+                text += f"\n• вместо: {payment.instead_of}"
             note = marks.note_of(payment.dds_item)
             if note:
                 # Метка статьи — отдельной строкой, как пометка о сумме: цвет
@@ -784,6 +787,10 @@ class PaymentsPage(QWidget):
             Column("План", lambda p: "Не было запланировано" if p.unplanned else "",
                    width=160, color=lambda p: QColor(Palette.INFO),
                    tip="Заявку завели в 1С, а плана на неё в приложении не было"),
+            # Оплату пустили на место другого поставщика — его и видно здесь.
+            Column("Вместо", lambda p: p.instead_of, width=200, highlight=True,
+                   color=lambda p: QColor(Palette.INFO),
+                   tip="Этого поставщика оплатили на место другого"),
             Column("Сумма, ₽", lambda p: money(p.amount), width=130,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    color=lambda p: QColor(Palette.WARNING) if p.amount_changed else None,
@@ -1979,16 +1986,36 @@ class PaymentsPage(QWidget):
         if not dialog.exec():
             return
         result = dialog.result_payment()
+        replaced = dialog.replacement_choice()
         try:
             store.save_payment(result)
         except ValueError as failure:
             self.notify(str(failure), ToastKind.ERROR)
+            return
+        if replaced is not None and not self._settle_replaced(result, *replaced):
+            self.reload()
             return
         self.notify(
             f"{result.title}: {money(result.amount)} ₽ на {result.pay_date:%d.%m.%Y}"
             if result.pay_date else f"{result.title}: сохранено",
             ToastKind.SUCCESS)
         self.reload()
+
+    def _settle_replaced(self, new: Payment, target: Payment, mode: replacement.Mode) -> bool:
+        """Отменяет или сокращает оплату поставщика, вместо которого платят.
+
+        Новая оплата к этому моменту уже сохранена, поэтому отказ здесь не
+        теряет её: человеку сообщается, что заменяемую оплату нужно поправить
+        самому.
+        """
+        try:
+            store.save_payment(replacement.apply(target, new, mode))
+        except (ValueError, OSError, transport.ServerError) as failure:
+            self.notify(
+                f"Оплата сохранена, но «{target.title}» не изменена: {failure}. "
+                "Поправьте её вручную.", ToastKind.ERROR)
+            return False
+        return True
 
     def focus_search(self) -> None:
         self.tabs.setCurrentIndex(1)

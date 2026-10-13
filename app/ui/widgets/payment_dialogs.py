@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from datetime import date
 
-from PySide6.QtCore import QDate, QLocale, QPoint, Qt, Signal
+from PySide6.QtCore import QDate, QLocale, QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QToolButton,
     QTreeWidget,
@@ -50,6 +51,8 @@ from ...core.payments import (
     duplicates,
     importer,
     planning,
+    recipient_key,
+    replacement,
     service,
     vat,
 )
@@ -185,6 +188,10 @@ class PaymentDialog(QDialog):
         self.payment = payment
         self._dds_items = list(dds_items) if dds_items else list(dds.BUILTIN_ITEMS)
         self.db_path = db_path
+        # Кого заменяли при открытии: пока поле не тронуто, заменять нечего.
+        self._original_instead = payment.instead_of.strip()
+        # Оплаты заменяемого поставщика; None — ещё грузятся или поле не тронуто.
+        self._targets: list[Payment] | None = None
         self.setWindowTitle("Оплата" if payment.id else "Новая оплата")
         self.setMinimumWidth(760)
 
@@ -293,6 +300,19 @@ class PaymentDialog(QDialog):
             "из названия — порядок слов не важен")
         form.addRow("Статья ДДС", self.dds_item)
 
+        # Поставщик оплачен вместо другого: выбирается из тех же получателей.
+        # Пусто — обычная оплата.
+        self.instead_of = SelectBox(self)
+        self.instead_of.setEditable(True)
+        self.instead_of.addItems(["", *recipients])
+        self.instead_of.setCurrentText("")
+        self.instead_of.lineEdit().setPlaceholderText("не вместо другого")
+        self.instead_of.setToolTip(
+            "Заполните, если этого поставщика оплачивают на место другого: "
+            "выберите того, кого заменили. Для обычной оплаты оставьте пустым")
+        form.addRow("Вместо", self.instead_of)
+        form.addRow("", self._replacement_block())
+
         column.addLayout(form)
 
         column.addWidget(QLabel("Комментарий", self))
@@ -340,6 +360,140 @@ class PaymentDialog(QDialog):
         buttons.rejected.connect(self.reject)
         column.addWidget(buttons)
         return column
+
+    # --- вместо другого поставщика -------------------------------------------
+
+    def _replacement_block(self) -> QFrame:
+        """Выбор, что сделать с оплатой заменяемого поставщика.
+
+        Появляется, только когда в поле «Вместо» назван поставщик: без этого
+        выбора заменённая оплата осталась бы висеть в плане невыполненной.
+        """
+        block = QFrame(self)
+        layout = QVBoxLayout(block)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.replace_info = Hint("", block)
+        layout.addWidget(self.replace_info)
+
+        self.replace_target = SelectBox(block)
+        layout.addWidget(self.replace_target)
+
+        self.replace_reduce = QRadioButton("Сократить на сумму новой", block)
+        self.replace_cancel = QRadioButton("Отменить оплату", block)
+        layout.addWidget(self.replace_reduce)
+        layout.addWidget(self.replace_cancel)
+
+        self.replace_result = Hint("", block)
+        layout.addWidget(self.replace_result)
+
+        # Пауза после ввода: оплаты поставщика запрашиваются, когда название
+        # дописано, а не на каждую набранную букву.
+        self._replace_timer = QTimer(self)
+        self._replace_timer.setSingleShot(True)
+        self._replace_timer.setInterval(350)
+        self._replace_timer.timeout.connect(self._instead_changed)
+        self.instead_of.currentTextChanged.connect(lambda _: self._replace_timer.start())
+        self.replace_target.currentIndexChanged.connect(lambda _: self._target_picked())
+        self.replace_reduce.toggled.connect(lambda _: self._refresh_replacement())
+        self.amount.valueChanged.connect(lambda _: self._refresh_replacement())
+
+        block.hide()
+        self.replace_block = block
+        return block
+
+    def _replacing(self) -> str:
+        """Название заменяемого поставщика, если оно новое; иначе пусто."""
+        name = self.instead_of.currentText().strip()
+        return name if name and name != self._original_instead else ""
+
+    def _instead_changed(self) -> None:
+        self._targets = None
+        self.replace_block.hide()
+        name = self._replacing()
+        if not name:
+            return
+        self.replace_info.setText(f"Загружаются оплаты «{name}»…")
+        self.replace_target.hide()
+        self.replace_reduce.hide()
+        self.replace_cancel.hide()
+        self.replace_result.setText("")
+        self.replace_block.show()
+        run_task(
+            _replaceable, name, self.payment.id, self.db_path,
+            on_result=self._show_targets,
+            on_error=lambda message: self.replace_info.setText(message))
+
+    def _show_targets(self, payload: tuple[str, list[Payment]]) -> None:
+        name, options = payload
+        if name != self._replacing():
+            return  # поле успели поменять, пока шёл запрос
+        self._targets = list(options)
+        if not options:
+            self.replace_info.setText(
+                f"У «{name}» нет неоплаченных оплат, вместо которых можно оплатить. "
+                "Очистите поле «Вместо»")
+            self.replace_result.setText("")
+            return
+        self.replace_info.setText(f"Какую оплату «{name}» заменяет эта:")
+        self.replace_target.blockSignals(True)
+        self.replace_target.clear()
+        for option in options:
+            when = f"{option.pay_date:%d.%m.%Y}" if option.pay_date else "без даты"
+            self.replace_target.addItem(
+                f"{when} · {money(option.amount)} ₽ · {option.status.title}")
+        self.replace_target.setCurrentIndex(
+            replacement.nearest(options, self.pay_date.value()))
+        self.replace_target.blockSignals(False)
+        self.replace_target.show()
+        self.replace_reduce.show()
+        self.replace_cancel.show()
+        self.replace_block.show()
+        self._target_picked()
+
+    def _target_picked(self) -> None:
+        """Выбрана другая оплата — вариант по умолчанию подбирается заново."""
+        target = self._chosen_target()
+        if target is None:
+            return
+        # Сократить, если есть что сокращать; равную сумму — только отменить.
+        reducible = float(self.amount.value()) < target.amount
+        self.replace_reduce.blockSignals(True)
+        self.replace_reduce.setChecked(reducible)
+        self.replace_cancel.setChecked(not reducible)
+        self.replace_reduce.blockSignals(False)
+        self._refresh_replacement()
+
+    def _chosen_target(self) -> Payment | None:
+        if not self._targets:
+            return None
+        index = self.replace_target.currentIndex()
+        return self._targets[index] if 0 <= index < len(self._targets) else None
+
+    def _chosen_mode(self) -> "replacement.Mode":
+        return (replacement.Mode.REDUCE if self.replace_reduce.isChecked()
+                else replacement.Mode.CANCEL)
+
+    def _refresh_replacement(self) -> None:
+        target = self._chosen_target()
+        if target is None:
+            return
+        amount = float(self.amount.value())
+        reducible = 0 < amount < target.amount
+        self.replace_reduce.setEnabled(reducible)
+        if not reducible and self.replace_reduce.isChecked():
+            self.replace_cancel.setChecked(True)
+        mode = self._chosen_mode()
+        reason = replacement.problem(amount, target, mode)
+        color = Palette.DANGER if reason else Palette.TEXT_MUTED
+        self.replace_result.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.replace_result.setText(reason or replacement.outcome(amount, target, mode))
+
+    def replacement_choice(self) -> "tuple[Payment, replacement.Mode] | None":
+        """Заменяемая оплата и что с ней сделать; None — заменять нечего."""
+        target = self._chosen_target() if self._replacing() else None
+        return (target, self._chosen_mode()) if target is not None else None
 
     # --- НДС ------------------------------------------------------------------
 
@@ -417,8 +571,8 @@ class PaymentDialog(QDialog):
             return
         for widget in (self.recipient, self.amount, self.vat, self.vat_rate,
                        self.pay_date, self.status, self.responsible,
-                       self.operation, self.dds_item, self.comment,
-                       self.attach_button, self.detach_button):
+                       self.operation, self.dds_item, self.instead_of,
+                       self.comment, self.attach_button, self.detach_button):
             widget.setEnabled(False)
         self.save_button.setEnabled(False)
         self.save_button.setText("Только просмотр")
@@ -537,6 +691,7 @@ class PaymentDialog(QDialog):
         self.dds_item.set_items(
             self._dds_items,
             payment.dds_item or ("" if payment.id else dds.default_item()))
+        self.instead_of.setCurrentText(payment.instead_of)
         self.comment.setPlainText(payment.comment)
         self._reload_files()
         if payment.doc_number:
@@ -615,6 +770,7 @@ class PaymentDialog(QDialog):
         payment.responsible = self.responsible.currentText().strip()
         payment.operation = self.operation.currentText().strip()
         payment.dds_item = self.dds_item.value()
+        payment.instead_of = self.instead_of.currentText().strip()
         payment.comment = self.comment.toPlainText().strip()
         if not payment.id and payment.origin is PaymentOrigin.IMPORT:
             payment.origin = PaymentOrigin.MANUAL
@@ -632,10 +788,38 @@ class PaymentDialog(QDialog):
         if not payment.recipient:
             self.error.setText("Укажите поставщика")
             return
+        if payment.instead_of and recipient_key(payment.instead_of) == recipient_key(
+                payment.recipient):
+            self.error.setText("Поставщик не может быть оплачен вместо самого себя — "
+                               "выберите другого или очистите поле «Вместо»")
+            return
+        if self._replacing():
+            if self._targets is None:
+                self.error.setText("Загружаются оплаты заменяемого поставщика — "
+                                   "повторите через секунду")
+                return
+            choice = self.replacement_choice()
+            if choice is None:
+                self.error.setText(f"У «{self._replacing()}» нет неоплаченных оплат, "
+                                   "вместо которых можно оплатить. Очистите поле «Вместо»")
+                return
+            reason = replacement.problem(payment.amount, choice[0], choice[1])
+            if reason:
+                self.error.setText(reason)
+                return
         if payment.status is not PaymentStatus.CANCELLED and payment.pay_date is None:
             self.error.setText("Укажите дату оплаты — без неё платёж не попадёт в календарь")
             return
         self.accept()
+
+
+def _replaceable(name: str, own_id: int, db_path: str | None) -> tuple[str, list[Payment]]:
+    """Неоплаченные оплаты поставщика, которые вправе править текущий пользователь."""
+    rows = store.list_payments(
+        store.Filter(recipient=name, statuses=[s for s in PaymentStatus if s.open]),
+        db_path, order="pay_date ASC, id ASC", limit=200)
+    return name, [p for p in replacement.candidates(rows, name, own_id=own_id)
+                  if store.may_edit(p)]
 
 
 def _supplier_history(
