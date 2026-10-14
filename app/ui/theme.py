@@ -52,6 +52,7 @@ class Metrics:
     PAD = 16
     ROW_HEIGHT = 34
     SIDEBAR_WIDTH = 212
+    SIDEBAR_COLLAPSED_WIDTH = 64
 
 
 STATUS_COLORS: dict[str, tuple[str, str]] = {
@@ -151,6 +152,18 @@ QFrame#Card, QWidget#Card {{
     border: 1px solid {Palette.BORDER};
     border-radius: {Metrics.RADIUS}px;
 }}
+/* Подложка под превью этикетки: серый «стол», на котором лежит белый лист. */
+QFrame#LabelStage {{
+    background: {Palette.BG};
+    border: 1px solid {Palette.BORDER};
+    border-radius: {Metrics.RADIUS}px;
+}}
+QLabel#LabelSheet {{
+    background: {Palette.SURFACE};
+    border: 1px solid {Palette.BORDER_STRONG};
+}}
+QLabel#FormSection {{ font-size: 13px; font-weight: 600; }}
+QLabel#FormCaption {{ color: {Palette.TEXT_MUTED}; font-size: 12px; }}
 QFrame#Divider {{ background: {Palette.BORDER}; max-height: 1px; border: none; }}
 
 QWidget#Sidebar {{
@@ -188,6 +201,29 @@ QPushButton#NavButton:checked {{
     background: {Palette.PRIMARY_SOFT};
     color: {Palette.PRIMARY};
     font-weight: 600;
+}}
+
+/* Свёрнутое меню: подписей нет, иконка стоит по центру кнопки. */
+QWidget#Sidebar[collapsed="true"] QPushButton#NavButton {{
+    padding: 10px 0;
+    text-align: center;
+}}
+QToolButton#SidebarToggle {{
+    background: transparent;
+    border: none;
+    border-radius: {Metrics.RADIUS_SM}px;
+    padding: 6px;
+}}
+QToolButton#SidebarToggle:hover {{ background: {Palette.SURFACE_ALT}; }}
+/* Метка «локальная база» в свёрнутом меню — переключателя там не видно, а
+   перепутать базы дорого. */
+QLabel#BaseBadge {{
+    background: {Palette.WARNING_SOFT};
+    color: {Palette.WARNING};
+    border-radius: {Metrics.RADIUS_SM}px;
+    padding: 3px 0;
+    font-size: 10px;
+    font-weight: 700;
 }}
 
 QPushButton {{

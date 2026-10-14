@@ -10,13 +10,12 @@
 """
 from __future__ import annotations
 
-import json
 from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from .. import db, security
+from .. import auditlog, db, security
 from ..schemas import (
     BulkPatch,
     BulkResult,
@@ -323,8 +322,12 @@ def create_payment(form: PaymentIn,
          form.priority, form.comment, form.dds_item.strip(),
          form.instead_of.strip(), responsible, user.full_name,
          form.origin, form.origin_ref, user.id))
+    about = auditlog.snapshot({
+        "recipient": form.recipient, "amount": form.amount,
+        "pay_date": form.pay_date, "doc_number": ""})
     _record(user, "payment", created["id"], "create",
-            {"recipient": form.recipient})
+            {"recipient": form.recipient, "responsible": responsible,
+             auditlog.ABOUT: about})
     return get_payment(created["id"], user)
 
 
@@ -359,18 +362,17 @@ def _changes(form: PaymentPatch) -> dict[str, Any]:
 
 def _record(user: User, entity: str, entity_id: int, action: str,
             changes: dict[str, Any]) -> None:
-    db.execute(
-        "INSERT INTO audit_log (user_id, entity, entity_id, action, changes)"
-        " VALUES (%s, %s, %s, %s, %s)",
-        (user.id, entity, entity_id, action, json.dumps(changes, default=str)))
+    auditlog.record(user.id, entity, entity_id, action, changes)
 
 
 @router.patch("/{payment_id}", response_model=PaymentOut,
               summary="Изменить оплату")
 def patch_payment(payment_id: int, form: PaymentPatch,
                   user: User = Depends(security.current_user)) -> PaymentOut:
-    owner = db.fetch_one("SELECT responsible, amount FROM payment WHERE id = %s",
-                         (payment_id,))
+    owner = db.fetch_one(
+        "SELECT responsible, amount, recipient, doc_number, pay_date, status,"
+        "       comment, supplier_id, vat, priority, dds_item, instead_of"
+        " FROM payment WHERE id = %s", (payment_id,))
     if not owner:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Оплата не найдена")
@@ -389,12 +391,15 @@ def patch_payment(payment_id: int, form: PaymentPatch,
     # как и везде, уходят параметрами.
     sql, params = _update(values, user)
     db.execute(f"{sql} WHERE id = %(id)s", {**params, "id": payment_id})
-    changes = dict(values)
-    if "amount" in values and abs(float(owner["amount"]) - values["amount"]) >= 0.005:
-        # Журнал хранит новые значения, но у суммы важно и прежнее: без него
-        # «кто поменял сумму и на сколько» из журнала не восстановить.
-        changes["amount_was"] = float(owner["amount"])
-    _record(user, "payment", payment_id, "update", changes)
+    # В журнал идёт то, что действительно поменялось, и прежнее значение рядом:
+    # приложение присылает правку целиком, и по присланному не понять, что
+    # человек тронул. Отметка об оплате следует за статусом и своей строкой не
+    # нужна. Если не изменилось ничего — писать в журнал нечего.
+    changes = auditlog.diff(owner, {k: v for k, v in values.items()
+                                    if k != "paid_flag"})
+    if changes:
+        changes[auditlog.ABOUT] = auditlog.snapshot(owner)
+        _record(user, "payment", payment_id, "update", changes)
     return get_payment(payment_id, user)
 
 
@@ -423,7 +428,8 @@ def patch_many(form: BulkPatch,
         return BulkResult(changed=0)
 
     rows = db.fetch_all(
-        "SELECT id, responsible FROM payment WHERE id = ANY(%s)", (form.ids,))
+        "SELECT id, responsible, recipient, amount, pay_date, doc_number"
+        " FROM payment WHERE id = ANY(%s)", (form.ids,))
     allowed = [r["id"] for r in rows if user.may_edit(r["responsible"])]
     denied = [r["id"] for r in rows if not user.may_edit(r["responsible"])]
     if not allowed:
@@ -431,8 +437,13 @@ def patch_many(form: BulkPatch,
 
     sql, params = _update(values, user)
     changed = db.execute(f"{sql} WHERE id = ANY(%(ids)s)", {**params, "ids": allowed})
+    # Какие именно оплаты тронуты — первые десять словами: одно «записей: 40»
+    # из журнала не расшифровать.
+    touched = [f"№{r['id']} {auditlog.describe(auditlog.snapshot(r))}"
+               for r in rows if r["id"] in allowed]
     _record(user, "payment", 0, "update_many",
-            {"ids": len(allowed), **{k: str(v) for k, v in values.items()}})
+            {"ids": len(allowed), "touched": touched[:10],
+             **{k: str(v) for k, v in values.items() if k != "paid_flag"}})
     return BulkResult(changed=changed, denied=denied)
 
 
@@ -440,8 +451,9 @@ def patch_many(form: BulkPatch,
                summary="Удалить оплату")
 def delete_payment(payment_id: int,
                    user: User = Depends(security.current_user)) -> None:
-    row = db.fetch_one("SELECT responsible, origin FROM payment WHERE id = %s",
-                       (payment_id,))
+    row = db.fetch_one(
+        "SELECT responsible, origin, recipient, amount, pay_date, doc_number,"
+        "       status, comment FROM payment WHERE id = %s", (payment_id,))
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Оплата не найдена")
@@ -455,4 +467,9 @@ def delete_payment(payment_id: int,
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Оплата пришла из 1С — удалить может только администратор")
     db.execute("DELETE FROM payment WHERE id = %s", (payment_id,))
-    _record(user, "payment", payment_id, "delete", {})
+    # Оплаты больше нет, и журнал — единственное место, где остаётся, что это
+    # было: поэтому сюда уходит всё существенное, включая статус и комментарий.
+    about = auditlog.snapshot(row)
+    _record(user, "payment", payment_id, "delete",
+            {"status": row["status"], "comment": row["comment"],
+             "responsible": row["responsible"], auditlog.ABOUT: about})

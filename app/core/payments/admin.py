@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from . import transport
+from .models import STATUS_TITLES, PaymentStatus
 
 
 @dataclass(slots=True)
@@ -107,16 +108,36 @@ class Entry:
     entity: str = ""
     entity_id: int = 0
     action: str = ""
+    # О какой записи речь словами — «Получатель · 100 000 ₽ · 14.10.2026».
+    # Номер сам по себе ничего не говорит, а удалённую запись по нему не найти.
+    subject: str = ""
     changes: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def record(self) -> str:
+        """Колонка «Запись»: номер и то, что за ним стоит."""
+        number = f"№{self.entity_id}" if self.entity_id else ""
+        return " · ".join(part for part in (number, self.subject) if part)
+
+    @property
     def summary(self) -> str:
-        """Что именно изменилось — одной строкой для таблицы."""
-        if not self.changes:
-            return ""
+        """Что именно изменилось — одной строкой для таблицы.
+
+        Если сервер прислал прежние значения, показывается «было → стало».
+        """
+        changes = dict(self.changes)
+        was = dict(changes.pop("was", None) or {})
+        if "amount_was" in changes:
+            # Так сервер записывал прежнюю сумму до появления `was`.
+            was.setdefault("amount", changes.pop("amount_was"))
         parts = []
-        for name, value in self.changes.items():
-            parts.append(f"{FIELD_TITLES.get(name, name)}: {value}")
+        for name, value in changes.items():
+            if name == "recipient" and str(value) in self.subject:
+                continue
+            shown = _show(name, value)
+            if name in was:
+                shown = f"{_show(name, was[name])} → {shown}"
+            parts.append(f"{FIELD_TITLES.get(name, name)}: {shown}")
         return " · ".join(parts)
 
 
@@ -132,6 +153,12 @@ FIELD_TITLES = {
     "title": "название",
     "paid_flag": "отметка об оплате",
     "recipient": "получатель",
+    "vat": "НДС",
+    "instead_of": "вместо",
+    "responsible": "ответственный",
+    "doc_number": "документ",
+    "file": "файл",
+    "touched": "оплаты",
     "ids": "записей",
     "note": "примечание",
     "color": "цвет",
@@ -142,6 +169,36 @@ FIELD_TITLES = {
     "imports": "импортов",
     "links": "привязок",
 }
+
+
+_MONEY_FIELDS = frozenset({"amount", "vat"})
+
+
+def _show(name: str, value: Any) -> str:
+    """Значение поля так, как его читает человек, а не как лежит в базе."""
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item) for item in value)
+    if name == "status":
+        try:
+            return STATUS_TITLES[PaymentStatus(value)]
+        except (KeyError, ValueError):
+            return str(value)
+    if name in _MONEY_FIELDS:
+        try:
+            text = f"{float(value):,.2f}".replace(",", " ").removesuffix(".00")
+            return text.replace(".", ",")
+        except (TypeError, ValueError):
+            return str(value)
+    if name == "pay_date":
+        try:
+            return date.fromisoformat(str(value)[:10]).strftime("%d.%m.%Y")
+        except ValueError:
+            return str(value)
+    return str(value)
 
 
 def _moment(value: Any) -> datetime | None:
@@ -242,6 +299,7 @@ def journal(limit: int = 200, entity: str = "", login: str = "") -> list[Entry]:
     return [
         Entry(id=row["id"], at=_moment(row["at"]), user=row["user"],
               entity=row["entity"], entity_id=row["entity_id"],
-              action=row["action"], changes=row.get("changes") or {})
+              action=row["action"], subject=row.get("subject") or "",
+              changes=row.get("changes") or {})
         for row in rows
     ]

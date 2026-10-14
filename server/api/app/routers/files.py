@@ -13,7 +13,7 @@ import secrets
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
-from .. import db, security
+from .. import auditlog, db, security
 from ..schemas import FileOut
 from ..security import User
 from ..settings import settings
@@ -65,6 +65,17 @@ def _owner(payment_id: int) -> str:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Оплата не найдена")
     return row["responsible"]
+
+
+def _log(user: User, payment_id: int, action: str, file_name: str) -> None:
+    """Вложение — тоже действие над оплатой: приложенный файл меняет то, чем
+    оплату подтверждают, и из журнала должно быть видно, кто и какой."""
+    row = db.fetch_one(
+        "SELECT recipient, amount, pay_date, doc_number FROM payment WHERE id = %s",
+        (payment_id,))
+    about = auditlog.snapshot(row) if row else {}
+    auditlog.record(user.id, "payment", payment_id, action,
+                    {"file": file_name, auditlog.ABOUT: about})
 
 
 @router.get("/{payment_id}/files", response_model=list[FileOut],
@@ -120,6 +131,7 @@ async def upload(payment_id: int, file: UploadFile,
         (payment_id, name or stored, stored, size, user.id))
     db.execute("UPDATE payment SET had_files = TRUE WHERE id = %s",
                (payment_id,))
+    _log(user, payment_id, "attach", name or stored)
     return FileOut(**row)
 
 
@@ -145,7 +157,7 @@ def download(file_id: int, user: User = Depends(security.current_user)
                summary="Убрать вложение")
 def detach(file_id: int, user: User = Depends(security.current_user)) -> None:
     row = db.fetch_one(
-        "SELECT f.payment_id, f.stored_as, p.responsible"
+        "SELECT f.payment_id, f.stored_as, f.name, p.responsible"
         " FROM payment_file f JOIN payment p ON p.id = f.payment_id"
         " WHERE f.id = %s", (file_id,))
     if not row:
@@ -156,6 +168,7 @@ def detach(file_id: int, user: User = Depends(security.current_user)) -> None:
                             detail="Оплата закреплена за другим менеджером")
 
     db.execute("DELETE FROM payment_file WHERE id = %s", (file_id,))
+    _log(user, row["payment_id"], "detach", row["name"])
     path = os.path.join(settings.files_dir, str(row["payment_id"]),
                         row["stored_as"])
     try:

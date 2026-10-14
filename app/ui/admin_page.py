@@ -272,10 +272,9 @@ class AdminPage(QWidget):
             Column("Когда", lambda e: _moment(e.at), 140,
                    sort_key=lambda e: e.at or datetime.min),
             Column("Кто", lambda e: e.user, 190),
-            Column("Что", lambda e: e.entity, 150),
-            Column("Действие", lambda e: e.action, 150),
-            Column("Запись", lambda e: e.entity_id or "", 80,
-                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            Column("Что", lambda e: e.entity, 120),
+            Column("Действие", lambda e: e.action, 170),
+            Column("Запись", lambda e: e.record, 330),
             Column("Изменения", lambda e: e.summary, 420),
         ], page)
         layout.addWidget(self.journal_table, 1)
