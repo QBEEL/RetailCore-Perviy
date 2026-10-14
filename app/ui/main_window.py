@@ -63,6 +63,10 @@ PAGE_PROFILE = len(PAGES)
 # работает и вовсе без сети.
 SERVER_PAGES = (PAGE_PAYMENTS, PAGE_SUPPLIERS, PAGE_REPORTS, PAGE_ADMIN)
 
+# Наименьший размер окна при развёрнутом меню; свёрнутое отдаёт окну свою ширину.
+MIN_WINDOW_WIDTH = 1120
+MIN_WINDOW_HEIGHT = 700
+
 
 def _scrollable(page: QWidget) -> QScrollArea:
     """Страница в прокручиваемой области.
@@ -103,7 +107,6 @@ class MainWindow(QMainWindow):
         payments_data.set_local_only(
             settings.payment_local_base and transport.session.is_admin)
         self.setWindowTitle(APP_TITLE)
-        self.setMinimumSize(1120, 700)
         self.setWindowIcon(icons.app_icon())
 
         root = QWidget(self)
@@ -201,19 +204,34 @@ class MainWindow(QMainWindow):
     def _sidebar(self, parent: QWidget) -> QWidget:
         bar = QWidget(parent)
         bar.setObjectName("Sidebar")
-        bar.setFixedWidth(Metrics.SIDEBAR_WIDTH)
-        layout = QVBoxLayout(bar)
-        layout.setContentsMargins(12, 18, 12, 14)
+        self._bar = bar
+        self._bar_layout = layout = QVBoxLayout(bar)
         layout.setSpacing(4)
 
-        brand = QLabel(APP_TITLE, bar)
+        # Шапка: название с версией и кнопка сворачивания. Свёрнутое меню — это
+        # колонка иконок, и от шапки в ней остаётся одна кнопка.
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 8)
+        header.setSpacing(0)
+        self._brand_box = QWidget(bar)
+        brand_layout = QVBoxLayout(self._brand_box)
+        brand_layout.setContentsMargins(0, 0, 0, 0)
+        brand_layout.setSpacing(0)
+        brand = QLabel(APP_TITLE, self._brand_box)
         brand.setObjectName("Brand")
         brand.setContentsMargins(8, 0, 0, 0)
-        layout.addWidget(brand)
-        version = QLabel(f"версия {__version__}", bar)
+        brand_layout.addWidget(brand)
+        version = QLabel(f"версия {__version__}", self._brand_box)
         version.setObjectName("BrandSub")
-        version.setContentsMargins(8, 0, 0, 8)
-        layout.addWidget(version)
+        version.setContentsMargins(8, 0, 0, 0)
+        brand_layout.addWidget(version)
+        header.addWidget(self._brand_box, 1)
+        self._collapse_button = QToolButton(bar)
+        self._collapse_button.setObjectName("SidebarToggle")
+        self._collapse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collapse_button.clicked.connect(self.toggle_sidebar)
+        header.addWidget(self._collapse_button)
+        layout.addLayout(header)
 
         # Какая база в работе. Видно всегда, потому что перепутать их дорого:
         # оплаты, заведённые «не там», обнаруживаются только когда их
@@ -230,6 +248,14 @@ class MainWindow(QMainWindow):
         self._base_toggle.toggled.connect(self.set_local_base)
         base_row_layout.addWidget(self._base_toggle, 1)
 
+        self._base_badge = QLabel("ЛОК", self._base_row)
+        self._base_badge.setObjectName("BaseBadge")
+        self._base_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._base_badge.setToolTip(
+            "Работа идёт в локальной базе этого компьютера. Раскройте меню (Ctrl+B), "
+            "чтобы переключить базу или выгрузить оплаты на сервер")
+        base_row_layout.addWidget(self._base_badge, 1)
+
         self._upload_button = QToolButton(self._base_row)
         self._upload_button.setObjectName("BaseUploadButton")
         self._upload_button.setIcon(icons.icon("export"))
@@ -244,7 +270,7 @@ class MainWindow(QMainWindow):
         self._nav_group = QButtonGroup(bar)
         self._nav_group.setExclusive(True)
         for index, page in enumerate(PAGES):
-            button = QPushButton(f"  {page.title}", bar)
+            button = QPushButton("", bar)
             button.setObjectName("NavButton")
             button.setCheckable(True)
             button.setChecked(index == 0)
@@ -273,13 +299,52 @@ class MainWindow(QMainWindow):
         self._profile_button.clicked.connect(lambda: self.show_page(PAGE_PROFILE))
         self._nav_group.addButton(self._profile_button, PAGE_PROFILE)
         layout.addWidget(self._profile_button)
-        self._sync_profile_button()
 
-        hint = QLabel("F5 — сопоставить\nCtrl+S — сохранить\nCtrl+F — поиск", bar)
-        hint.setObjectName("BrandSub")
-        hint.setContentsMargins(8, 0, 0, 0)
-        layout.addWidget(hint)
+        self._hint = QLabel("F5 — сопоставить\nCtrl+S — сохранить\nCtrl+F — поиск", bar)
+        self._hint.setObjectName("BrandSub")
+        self._hint.setContentsMargins(8, 0, 0, 0)
+        layout.addWidget(self._hint)
+
+        self._sync_profile_button()
+        self._apply_sidebar()
         return bar
+
+    # --- сворачивание меню ----------------------------------------------------
+
+    def toggle_sidebar(self) -> None:
+        """Сворачивает меню до иконок и раскрывает обратно. Выбор запоминается."""
+        self.settings.sidebar_collapsed = not self.settings.sidebar_collapsed
+        self.settings.save()
+        self._apply_sidebar()
+
+    def _apply_sidebar(self) -> None:
+        """Подгоняет меню под выбранный вид: подписи, ширину, шапку, подсказки."""
+        collapsed = self.settings.sidebar_collapsed
+        bar = self._bar
+        bar.setFixedWidth(
+            Metrics.SIDEBAR_COLLAPSED_WIDTH if collapsed else Metrics.SIDEBAR_WIDTH)
+        side = 8 if collapsed else 12
+        self._bar_layout.setContentsMargins(side, 18, side, 14)
+        bar.setProperty("collapsed", collapsed)
+        # Без перерисовки стиля свойство в таблице стилей не подхватывается.
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+
+        self._brand_box.setVisible(not collapsed)
+        self._hint.setVisible(not collapsed)
+        self._collapse_button.setIcon(icons.icon("chevron" if collapsed else "chevron-left"))
+        self._collapse_button.setToolTip(
+            "Развернуть меню (Ctrl+B)" if collapsed else "Свернуть меню (Ctrl+B)")
+        for index, page in enumerate(PAGES):
+            if button := self._nav_group.button(index):
+                button.setText("" if collapsed else f"  {page.title}")
+        self._sync_profile_button()
+        self._sync_base_button(animate=False)
+        # Окно в свёрнутом режиме можно сделать уже: освободившуюся ширину
+        # люди и сворачивают ради неё, а на экране 1366 при масштабе 125%
+        # прежний минимум в окно не помещался.
+        freed = Metrics.SIDEBAR_WIDTH - Metrics.SIDEBAR_COLLAPSED_WIDTH
+        self.setMinimumSize(MIN_WINDOW_WIDTH - (freed if collapsed else 0), MIN_WINDOW_HEIGHT)
 
     def _sync_base_button(self, animate: bool = True) -> None:
         """Положение переключателя базы. Не администратору его показывать не за чем."""
@@ -288,10 +353,16 @@ class MainWindow(QMainWindow):
         if not allowed:
             return
         local = payments_data.local_only()
+        collapsed = self.settings.sidebar_collapsed
+        # В узкой колонке переключатель не помещается: остаётся метка «ЛОК», и
+        # только пока база локальная — общая и так подразумевается.
+        self._base_toggle.setVisible(not collapsed)
+        self._base_badge.setVisible(collapsed and local)
+        self._base_row.setVisible(not collapsed or local)
         self._base_toggle.set_local(local, animate=animate)
         was_visible = self._upload_button.isVisible()
-        self._upload_button.setVisible(local)
-        if animate and local and not was_visible:
+        self._upload_button.setVisible(local and not collapsed)
+        if animate and local and not collapsed and not was_visible:
             fade_in(self._upload_button)
 
     def set_local_base(self, local: bool) -> None:
@@ -323,7 +394,12 @@ class MainWindow(QMainWindow):
 
     def _sync_profile_button(self) -> None:
         name = transport.session.full_name or transport.session.login
-        self._profile_button.setText(f"  {name}" if name else "  Без сервера")
+        label = name or "Без сервера"
+        collapsed = self.settings.sidebar_collapsed
+        self._profile_button.setText("" if collapsed else f"  {label}")
+        # В свёрнутом меню имя не видно, а учётку на общей базе перепутать легко.
+        self._profile_button.setToolTip(
+            f"Личный кабинет: {label} (Ctrl+P)" if collapsed else "Личный кабинет (Ctrl+P)")
 
     def _lock_server_pages(self) -> None:
         """Гасит разделы общей базы, когда работаем без сервера.
@@ -517,6 +593,7 @@ class MainWindow(QMainWindow):
         self._add_action("Ctrl+Shift+O", self.match_page.target_picker.browse)
         self._add_action("Ctrl+R", self.match_page.open_last_session)
         self._add_action("Ctrl+P", lambda: self.show_page(PAGE_PROFILE))
+        self._add_action("Ctrl+B", self.toggle_sidebar)
         self._add_action("Ctrl+Q", self.close)
 
     def _add_action(self, shortcut, handler) -> None:

@@ -47,6 +47,8 @@ class AppSettings:
     window_geometry: str = ""
     window_state: str = ""
     splitter_sizes: list[int] = field(default_factory=list)
+    # Боковое меню свёрнуто до колонки иконок — для невысоких и узких экранов.
+    sidebar_collapsed: bool = False
     column_overrides: dict[str, dict[int, FieldRole]] = field(default_factory=dict)
     update_check_auto: bool = True
     update_download_auto: bool = True
@@ -268,6 +270,7 @@ class AppSettings:
         self.window_geometry = data.get("window_geometry", "")
         self.window_state = data.get("window_state", "")
         self.splitter_sizes = [int(v) for v in data.get("splitter_sizes", []) if isinstance(v, int)]
+        self.sidebar_collapsed = bool(data.get("sidebar_collapsed", self.sidebar_collapsed))
         self.column_overrides = {
             path: {int(index): role for index, name in mapping.items() if (role := _role(name))}
             for path, mapping in (data.get("column_overrides") or {}).items()
@@ -386,6 +389,7 @@ class AppSettings:
             "window_geometry": self.window_geometry,
             "window_state": self.window_state,
             "splitter_sizes": self.splitter_sizes,
+            "sidebar_collapsed": self.sidebar_collapsed,
             "column_overrides": {
                 path: {str(index): role.value for index, role in mapping.items()}
                 for path, mapping in self.column_overrides.items()

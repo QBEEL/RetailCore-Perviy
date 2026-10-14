@@ -313,3 +313,29 @@ def test_анимация_и_при_автозагрузке(application, monkey
     monkeypatch.setattr(dialog, "_is_snoozed", lambda: False)
     dialog._on_found(updater.ReleaseManifest(version="9.9.9", exe_url=""))
     assert not dialog._animation.isHidden()
+
+
+# --- сворачивание меню ----------------------------------------------------------
+
+def test_меню_сворачивается_до_иконок_и_раскрывается(application, profile):
+    from app.ui.theme import Metrics
+
+    window = _window(application)
+    window.settings._path = str(profile / "settings.json")
+    button = window._nav_group.button(index_of("match"))
+    assert window._bar.width() == Metrics.SIDEBAR_WIDTH
+    assert button.text().strip() == PAGES[0].title
+
+    window.toggle_sidebar()
+    assert window.settings.sidebar_collapsed
+    assert window._bar.width() == Metrics.SIDEBAR_COLLAPSED_WIDTH
+    assert button.text() == ""
+    # Подпись из кнопки ушла, но название остаётся в подсказке.
+    assert PAGES[0].title in button.toolTip()
+    # Освободившаяся ширина возвращается окну.
+    assert window.minimumWidth() < 1120
+
+    window.toggle_sidebar()
+    assert window._bar.width() == Metrics.SIDEBAR_WIDTH
+    assert button.text().strip() == PAGES[0].title
+    assert window.minimumWidth() == 1120

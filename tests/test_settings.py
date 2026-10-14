@@ -143,3 +143,12 @@ def test_туннель_по_умолчанию_выключен_и_пережи
     settings.save()
 
     assert AppSettings.load(settings._path).vpn_enabled is True
+
+
+# --- боковое меню ---------------------------------------------------------------
+
+def test_свёрнутое_меню_переживает_перезапуск(settings):
+    assert settings.sidebar_collapsed is False
+    settings.sidebar_collapsed = True
+    settings.save()
+    assert AppSettings.load(settings._path).sidebar_collapsed is True
