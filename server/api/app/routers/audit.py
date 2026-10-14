@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -52,6 +52,12 @@ class AuditEntry(BaseModel):
     entity: str
     entity_id: int
     action: str
+    # Код сущности («payment») — по нему окно записи запрашивает её историю;
+    # `entity` выше — название для человека.
+    kind: str = ""
+    # Оплата заведена на получателя, у которого нет карточки поставщика.
+    # Считается здесь: клиент не знает, привязана ли оплата к карточке.
+    no_supplier: bool = False
     # О какой записи речь словами: получатель, сумма, дата. Номер без этого
     # ничего не говорит, а удалённую запись по номеру не найти нигде.
     subject: str = ""
@@ -90,6 +96,11 @@ def list_entries(
     limit: int = 200,
     entity: str = "",
     login: str = "",
+    record_id: int = 0,
+    action: str = "",
+    start: date | None = None,
+    end: date | None = None,
+    text: str = "",
 ) -> list[AuditEntry]:
     where, values = ["TRUE"], []
     if entity:
@@ -98,6 +109,26 @@ def list_entries(
     if login:
         where.append("u.login = %s")
         values.append(login)
+    if record_id:
+        where.append("a.entity_id = %s")
+        values.append(record_id)
+    if action:
+        where.append("a.action = %s")
+        values.append(action)
+    if start:
+        where.append("a.at >= %s")
+        values.append(start)
+    if end:
+        # Конец включительно: «по 14.10» должно захватить весь день.
+        where.append("a.at < %s")
+        values.append(end + timedelta(days=1))
+    if text.strip():
+        # Ищем и в самих изменениях: снимок оплаты лежит в них, и так находится
+        # получатель даже у оплаты, которой давно нет.
+        like = f"%{text.strip()}%"
+        where.append("(a.changes::text ILIKE %s OR p.recipient ILIKE %s"
+                     " OR u.full_name ILIKE %s OR tu.full_name ILIKE %s)")
+        values.extend([like] * 4)
     values.append(min(limit, 2000))
 
     rows = db.fetch_all(
@@ -105,6 +136,7 @@ def list_entries(
         "       a.entity, a.entity_id, a.action, a.changes,"
         "       p.recipient AS p_recipient, p.amount AS p_amount,"
         "       p.pay_date AS p_date, p.doc_number AS p_doc,"
+        "       p.supplier_id AS p_supplier,"
         "       tu.full_name AS t_user, d.title AS t_dds,"
         "       (SELECT c.changes->>'recipient' FROM audit_log c"
         "         WHERE a.entity = 'payment' AND c.entity = 'payment'"
@@ -130,5 +162,9 @@ def list_entries(
             entity=ENTITIES.get(row["entity"], row["entity"]),
             entity_id=row["entity_id"],
             action=ACTIONS.get(row["action"], row["action"]),
+            kind=row["entity"],
+            no_supplier=(row["entity"] == "payment" and row["action"] == "create"
+                         and row["p_recipient"] is not None
+                         and not row["p_supplier"]),
             subject=subject, changes=changes))
     return entries

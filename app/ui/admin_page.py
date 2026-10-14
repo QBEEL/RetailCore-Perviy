@@ -8,13 +8,16 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -36,9 +39,37 @@ from .widgets.account_dialogs import AccountDialog, PasswordShown
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title
 from .widgets import marks
 from .widgets.database_dialogs import WipeDialog
+from .widgets.journal_dialog import JournalEntryDialog
 from .widgets.dds_dialog import DdsMarkDialog
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
+
+
+# Периоды отбора журнала: подпись и сколько дней назад начинать (None — всё время).
+JOURNAL_PERIODS = (("За всё время", None), ("Сегодня", 0), ("За 7 дней", 7),
+                   ("За 30 дней", 30))
+JOURNAL_LIMITS = (200, 500, 1000, 2000)
+
+
+def _read_journal(query: dict) -> list[Entry]:
+    return admin.journal(**query)
+
+
+def write_journal(entries: list[Entry], path: str) -> None:
+    """Журнал в Excel — то, что видно в таблице, плюс пометки о проверке."""
+    import openpyxl
+
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "Журнал изменений"
+    sheet.append(["Когда", "Кто", "Что", "Действие", "Запись", "Изменения", "Внимание"])
+    for entry in entries:
+        sheet.append([_moment(entry.at), entry.user, entry.entity, entry.action,
+                      entry.record, entry.summary, "; ".join(entry.flags)])
+    for column, width in zip("ABCDEFG", (18, 24, 18, 26, 52, 70, 34)):
+        sheet.column_dimensions[column].width = width
+    sheet.freeze_panes = "A2"
+    book.save(path)
 
 
 def _moment(value: datetime | None) -> str:
@@ -65,6 +96,10 @@ class AdminPage(QWidget):
         self._dds_items: list[dds.DdsItem] = []
         self._scope = Scope()
         self._loaded = False
+        # Номер последнего запроса журнала: ответы приходят не по порядку, и
+        # медленный ответ на прежний отбор не должен затирать свежий.
+        self._journal_request = 0
+        self._journal_shown: list[Entry] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(Metrics.PAD + 8, Metrics.PAD + 4,
@@ -264,21 +299,87 @@ class AdminPage(QWidget):
         layout.setContentsMargins(0, Metrics.GAP, 0, 0)
         layout.setSpacing(Metrics.GAP)
 
-        layout.addWidget(Hint(
-            "Двести последних действий. Массовый импорт из 1С даёт одну запись "
-            "на прогон, а не на строку."))
+        layout.addLayout(self._journal_filters())
 
         self.journal_table = DataTable([
             Column("Когда", lambda e: _moment(e.at), 140,
                    sort_key=lambda e: e.at or datetime.min),
-            Column("Кто", lambda e: e.user, 190),
-            Column("Что", lambda e: e.entity, 120),
-            Column("Действие", lambda e: e.action, 170),
-            Column("Запись", lambda e: e.record, 330),
-            Column("Изменения", lambda e: e.summary, 420),
+            Column("Кто", lambda e: e.user, 170),
+            Column("Что", lambda e: e.entity, 110),
+            Column("Действие", lambda e: e.action, 160),
+            Column("Внимание", lambda e: "; ".join(e.flags), 200,
+                   color=lambda e: QColor(Palette.WARNING) if e.flags else None,
+                   tip="Что в этом действии стоит проверить"),
+            Column("Запись", lambda e: e.record, 300),
+            Column("Изменения", lambda e: e.summary, 380),
         ], page)
+        self.journal_table.model_.set_row_tint(
+            lambda e: marks.tint(QColor(Palette.WARNING)) if e.flags else None)
+        self.journal_table.item_activated.connect(self.open_entry)
         layout.addWidget(self.journal_table, 1)
         return page
+
+    def _journal_filters(self) -> QVBoxLayout:
+        """Отбор журнала: кто, что, когда и поиск по тексту."""
+        box = QVBoxLayout()
+        box.setSpacing(Metrics.GAP // 2)
+
+        top = QHBoxLayout()
+        top.setSpacing(Metrics.GAP // 2)
+        self.journal_search = QLineEdit(self)
+        self.journal_search.setPlaceholderText("Поиск: получатель, менеджер, комментарий…")
+        self.journal_search.setClearButtonEnabled(True)
+        # Запрос уходит, когда человек договорил, а не на каждую букву.
+        self._journal_timer = QTimer(self)
+        self._journal_timer.setSingleShot(True)
+        self._journal_timer.setInterval(500)
+        self._journal_timer.timeout.connect(self.reload_journal)
+        self.journal_search.textChanged.connect(lambda _: self._journal_timer.start())
+        top.addWidget(self.journal_search, 1)
+
+        self.journal_who = QComboBox(self)
+        self.journal_who.addItem("Все менеджеры", "")
+        self.journal_entity = QComboBox(self)
+        for title, code in admin.ENTITY_FILTER:
+            self.journal_entity.addItem(title, code)
+        self.journal_action = QComboBox(self)
+        for title, code in admin.ACTION_FILTER:
+            self.journal_action.addItem(title, code)
+        for combo in (self.journal_who, self.journal_entity, self.journal_action):
+            combo.currentIndexChanged.connect(lambda _: self.reload_journal())
+            top.addWidget(combo)
+        box.addLayout(top)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(Metrics.GAP // 2)
+        self.journal_period = QComboBox(self)
+        for title, days in JOURNAL_PERIODS:
+            self.journal_period.addItem(title, days)
+        self.journal_period.currentIndexChanged.connect(lambda _: self.reload_journal())
+        bottom.addWidget(self.journal_period)
+
+        self.journal_limit = QComboBox(self)
+        for count in JOURNAL_LIMITS:
+            self.journal_limit.addItem(f"Показать {count}", count)
+        self.journal_limit.currentIndexChanged.connect(lambda _: self.reload_journal())
+        bottom.addWidget(self.journal_limit)
+
+        self.journal_flagged = QCheckBox("Только требующие проверки", self)
+        self.journal_flagged.setToolTip(
+            "Удаление оплаты, правка суммы на 20 % и больше, оплата получателю без "
+            "карточки поставщика, оплата, заведённая в выходной")
+        self.journal_flagged.toggled.connect(lambda _: self._render_journal())
+        bottom.addWidget(self.journal_flagged)
+
+        self.journal_count = Hint("", self)
+        bottom.addWidget(self.journal_count, 1)
+
+        self.journal_export = QPushButton("Выгрузить в Excel", self)
+        self.journal_export.setIcon(icons.icon("export"))
+        self.journal_export.clicked.connect(self.export_journal)
+        bottom.addWidget(self.journal_export)
+        box.addLayout(bottom)
+        return box
 
     def _maintenance_tab(self) -> QWidget:
         """Удаление данных общей базы.
@@ -345,14 +446,17 @@ class AdminPage(QWidget):
             self.subtitle.setText("Требуется вход администратором")
             return
 
-        run_task(_load_all, on_result=self._apply, on_error=self._failed)
+        self._journal_request += 1
+        run_task(_load_all, self._journal_query(), on_result=self._apply,
+                 on_error=self._failed)
 
     def _apply(self, payload: tuple) -> None:
         (self.accounts, self.entries, self._known,
          self._directions, self._claims, self._scope, self._dds_items) = payload
         self._loaded = True
         self.accounts_table.set_items(self.accounts)
-        self.journal_table.set_items(self.entries)
+        self._fill_journal_people()
+        self._render_journal()
         self.claims_table.set_items(self._claims)
         self.dds_table.set_items(self._dds_items)
         self._filter_dds(self.dds_search.text())
@@ -386,6 +490,83 @@ class AdminPage(QWidget):
                 f"Сейчас в базе: {self._scope.summary}"
                 if not self._scope.empty else "Данных в базе нет — стирать нечего")
         self.wipe_button.setEnabled(self._scope.supported and not self._scope.empty)
+
+    # --- журнал ---------------------------------------------------------------
+
+    def _fill_journal_people(self) -> None:
+        """Список менеджеров для отбора — из учёток. Выбранный остаётся выбранным."""
+        chosen = self.journal_who.currentData()
+        self.journal_who.blockSignals(True)
+        self.journal_who.clear()
+        self.journal_who.addItem("Все менеджеры", "")
+        for account in sorted(self.accounts, key=lambda a: a.title.lower()):
+            self.journal_who.addItem(account.title, account.login)
+        index = self.journal_who.findData(chosen)
+        self.journal_who.setCurrentIndex(max(index, 0))
+        self.journal_who.blockSignals(False)
+
+    def _journal_query(self) -> dict:
+        """Условия отбора журнала — как их понимает сервер."""
+        days = self.journal_period.currentData()
+        return {
+            "limit": self.journal_limit.currentData() or JOURNAL_LIMITS[0],
+            "entity": self.journal_entity.currentData() or "",
+            "login": self.journal_who.currentData() or "",
+            "action": self.journal_action.currentData() or "",
+            "text": self.journal_search.text(),
+            # 0 дней — «сегодня»; None — без ограничения периода.
+            "start": date.today() - timedelta(days=days) if days is not None else None,
+        }
+
+    def reload_journal(self) -> None:
+        """Перечитывает только журнал — после смены отбора остальное не трогаем."""
+        if not (transport.session.active and transport.session.is_admin):
+            return
+        self._journal_timer.stop()
+        self._journal_request += 1
+        request = self._journal_request
+        self.journal_count.setText("Загружаю…")
+        run_task(_read_journal, self._journal_query(),
+                 on_result=lambda entries: self._journal_loaded(request, entries),
+                 on_error=self._failed)
+
+    def _journal_loaded(self, request: int, entries: list[Entry]) -> None:
+        if request != self._journal_request:
+            return
+        self.entries = entries
+        self._render_journal()
+
+    def _render_journal(self) -> None:
+        flagged = sum(1 for entry in self.entries if entry.flags)
+        shown = ([e for e in self.entries if e.flags]
+                 if self.journal_flagged.isChecked() else self.entries)
+        self._journal_shown = shown
+        self.journal_table.set_items(shown)
+        self.journal_count.setText(
+            f"Действий: {len(shown)}"
+            + (f" · требуют проверки: {flagged}" if flagged else ""))
+
+    def open_entry(self, entry: Entry) -> None:
+        """Двойной щелчок по строке: все подробности действия и история оплаты."""
+        JournalEntryDialog(entry, self).exec()
+
+    def export_journal(self) -> None:
+        if not self._journal_shown:
+            self.notify("В журнале нет строк для выгрузки", ToastKind.WARNING)
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Выгрузить журнал",
+            f"Журнал изменений {date.today():%d.%m.%Y}.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+        try:
+            write_journal(self._journal_shown, path)
+        except OSError as error:
+            # Чаще всего файл открыт в Excel и занят.
+            self.notify(f"Не удалось сохранить файл: {error}", ToastKind.ERROR)
+            return
+        self.notify(f"Журнал выгружен: {len(self._journal_shown)} строк",
+                    ToastKind.SUCCESS)
 
     def _failed(self, message: str) -> None:
         self.notify(message, ToastKind.ERROR)
@@ -609,7 +790,7 @@ def _color_name(item: dds.DdsItem) -> str:
                 item.color)
 
 
-def _load_all() -> tuple:
+def _load_all(journal_query: dict) -> tuple:
     """Учётки, журнал, имена из 1С, направления, заявки и объём базы.
 
     Одним походом: страница показывает всё сразу, а шесть последовательных
@@ -620,7 +801,7 @@ def _load_all() -> tuple:
     directions = [(item.code, item.title) for item in directory.directions()
                   if item.for_people]
     claims = directory.pending_claims().items
-    return (admin.accounts(), admin.journal(), known, directions, claims,
+    return (admin.accounts(), admin.journal(**journal_query), known, directions, claims,
             admin.scope(), dds.catalog())
 
 

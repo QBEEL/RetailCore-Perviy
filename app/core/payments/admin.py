@@ -111,13 +111,77 @@ class Entry:
     # О какой записи речь словами — «Получатель · 100 000 ₽ · 14.10.2026».
     # Номер сам по себе ничего не говорит, а удалённую запись по нему не найти.
     subject: str = ""
+    # Код сущности («payment»); пуст у сервера прежней версии.
+    kind: str = ""
+    # Оплата заведена на получателя без карточки поставщика (считает сервер).
+    no_supplier: bool = False
     changes: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_payment(self) -> bool:
+        return self.kind == "payment" or (not self.kind and self.entity == "оплата")
+
+    @property
+    def flags(self) -> list[str]:
+        """Что в этом действии стоит проверить глазами.
+
+        Это не обвинение, а повод посмотреть: удаление, заметная правка суммы,
+        оплата получателю без карточки поставщика, оплата, заведённая в
+        выходной. Порог и перечень один на всех — чтобы подсвеченное значило
+        одно и то же в любой день.
+        """
+        if not self.is_payment:
+            return []
+        found = []
+        if self.action == "удаление":
+            found.append("оплата удалена")
+        change = self.amount_change()
+        if change is not None and abs(change) >= AMOUNT_ALERT:
+            found.append(f"сумма изменена на {abs(change):.0%}".replace("%", " %"))
+        if self.action == "создание":
+            if self.no_supplier:
+                found.append("нет карточки поставщика")
+            if self.at is not None and self.at.weekday() >= 5:
+                found.append("заведена в выходной")
+        return found
+
+    def amount_change(self) -> float | None:
+        """Доля, на которую изменилась сумма; `None` — сумма не менялась."""
+        was = (self.changes.get("was") or {}).get("amount", self.changes.get("amount_was"))
+        now = self.changes.get("amount")
+        try:
+            was, now = float(was), float(now)
+        except (TypeError, ValueError):
+            return None
+        return (now - was) / was if was else None
 
     @property
     def record(self) -> str:
         """Колонка «Запись»: номер и то, что за ним стоит."""
         number = f"№{self.entity_id}" if self.entity_id else ""
         return " · ".join(part for part in (number, self.subject) if part)
+
+    def rows(self) -> list[tuple[str, str, str]]:
+        """Изменения построчно: поле, было, стало — для окна записи.
+
+        Здесь ничего не пропускается и не сокращается: окно существует ради
+        полной картины, в отличие от одной строки таблицы. Список (оплаты
+        массовой правки) разворачивается по строке на элемент.
+        """
+        changes = dict(self.changes)
+        was = dict(changes.pop("was", None) or {})
+        if "amount_was" in changes:
+            was.setdefault("amount", changes.pop("amount_was"))
+        rows: list[tuple[str, str, str]] = []
+        for name, value in changes.items():
+            title = FIELD_TITLES.get(name, name)
+            if isinstance(value, (list, tuple)):
+                rows.extend((title if index == 0 else "", "", str(item))
+                            for index, item in enumerate(value))
+                continue
+            rows.append((title, _show(name, was[name]) if name in was else "",
+                         _show(name, value)))
+        return rows
 
     @property
     def summary(self) -> str:
@@ -140,6 +204,19 @@ class Entry:
             parts.append(f"{FIELD_TITLES.get(name, name)}: {shown}")
         return " · ".join(parts)
 
+
+# Варианты отбора журнала: подпись и код, который понимает сервер.
+ENTITY_FILTER = (("Всё", ""), ("Оплаты", "payment"), ("Бюджеты", "budget"),
+                 ("Учётные записи", "app_user"), ("Статьи ДДС", "dds_item"),
+                 ("Привязки получателей", "recipient_link"))
+ACTION_FILTER = (("Любое действие", ""), ("Создание", "create"), ("Изменение", "update"),
+                 ("Массовое изменение", "update_many"), ("Удаление", "delete"),
+                 ("Вложение добавлено", "attach"), ("Вложение убрано", "detach"),
+                 ("Импорт из 1С", "import"), ("Выгрузка локальной базы", "upload"),
+                 ("Сохранение", "save"))
+
+# Изменение суммы на столько и больше подсвечивается в журнале.
+AMOUNT_ALERT = 0.20
 
 # Названия полей для журнала. Без них в таблице стояло бы «pay_date».
 FIELD_TITLES = {
@@ -293,13 +370,24 @@ def wipe(password: str) -> Scope:
 
 # --- журнал --------------------------------------------------------------------
 
-def journal(limit: int = 200, entity: str = "", login: str = "") -> list[Entry]:
-    rows = transport.get("/api/audit",
-                         {"limit": limit, "entity": entity, "login": login})
+def journal(limit: int = 200, entity: str = "", login: str = "", *,
+            record_id: int = 0, action: str = "", start: date | None = None,
+            end: date | None = None, text: str = "") -> list[Entry]:
+    """Журнал с отбором. Пустое условие выборку не ограничивает.
+
+    Сервер прежней версии лишних условий не знает и игнорирует: журнал
+    остаётся читаемым, просто неотфильтрованным.
+    """
+    rows = transport.get("/api/audit", {
+        "limit": limit, "entity": entity, "login": login,
+        "record_id": record_id or "", "action": action, "text": text.strip(),
+        "start": start.isoformat() if start else "",
+        "end": end.isoformat() if end else ""})
     return [
         Entry(id=row["id"], at=_moment(row["at"]), user=row["user"],
               entity=row["entity"], entity_id=row["entity_id"],
               action=row["action"], subject=row.get("subject") or "",
+              kind=row.get("kind") or "", no_supplier=bool(row.get("no_supplier")),
               changes=row.get("changes") or {})
         for row in rows
     ]
