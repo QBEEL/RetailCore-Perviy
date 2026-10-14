@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -46,7 +48,7 @@ from ...core.marking import introduce, issue, labels
 from ...core.marking.labels import LabelSpec
 from .. import icons, label_print
 from ..theme import Metrics, Palette
-from .common import Hint, SectionTitle
+from .common import Hint, SectionTitle, apply_shadow
 
 
 def _buttons(parent: QDialog, ok_text: str, ok_icon: str,
@@ -155,11 +157,16 @@ class IssueDialog(QDialog):
 class PrintDialog(QDialog):
     """Печать блока кодов на принтер этикеток."""
 
+    # Место под превью: этикетка в него вписывается, а не растягивает окно.
+    _STAGE_WIDTH = 420
+    _STAGE_HEIGHT = 330
+    _SETTINGS_WIDTH = 350
+
     def __init__(self, batch: issue.Batch, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Печать этикеток")
         self.setModal(True)
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(840)
         self.batch = batch
         self._settings = labels.load()
         self._spec = self._settings.spec()
@@ -177,79 +184,18 @@ class PrintDialog(QDialog):
         root.setSpacing(Metrics.GAP)
         root.addWidget(SectionTitle(self.batch.title))
 
-        form = QFormLayout()
-        form.setSpacing(9)
-        self.printer_box = QComboBox(self)
-        names = label_print.printers()
-        self.printer_box.addItems(names)
-        wanted = self._settings.printer or label_print.suggested_printer()
-        if wanted in names:
-            self.printer_box.setCurrentText(wanted)
-        form.addRow("Принтер", self.printer_box)
+        # Слева настройки, справа превью: в одну колонку окно вытягивалось выше
+        # экрана ноутбука, и кнопки печати уезжали под панель задач.
+        body = QHBoxLayout()
+        body.setSpacing(Metrics.PAD)
+        settings = QWidget(self)
+        settings.setFixedWidth(self._SETTINGS_WIDTH)
+        settings.setLayout(self._build_settings())
+        settings.layout().setContentsMargins(0, 0, 0, 0)
+        body.addWidget(settings)
+        body.addWidget(self._build_stage(), 1)
+        root.addLayout(body, 1)
 
-        self.pdf_box = QCheckBox("Сохранить в PDF вместо печати", self)
-        form.addRow("", self.pdf_box)
-
-        row = QHBoxLayout()
-        row.setSpacing(9)
-        self.width = self._spin(self._spec.width, 10, 200, 1, " мм")
-        self.height = self._spin(self._spec.height, 10, 200, 1, " мм")
-        row.addWidget(QLabel("Этикетка"))
-        row.addWidget(self.width)
-        row.addWidget(QLabel("×"))
-        row.addWidget(self.height)
-        row.addWidget(QLabel("Символ"))
-        self.dm_size = self._spin(self._spec.dm_size, 8, 40, 1, " мм")
-        row.addWidget(self.dm_size)
-        row.addStretch(1)
-        form.addRow("Размер", row)
-
-        shift = QHBoxLayout()
-        shift.setSpacing(9)
-        self.offset_x = self._spin(self._spec.offset_x, -10, 10, 1, " мм", step=0.5)
-        self.offset_y = self._spin(self._spec.offset_y, -10, 10, 1, " мм", step=0.5)
-        shift.addWidget(QLabel("вправо"))
-        shift.addWidget(self.offset_x)
-        shift.addWidget(QLabel("вниз"))
-        shift.addWidget(self.offset_y)
-        shift.addWidget(Hint("Если печать съезжает, подвиньте на долю миллиметра"))
-        shift.addStretch(1)
-        form.addRow("Сдвиг", shift)
-
-        text = QHBoxLayout()
-        text.setSpacing(9)
-        self.show_name = QCheckBox("Название", self)
-        self.show_name.setChecked(self._spec.show_name)
-        self.show_text = QCheckBox("GTIN и серийный номер", self)
-        self.show_text.setChecked(self._spec.show_text)
-        self.name_font = self._spin(self._spec.name_font, 3, 20, 1, " пт", step=0.5)
-        text.addWidget(self.show_name)
-        text.addWidget(self.show_text)
-        text.addWidget(QLabel("шрифт"))
-        text.addWidget(self.name_font)
-        text.addStretch(1)
-        form.addRow("Текст", text)
-
-        rng = QHBoxLayout()
-        rng.setSpacing(9)
-        self.start = QSpinBox(self)
-        self.start.setRange(1, max(1, self.batch.total))
-        self.start.setValue(min(self.batch.printed + 1, max(1, self.batch.total)))
-        self.count = QSpinBox(self)
-        self.count.setRange(1, max(1, self.batch.total))
-        self.count.setValue(max(1, self.batch.left))
-        rng.addWidget(QLabel("с №"))
-        rng.addWidget(self.start)
-        rng.addWidget(QLabel("штук"))
-        rng.addWidget(self.count)
-        self.range_hint = Hint("")
-        rng.addWidget(self.range_hint, 1)
-        form.addRow("Что печатать", rng)
-        root.addLayout(form)
-
-        self.picture = QLabel(self)
-        self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self.picture)
         self.hint = Hint("")
         root.addWidget(self.hint)
 
@@ -284,6 +230,116 @@ class PrintDialog(QDialog):
         self.start.valueChanged.connect(self._refresh)
         self.count.valueChanged.connect(self._refresh)
 
+    def _build_settings(self) -> QVBoxLayout:
+        """Левая колонка: принтер, размеры, сдвиг, текст и диапазон печати."""
+        column = QVBoxLayout()
+        column.setSpacing(Metrics.GAP)
+
+        self.printer_box = QComboBox(self)
+        names = label_print.printers()
+        self.printer_box.addItems(names)
+        wanted = self._settings.printer or label_print.suggested_printer()
+        if wanted in names:
+            self.printer_box.setCurrentText(wanted)
+        self.pdf_box = QCheckBox("Сохранить в PDF вместо печати", self)
+        column.addLayout(self._section("Принтер", self.printer_box, self.pdf_box))
+
+        self.width = self._spin(self._spec.width, 10, 200, 1, "")
+        self.height = self._spin(self._spec.height, 10, 200, 1, "")
+        self.dm_size = self._spin(self._spec.dm_size, 8, 40, 1, "")
+        self.offset_x = self._spin(self._spec.offset_x, -10, 10, 1, "", step=0.5)
+        self.offset_y = self._spin(self._spec.offset_y, -10, 10, 1, "", step=0.5)
+        size = QGridLayout()
+        size.setHorizontalSpacing(8)
+        size.setVerticalSpacing(4)
+        for index in range(3):
+            size.setColumnStretch(index, 1)
+        for index, (caption, spin) in enumerate((
+                ("Ширина, мм", self.width), ("Высота, мм", self.height),
+                ("Символ, мм", self.dm_size))):
+            size.addWidget(self._caption(caption), 0, index)
+            size.addWidget(spin, 1, index)
+        size.addWidget(self._caption("Сдвиг вправо, мм"), 2, 0, 1, 2)
+        size.addWidget(self._caption("Сдвиг вниз, мм"), 2, 2, 1, 1)
+        size.addWidget(self.offset_x, 3, 0)
+        size.addWidget(self.offset_y, 3, 1)
+        shift_hint = Hint("Если печать съезжает, подвиньте на долю миллиметра")
+        column.addLayout(self._section("Этикетка", size, shift_hint))
+
+        self.show_name = QCheckBox("Название", self)
+        self.show_name.setChecked(self._spec.show_name)
+        self.show_text = QCheckBox("GTIN и серийный номер", self)
+        self.show_text.setChecked(self._spec.show_text)
+        self.name_font = self._spin(self._spec.name_font, 3, 20, 1, " пт", step=0.5)
+        checks = QHBoxLayout()
+        checks.setSpacing(16)
+        checks.addWidget(self.show_name)
+        checks.addWidget(self.show_text)
+        checks.addStretch(1)
+        font_row = QHBoxLayout()
+        font_row.setSpacing(8)
+        font_row.addWidget(self._caption("Шрифт"))
+        font_row.addWidget(self.name_font)
+        font_row.addStretch(1)
+        column.addLayout(self._section("Текст", checks, font_row))
+
+        self.start = QSpinBox(self)
+        self.start.setRange(1, max(1, self.batch.total))
+        self.start.setValue(min(self.batch.printed + 1, max(1, self.batch.total)))
+        self.count = QSpinBox(self)
+        self.count.setRange(1, max(1, self.batch.total))
+        self.count.setValue(max(1, self.batch.left))
+        rng = QGridLayout()
+        rng.setHorizontalSpacing(8)
+        rng.setColumnStretch(0, 1)
+        rng.setColumnStretch(1, 1)
+        rng.addWidget(self._caption("Начиная с №"), 0, 0)
+        rng.addWidget(self._caption("Сколько штук"), 0, 1)
+        rng.addWidget(self.start, 1, 0)
+        rng.addWidget(self.count, 1, 1)
+        self.range_hint = Hint("")
+        column.addLayout(self._section("Что печатать", rng, self.range_hint))
+        column.addStretch(1)
+        return column
+
+    def _build_stage(self) -> QFrame:
+        """Правая часть: белый лист этикетки на сером фоне и подпись под ним."""
+        stage = QFrame(self)
+        stage.setObjectName("LabelStage")
+        stage.setMinimumSize(self._STAGE_WIDTH, self._STAGE_HEIGHT)
+        layout = QVBoxLayout(stage)
+        layout.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
+        layout.addStretch(1)
+        self.picture = QLabel(stage)
+        self.picture.setObjectName("LabelSheet")
+        self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        apply_shadow(self.picture, blur=18, alpha=30, offset=2)
+        layout.addWidget(self.picture, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch(1)
+        self.size_caption = Hint("")
+        self.size_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.size_caption)
+        return stage
+
+    def _caption(self, text: str) -> QLabel:
+        label = QLabel(text, self)
+        label.setObjectName("FormCaption")
+        return label
+
+    def _section(self, title: str, *items) -> QVBoxLayout:
+        """Заголовок раздела настроек и его строки под ним."""
+        box = QVBoxLayout()
+        box.setSpacing(6)
+        heading = QLabel(title, self)
+        heading.setObjectName("FormSection")
+        box.addWidget(heading)
+        for item in items:
+            if isinstance(item, QWidget):
+                box.addWidget(item)
+            else:
+                box.addLayout(item)
+        return box
+
     def _spin(self, value: float, low: float, high: float, decimals: int,
               suffix: str, step: float = 1.0) -> QDoubleSpinBox:
         spin = QDoubleSpinBox(self)
@@ -317,12 +373,7 @@ class PrintDialog(QDialog):
         spec = self._spec_now()
         selected = self._selected()
         sample = selected[0] if selected else label_print.SAMPLE_CODE
-        pixmap = QPixmap.fromImage(
-            label_print.preview(spec, sample, self.batch.name or "Название товара",
-                                zoom=3))
-        self.picture.setPixmap(pixmap)
-        # Высота по картинке: иначе при смене размера этикетки её обрезает.
-        self.picture.setFixedHeight(pixmap.height() + 8)
+        self._show_preview(spec, sample)
         names = label_print.printers()
         pdf = self.pdf_box.isChecked()
         self.printer_box.setEnabled(not pdf)
@@ -346,9 +397,35 @@ class PrintDialog(QDialog):
         else:
             self.hint.setStyleSheet("")
             self.hint.setText(
-                "Так этикетка выйдет на принтере 203 dpi. Символ читается "
-                "сканером при размере не меньше 3 точек на модуль; пробная "
-                "этикетка печатается образцом и кодов не тратит.")
+                "Символ читается сканером при размере не меньше 3 точек на "
+                "модуль. Пробная этикетка печатается образцом и кодов не тратит.")
+
+    def _show_preview(self, spec: LabelSpec, sample: str) -> None:
+        """Рисует этикетку так, чтобы она помещалась в отведённое место.
+
+        Маленькую увеличиваем целым числом раз — точки остаются квадратными, как
+        у принтера, — а большую уменьшаем плавно: резать её по кратному зуму
+        значило бы выпустить окно за край экрана.
+        """
+        image = label_print.preview(spec, sample, self.batch.name or "Название товара")
+        room_w = self._STAGE_WIDTH - 2 * Metrics.PAD - 4
+        room_h = self._STAGE_HEIGHT - 2 * Metrics.PAD - 40
+        factor = min(room_w / image.width(), room_h / image.height())
+        if factor >= 2:
+            zoom = int(factor)
+            image = image.scaled(image.width() * zoom, image.height() * zoom,
+                                 Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.FastTransformation)
+        elif factor < 1:
+            image = image.scaled(int(image.width() * factor), int(image.height() * factor),
+                                 Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+        pixmap = QPixmap.fromImage(image)
+        self.picture.setPixmap(pixmap)
+        # Рамка листа — по краям картинки: иначе белый квадрат сливается с фоном.
+        self.picture.setFixedSize(pixmap.width() + 2, pixmap.height() + 2)
+        self.size_caption.setText(
+            f"{spec.width:g} × {spec.height:g} мм · так этикетка выйдет на принтере 203 dpi")
 
     def _remember(self) -> None:
         self._settings.printer = self.printer_box.currentText()
