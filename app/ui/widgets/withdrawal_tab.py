@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Callable
 
 from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -50,6 +52,7 @@ from ...core.marking.models import (
     OperationStatus,
 )
 from ...core.marking.reconcile import key_of
+from ...core.marking.session import Organisation
 from ...core.settings import AppSettings
 from .. import icons
 from ..tasks import run_task
@@ -60,6 +63,32 @@ from .toast import ToastKind
 # Группа по умолчанию — лёгкая промышленность: ею здесь торгуют чаще всего, а
 # вывод без группы система не принимает (`?pg=`).
 DEFAULT_GROUP = "lp"
+
+# Колонки таблицы кодов: наименование идёт сразу за кодом, цена — последняя.
+GTIN_COLUMN = 1
+NAME_COLUMN = 4
+PRICE_COLUMN = 5
+EDITABLE_COLUMNS = (NAME_COLUMN, PRICE_COLUMN)
+
+
+class _CellEditor(QStyledItemDelegate):
+    """Редактор ячейки по размеру строки.
+
+    Стандартный берёт отступы поля формы, в строку таблицы они не помещаются, и
+    набираемый текст — цену — не видно. Так же устроена таблица во вкладке «Продажа».
+    """
+
+    def createEditor(self, parent, option, index):  # noqa: N802 — Qt
+        editor = QLineEdit(parent)
+        editor.setStyleSheet("QLineEdit { padding: 0 7px; margin: 0; border-radius: 0; }")
+        if index.column() == PRICE_COLUMN:
+            editor.setPlaceholderText("0,00")
+            editor.setAlignment(Qt.AlignmentFlag.AlignRight
+                                | Qt.AlignmentFlag.AlignVCenter)
+        return editor
+
+    def updateEditorGeometry(self, editor, option, index):  # noqa: N802 — Qt
+        editor.setGeometry(option.rect)
 
 # Цвет и фон ответа на скан: зелёное «принято», жёлтое «повтор», красное «не принято».
 RESULT_COLOURS = {
@@ -85,6 +114,7 @@ class WithdrawalTab(QWidget):
         contour: Callable[[], Contour] = lambda: Contour.SANDBOX,
         thumbprint: Callable[[], str] = lambda: "",
         inn: Callable[[], str] = lambda: "",
+        organisations: Callable[[], list[Organisation]] = lambda: [],
     ) -> None:
         super().__init__(parent)
         self.settings = settings
@@ -92,6 +122,16 @@ class WithdrawalTab(QWidget):
         self._contour = contour
         self._thumbprint = thumbprint
         self._inn = inn
+        self._organisations = organisations
+        # ИНН, который подставили мы: пока в поле он, его можно менять на ИНН
+        # вошедшей организации; набранное руками не трогаем.
+        self._filled_inn = ""
+        self._refreshing = False
+        # Наименования по коду товара (GTIN): их знает память «Продажи», кэш
+        # проверок и, если вошли, «Честный ЗНАК». `_asked` — по кому уже спросили.
+        self._names: dict[str, str] = {}
+        self._asked: set[str] = set()
+        self._finding = False
         # Коды как отсканированы — документ сам возьмёт из них код идентификации.
         self.codes: list[str] = []
         self._keys: set[str] = set()
@@ -117,12 +157,35 @@ class WithdrawalTab(QWidget):
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
-        self.inn_edit = QLineEdit(card)
+        # ИНН — список знакомых организаций с возможностью вписать свой: по
+        # умолчанию стоит ИНН организации, под которой выполнен вход.
+        self.inn_box = QComboBox(card)
+        self.inn_box.setEditable(True)
+        self.inn_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.inn_box.setCompleter(None)
+        self.inn_box.activated.connect(self._pick_organisation)
+        self.inn_edit = self.inn_box.lineEdit()
         self.inn_edit.setPlaceholderText("ИНН организации или ИП")
         self.inn_edit.setMaxLength(12)
+        self.inn_box.setToolTip(
+            "ИНН участника оборота. Подставляется из организации, под которой "
+            "выполнен вход; другую можно выбрать в списке или вписать.")
         self.date_edit = QDateEdit(QDate.currentDate(), card)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("dd.MM.yyyy")
+        # Место осуществления деятельности: система ищет его по ИНН, КПП и ФИАС и
+        # без них отклоняет документ. Один раз вписанное помнится по ИНН.
+        self.fias_edit = QLineEdit(card)
+        self.fias_edit.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        self.fias_edit.editingFinished.connect(self._tidy_fias)
+        self.fias_edit.setToolTip(
+            "Идентификатор (ФИАС, ГАР) адреса места осуществления деятельности — "
+            "из личного кабинета «Честного ЗНАКа», раздел «Места осуществления "
+            "деятельности». Запоминается для этого ИНН.")
+        self.kpp_edit = QLineEdit(card)
+        self.kpp_edit.setPlaceholderText("9 цифр; у ИП не нужен")
+        self.kpp_edit.setMaxLength(9)
+        self.inn_edit.editingFinished.connect(self.recall_place)
         self.group_box = QComboBox(card)
         for group in GROUPS:
             self.group_box.addItem(group.title, group.code)
@@ -157,7 +220,7 @@ class WithdrawalTab(QWidget):
         self.cause_other_label = QLabel("Описание причины", card)
         self.doc_name_label = QLabel("Наименование документа", card)
         rows = (
-            (QLabel("ИНН участника", card), self.inn_edit,
+            (QLabel("ИНН участника", card), self.inn_box,
              QLabel("Дата вывода", card), self.date_edit),
             (QLabel("Причина вывода", card), self.cause_box,
              QLabel("Товарная группа", card), self.group_box),
@@ -169,6 +232,11 @@ class WithdrawalTab(QWidget):
             grid.addWidget(second_label, row, 2)
             grid.addWidget(second, row, 3)
             row += 1
+        grid.addWidget(QLabel("ФИАС места деятельности", card), row, 0)
+        grid.addWidget(self.fias_edit, row, 1)
+        grid.addWidget(QLabel("КПП места деятельности", card), row, 2)
+        grid.addWidget(self.kpp_edit, row, 3)
+        row += 1
         grid.addWidget(self.cause_other_label, row, 0)
         grid.addWidget(self.cause_other_edit, row, 1, 1, 3)
         row += 1
@@ -185,15 +253,19 @@ class WithdrawalTab(QWidget):
         grid.addWidget(self.doc_name_edit, row, 3)
         # Названия причин длинные («…для производственных целей — PRODUCTION_USE»),
         # и список, который не умеет сжиматься, раздувал вкладку шире окна.
-        for combo in (self.group_box, self.cause_box, self.doc_type_box):
+        for combo in (self.inn_box, self.group_box, self.cause_box,
+                      self.doc_type_box):
             combo.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(12)
         body.addLayout(grid)
 
         self.details_hint = Hint(
-            "Чек или иной документ нужен не для каждой причины: какой — решает "
-            "система, и отказ она объяснит. Номера ККТ в формате документа нет.",
+            "При продаже, фасовке и передаче у каждого товара нужна цена за "
+            "единицу: впишите её в таблице ниже, в колонке «Цена, ₽». Чек или иной "
+            "документ нужен не для каждой причины: какой — решает система, и "
+            "отказ она объяснит. Номера ККТ в формате документа нет. ФИАС и КПП — "
+            "адрес вашего места осуществления деятельности из личного кабинета.",
             card)
         body.addWidget(self.details_hint)
         return card
@@ -251,25 +323,31 @@ class WithdrawalTab(QWidget):
         self.sound_box.setChecked(self.settings.marking_reconcile_sound)
         body.addWidget(self.sound_box)
 
-        self.table = QTableWidget(0, 4, card)
-        self.table.setHorizontalHeaderLabels(["№", "Код товара", "Серийный номер", "Код"])
+        self.table = QTableWidget(0, 6, card)
+        self.table.setHorizontalHeaderLabels(
+            ["№", "Код товара", "Серийный номер", "Код", "Наименование",
+             "Цена за единицу, ₽"])
+        self.table.setItemDelegate(_CellEditor(self.table))
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Правятся наименование и цена; остальное в таблице только для чтения.
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.setMinimumHeight(140)
         head = self.table.horizontalHeader()
-        head.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        for column in (0, 1, 2):
+        head.setSectionResizeMode(NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 1, 2, 3, PRICE_COLUMN):
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._sync)
+        self.table.itemChanged.connect(self._cell_edited)
         body.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
         actions.setSpacing(9)
         self.hint = Hint("", card)
         actions.addWidget(self.hint, 1)
-        self.file_save_button = self._button(card, "Сохранить XML…", "save",
+        self.file_save_button = self._button(card, "Сохранить JSON…", "save",
                                              self.save_file)
         self.send_button = self._button(card, "Создать документ в ЧЗ", "export",
                                         self.create_document)
@@ -326,13 +404,27 @@ class WithdrawalTab(QWidget):
         self.codes.append(text)
         row = self.table.rowCount()
         self.table.insertRow(row)
-        for column, value in enumerate((str(row + 1), parsed.gtin, parsed.serial,
-                                        parsed.ki)):
-            self.table.setItem(row, column, QTableWidgetItem(value))
+        self._refreshing = True
+        try:
+            for column, value in enumerate((str(row + 1), parsed.gtin, parsed.serial,
+                                            parsed.ki)):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, column, item)
+            self.table.setItem(row, NAME_COLUMN,
+                               QTableWidgetItem(self._name_of(parsed.gtin)))
+            price = QTableWidgetItem(self._price_known(parsed.gtin))
+            price.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, PRICE_COLUMN, price)
+        finally:
+            self._refreshing = False
+        self._paint_prices()
         if not quiet:
             self._say("added", f"Принято · {parsed.gtin} · {parsed.serial}")
             self.table.scrollToBottom()
         self._sync()
+        self._find_names()
         return "added"
 
     def _say(self, kind: str, text: str) -> None:
@@ -405,7 +497,112 @@ class WithdrawalTab(QWidget):
 
     def _renumber(self) -> None:
         for row in range(self.table.rowCount()):
-            self.table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            item = QTableWidgetItem(str(row + 1))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+
+    # --- цена и наименование -------------------------------------------------------
+
+    def _gtin_of(self, row: int) -> str:
+        item = self.table.item(row, GTIN_COLUMN)
+        return item.text() if item is not None else ""
+
+    def _price_known(self, gtin: str) -> str:
+        """Цена, уже вписанная у другого кода этого товара, — чтобы не набирать её заново."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, PRICE_COLUMN)
+            if self._gtin_of(row) == gtin and item is not None and item.text().strip():
+                return item.text().strip()
+        return ""
+
+    def _cell_edited(self, item: QTableWidgetItem) -> None:
+        """Вписали наименование или цену: то же — остальным кодам этого товара."""
+        if self._refreshing or item.column() not in EDITABLE_COLUMNS:
+            return
+        gtin, text = self._gtin_of(item.row()), item.text().strip()
+        self._refreshing = True
+        try:
+            for row in range(self.table.rowCount()):
+                other = self.table.item(row, item.column())
+                if other is None or row == item.row() or self._gtin_of(row) != gtin:
+                    continue
+                if item.column() == NAME_COLUMN:
+                    other.setText(text)
+                elif not other.text().strip():
+                    # Цена подставляется только туда, где её ещё нет.
+                    other.setText(text)
+        finally:
+            self._refreshing = False
+        if item.column() == NAME_COLUMN:
+            self._names[gtin] = text
+        self._paint_prices()
+
+    def _paint_prices(self) -> None:
+        """Подсвечивает строки, где цена нужна, а её нет, — чтобы было видно, где вписать."""
+        priced = self.cause_box.currentData() in withdrawal.COST_CAUSES
+        warning = QBrush(QColor(Palette.WARNING_SOFT))
+        self._refreshing = True
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, PRICE_COLUMN)
+                if item is not None:
+                    item.setBackground(
+                        warning if priced and not item.text().strip() else QBrush())
+        finally:
+            self._refreshing = False
+
+    def _row_prices(self) -> tuple[str, ...]:
+        prices = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, PRICE_COLUMN)
+            prices.append(item.text().strip() if item is not None else "")
+        return tuple(prices)
+
+    def _name_of(self, gtin: str) -> str:
+        if gtin not in self._names:
+            known = self.settings.marking_sale_items.get(gtin, {})
+            self._names[gtin] = known.get("name", "")
+        return self._names[gtin]
+
+    def _find_names(self) -> None:
+        """Наименования, которых ещё нет, ищутся в кэше и у «Честного ЗНАКа».
+
+        Фоном и по одному коду на товар: список не ждёт, а нет ответа — ячейка
+        остаётся пустой, и название можно вписать руками.
+        """
+        if self._finding:
+            return
+        wanted: dict[str, str] = {}
+        for row, code in enumerate(self.codes):
+            gtin = self._gtin_of(row)
+            if gtin and not self._names.get(gtin) and gtin not in self._asked:
+                wanted.setdefault(gtin, code)
+        if not wanted:
+            return
+        self._asked.update(wanted)
+        self._finding = True
+        online = service.signed_in()
+        run_task(
+            _look_up_names, list(wanted.values()), self._contour(), online,
+            on_result=self._names_found,
+            on_error=lambda _message: self._names_found({}))
+
+    def _names_found(self, found: dict[str, str]) -> None:
+        self._finding = False
+        self._refreshing = True
+        try:
+            for gtin, name in found.items():
+                if not name or self._names.get(gtin):
+                    continue
+                self._names[gtin] = name
+                for row in range(self.table.rowCount()):
+                    item = self.table.item(row, NAME_COLUMN)
+                    if self._gtin_of(row) == gtin and item is not None \
+                            and not item.text().strip():
+                        item.setText(name)
+        finally:
+            self._refreshing = False
+        self._find_names()
 
     # --- документ ------------------------------------------------------------------
 
@@ -423,19 +620,73 @@ class WithdrawalTab(QWidget):
             doc_number=self.doc_number_edit.text() if doc_type else "",
             doc_date=(self.doc_date_edit.date().toString("yyyy-MM-dd")
                       if doc_type else ""),
-            doc_name=self.doc_name_edit.text() if doc_type == "OTHER" else "")
+            doc_name=self.doc_name_edit.text() if doc_type == "OTHER" else "",
+            fias_id=self.fias_edit.text().strip(),
+            kpp=self.kpp_edit.text().strip(),
+            code_prices=self._row_prices())
 
     @property
     def group(self) -> str:
         return str(self.group_box.currentData() or "")
 
     def prefill_inn(self) -> None:
-        """Подставляет ИНН организации, под которой выполнен вход, если поле пусто."""
-        if not self.inn_edit.text().strip():
-            self.inn_edit.setText(self._inn() or "")
+        """Ставит ИНН организации, под которой выполнен вход, и обновляет список.
+
+        Вписанное руками не трогается: заменяется только пустое поле или ИНН,
+        подставленный ранее (вошли под другой организацией).
+        """
+        self._load_organisations()
+        current = (self._inn() or "").strip()
+        shown = self.inn_edit.text().strip()
+        if current and (not shown or shown == self._filled_inn):
+            self.inn_edit.setText(current)
+            self._filled_inn = current
+        self.recall_place()
+
+    def _tidy_fias(self) -> None:
+        """Вставленный с мусором идентификатор приводится к чистому виду."""
+        if tidy := withdrawal.fias(self.fias_edit.text()):
+            self.fias_edit.setText(tidy)
+
+    def recall_place(self) -> None:
+        """Подставляет запомненные ФИАС и КПП этого ИНН, если поля ещё пусты."""
+        known = self.settings.marking_places.get(self.inn_edit.text().strip(), {})
+        for edit, name in ((self.fias_edit, "fias_id"), (self.kpp_edit, "kpp")):
+            if not edit.text().strip():
+                edit.setText(known.get(name, ""))
+
+    def _remember_place(self, document: withdrawal.Withdrawal) -> None:
+        """Документ отправлен: адрес и КПП запоминаются, чтобы не вписывать их снова."""
+        self.settings.marking_places[document.inn.strip()] = {
+            "fias_id": withdrawal.fias(document.fias_id), "kpp": document.kpp.strip()}
+        self.settings.save()
+
+    def _load_organisations(self) -> None:
+        """Список знакомых организаций: запомненные при входе и вошедшая."""
+        known = list(self._organisations() or [])
+        if (current := (self._inn() or "").strip()) and all(
+                item.inn != current for item in known):
+            known.insert(0, Organisation(inn=current))
+        typed = self.inn_edit.text()
+        self.inn_box.blockSignals(True)
+        self.inn_box.clear()
+        for item in known:
+            self.inn_box.addItem(item.title, item.inn)
+        self.inn_box.setCurrentIndex(-1)
+        self.inn_edit.setText(typed)
+        self.inn_box.blockSignals(False)
+
+    def _pick_organisation(self, index: int) -> None:
+        """В списке выбрали организацию: в поле — её ИНН, а не подпись с названием."""
+        if inn := self.inn_box.itemData(index):
+            self.inn_edit.setText(str(inn))
+            # Другая организация — другой адрес: чужой не оставляем.
+            self.fias_edit.clear()
+            self.kpp_edit.clear()
+            self.recall_place()
 
     def save_file(self) -> None:
-        """Сохраняет XML для загрузки в личном кабинете. В систему ничего не уходит."""
+        """Сохраняет JSON для загрузки в личном кабинете. В систему ничего не уходит."""
         document = self.document()
         if problems := document.problems:
             self._tell(f"Файл не собран: {problems[0]}", ToastKind.WARNING)
@@ -446,10 +697,10 @@ class WithdrawalTab(QWidget):
         if not path:
             return
         if not os.path.splitext(path)[1]:
-            path += ".xml"
+            path += ".json"
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(document.render(".xml"))
+                handle.write(document.render(".json"))
         except (OSError, introduce.IntroduceProblem) as error:
             self._tell(f"Не удалось сохранить файл: {error}", ToastKind.ERROR)
             return
@@ -550,6 +801,8 @@ class WithdrawalTab(QWidget):
             return
         sent: introduce.Sent = payload
         status = sent.status
+        if not status.failed:
+            self._remember_place(document)
         operation.document_id = sent.doc_id
         if status.done:
             operation.status = OperationStatus.DONE
@@ -601,6 +854,9 @@ class WithdrawalTab(QWidget):
 
     def _sync(self) -> None:
         """Приводит поля, плитки и кнопки к тому, что выбрано и набрано."""
+        priced = self.cause_box.currentData() in withdrawal.COST_CAUSES
+        self.table.setColumnHidden(PRICE_COLUMN, not priced)
+        self._paint_prices()
         other = self.cause_box.currentData() == "OTHER"
         self.cause_other_label.setVisible(other)
         self.cause_other_edit.setVisible(other)
@@ -644,3 +900,25 @@ def _send(document: withdrawal.Withdrawal, thumbprint: str, group: str,
                                       on_created=created)
     except introduce.IntroduceUnknown as error:
         return "unknown", str(error)
+
+
+def _look_up_names(codes: list[str], contour: Contour,
+                online: bool) -> dict[str, str]:
+    """Наименования по одному коду на товар: сначала кэш проверок, потом система.
+
+    Без входа спрашивать некого — остаётся кэш. Возвращается {GTIN: наименование}.
+    """
+    requested = {code: codes_module.for_request(code) or code for code in codes}
+    found: dict[str, str] = {}
+    for info in service.store.known_checks(
+            list(requested.values()), contour).values():
+        if info.product_name:
+            found[info.gtin or codes_module.parse(info.code).gtin] = info.product_name
+    missing = [code for code in codes
+               if codes_module.parse(code).gtin not in found]
+    if online and missing:
+        for info in service.check(missing, contour=contour):
+            gtin = info.gtin or codes_module.parse(info.code).gtin
+            if gtin and info.product_name:
+                found.setdefault(gtin, info.product_name)
+    return found

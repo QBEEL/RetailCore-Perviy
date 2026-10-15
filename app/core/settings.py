@@ -119,6 +119,9 @@ class AppSettings:
     marking_sale_seller: dict[str, str] = field(default_factory=dict)
     marking_sale_buyers: dict[str, dict[str, str]] = field(default_factory=dict)
     marking_sale_items: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Место осуществления деятельности для вывода из оборота: ФИАС адреса и КПП по
+    # ИНН участника. Один раз найденное в кабинете второй раз не вписывают.
+    marking_places: dict[str, dict[str, str]] = field(default_factory=dict)
     # Туннель через свой сервер включён и поднимается при запуске. Сама ссылка
     # с идентификатором пользователя здесь не хранится: см. core/vpn/manager.py.
     vpn_enabled: bool = False
@@ -341,6 +344,7 @@ class AppSettings:
         self.marking_sale_seller = _strings(data.get("marking_sale_seller"))
         self.marking_sale_buyers = _string_tables(data.get("marking_sale_buyers"))
         self.marking_sale_items = _string_tables(data.get("marking_sale_items"))
+        self.marking_places = _string_tables(data.get("marking_places"))
         self.vpn_enabled = bool(data.get("vpn_enabled", False))
         self.vpn_server = str(data.get("vpn_server", ""))
 
@@ -425,6 +429,7 @@ class AppSettings:
             "marking_sale_seller": self.marking_sale_seller,
             "marking_sale_buyers": self.marking_sale_buyers,
             "marking_sale_items": self.marking_sale_items,
+            "marking_places": self.marking_places,
             "vpn_enabled": self.vpn_enabled,
             "vpn_server": self.vpn_server,
         }

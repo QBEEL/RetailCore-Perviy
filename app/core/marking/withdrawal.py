@@ -1,4 +1,4 @@
-"""Вывод из оборота: документ «Вывод из оборота» (`LK_RECEIPT_XML`).
+"""Вывод из оборота: документ «Вывод из оборота» (`LK_RECEIPT`, JSON).
 
 Товар уходит из оборота не сам: розничная продажа, фасовка, уничтожение, утрата
 и прочее оформляются документом, в котором перечислены коды маркировки и сказано,
@@ -7,18 +7,25 @@
 отправляется молча.
 
 Состав документа не выдуман: он снят со строк библиотеки ПРИНТМАРКИ
-(`marklib.dll`, раздел «Вывод из оборота»). Корень — `<withdrawal version="8">`;
-внутри по порядку: `trade_participant_inn`, `buyer_inn` (по желанию),
-`withdrawal_type`, `withdrawal_type_other` (для причины OTHER), `withdrawal_date`,
-первичный документ (`primary_document_type`, `primary_document_number`,
-`primary_document_date`, `primary_document_custom_name`), `state_contract_id`
-(для госконтракта) и `products_list` с кодами в `<cis>` внутри CDATA. Уходит он
-тем же единым методом создания документов, что и ввод в оборот:
-`{"document_format": "XML", "product_document": <base64>, "type":
-"LK_RECEIPT_XML", "signature": <base64>}`; подписывается тот же текст XML.
+(`marklib.dll`, раздел «Вывод из оборота»). Это JSON: `inn`, `buyer_inn` (по
+желанию), `action` — причина (для OTHER ещё `withdrawal_type_other`),
+`action_date`, первичный документ (`document_type`, `document_number`,
+`document_date`, `primary_document_custom_name`), `kpp` и `fias_id` — место
+осуществления деятельности, `state_contract_id` (для госконтракта) и `products` с
+кодом `cis` и, когда вывод связан с продажей или передачей, ценой за единицу в
+копейках `product_cost` (какие причины требуют цену, видно по тому, где ПРИНТМАРКИ
+пишет её, — `COST_CAUSES`).
+
+Место осуществления деятельности (МОД) система ищет по ИНН, КПП и ФИАС: без них
+документ отклоняется («МОД по указанным ИНН…, КПП null, ФИАС null не найдены»).
+Старый XML версии 8, который описывает та же библиотека, этих полей не знает, и
+отправлять его бесполезно, поэтому документ уходит JSON-ом — так же, как
+перемаркировка (`LK_REMARK`): `{"document_format": "MANUAL", "product_document":
+<base64>, "type": "LK_RECEIPT", "signature": <base64>}`; подписывается тот же
+текст JSON.
 
 Номер ККТ, который показывает окно ПРИНТМАРКИ, в этот шаблон не попадает — в
-строках библиотеки такого поля нет, и придумывать для него тег значило бы
+строках библиотеки такого поля нет, и придумывать для него ключ значило бы
 отправить в систему то, чего она не ждёт.
 
 Отправка и опрос статуса общие с вводом в оборот (`introduce.send`): документ
@@ -26,13 +33,14 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from xml.sax.saxutils import escape
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from . import codes as codes_module
-from .introduce import MAX_PRODUCTS, IntroduceProblem, _cdata, _INN
+from .introduce import MAX_PRODUCTS, IntroduceProblem, _INN
 
 # Причины вывода — в том порядке и теми словами, что в окне ПРИНТМАРКИ. Порядок
 # не случаен: первыми идут частые, а «Другое» — последним.
@@ -65,14 +73,43 @@ PRIMARY_DOCUMENT_TYPES: dict[str, str] = {
     "OTHER": "Иной документ",
 }
 
+# Причины, при которых у каждого товара должна стоять цена за единицу: так
+# ПРИНТМАРКИ решает, писать ли `<cost>`. Для остальных (утрата, уничтожение,
+# экспорт…) цены нет, и отправлять её незачем.
+COST_CAUSES = frozenset({"PACKING", "RETAIL", "BY_SAMPLES", "DISTANCE", "VENDING",
+                         "DONATION", "OWN_USE", "PRODUCTION_USE"})
+
 # Причина по умолчанию и вид документа к ней: чаще всего выводят розничной
 # продажей по кассовому чеку.
 DEFAULT_CAUSE = "RETAIL"
 DEFAULT_DOCUMENT_TYPE = "RECEIPT"
 
-DOCUMENT_TYPE = "LK_RECEIPT_XML"
+DOCUMENT_TYPE = "LK_RECEIPT"
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_KPP = re.compile(r"^\d{9}$")
+# Идентификатор адреса в ФИАС (ГАР): GUID. Из кабинета его копируют с пробелами,
+# скобками и невидимыми знаками по краям, а иногда без дефисов — всё это
+# отбрасывается, ищется сам идентификатор.
+_FIAS = re.compile(r"([0-9a-fA-F]{8})-?([0-9a-fA-F]{4})-?([0-9a-fA-F]{4})-?"
+                   r"([0-9a-fA-F]{4})-?([0-9a-fA-F]{12})")
+
+
+def fias(text: str) -> str:
+    """ФИАС в каноническом виде («xxxxxxxx-xxxx-…», строчными) или пустая строка."""
+    found = _FIAS.search(text or "")
+    return "-".join(found.groups()).lower() if found else ""
+
+
+def kopecks(text: str) -> int | None:
+    """Цена из поля «рубли» — в копейки. None, если это не неотрицательное число."""
+    try:
+        value = Decimal(text.strip().replace(",", ".").replace(" ", ""))
+    except InvalidOperation:
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    return int((value * 100).quantize(Decimal(1), ROUND_HALF_UP))
 
 
 def cause_title(code: str) -> str:
@@ -102,11 +139,18 @@ class Withdrawal:
     doc_name: str = ""
     buyer_inn: str = ""
     state_contract_id: str = ""
+    # Место осуществления деятельности: ФИАС адреса и КПП (у ИП КПП нет).
+    fias_id: str = ""
+    kpp: str = ""
+    # Цена за единицу в рублях: общая для списка и, по желанию, своя у каждого
+    # кода (`code_prices` идёт в том же порядке, что `codes`; пустая — общая).
+    price: str = ""
+    code_prices: tuple[str, ...] = ()
 
     # как документ уходит в систему — общий разговор с `introduce.send`
     kind = "withdrawal"
     title = "Вывод из оборота"
-    wire_format = "XML"
+    wire_format = "MANUAL"
 
     @property
     def problems(self) -> list[str]:
@@ -142,7 +186,35 @@ class Withdrawal:
             found.append("дата первичного документа — в виде ГГГГ-ММ-ДД")
         if self.buyer_inn.strip() and not _INN.match(self.buyer_inn.strip()):
             found.append("ИНН покупателя — 10 цифр для организации, 12 для ИП")
+        if not self.fias_id.strip():
+            found.append("не указан ФИАС места осуществления деятельности — по нему "
+                         "система находит ваш адрес")
+        elif not fias(self.fias_id):
+            found.append("ФИАС места деятельности не похож на идентификатор вида "
+                         "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (получено: "
+                         f"{self.fias_id.strip()[:50]!r})")
+        if self.kpp.strip() and not _KPP.match(self.kpp.strip()):
+            found.append("КПП — 9 цифр")
+        elif len(self.inn.strip()) == 10 and not self.kpp.strip():
+            found.append("для организации нужен КПП места осуществления деятельности")
+        if self.needs_price:
+            prices = [self.price_of(index) for index in range(len(self.codes))]
+            if empty := sum(1 for item in prices if not item):
+                found.append(f"не указана цена за единицу у кодов: {empty} — для "
+                             f"причины «{WITHDRAWAL_CAUSES[self.cause]}» она "
+                             "обязательна")
+            elif any(kopecks(item) is None for item in prices):
+                found.append("цена за единицу — число в рублях, например 1490 или 99,90")
         return found
+
+    def price_of(self, index: int) -> str:
+        """Цена строки: своя, если задана, иначе общая."""
+        own = self.code_prices[index].strip() if index < len(self.code_prices) else ""
+        return own or self.price.strip()
+
+    @property
+    def needs_price(self) -> bool:
+        return self.cause in COST_CAUSES
 
     def _keys(self) -> list[str]:
         """Что делает код единственным: код идентификации без криптохвоста."""
@@ -153,50 +225,42 @@ class Withdrawal:
             raise IntroduceProblem("Не указана товарная группа.")
         return DOCUMENT_TYPE
 
-    def render(self, extension: str = ".xml") -> str:
-        """Текст XML: он же уходит в запрос и подписывается."""
+    def render(self, extension: str = ".json") -> str:
+        """Текст JSON: он же уходит в запрос и подписывается."""
         if problems := self.problems:
             raise IntroduceProblem("Документ не собран: " + "; ".join(problems) + ".")
-        lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-                 '<withdrawal version="8">',
-                 f"  <trade_participant_inn>{escape(self.inn.strip())}"
-                 "</trade_participant_inn>"]
+        body: dict[str, object] = {"inn": self.inn.strip()}
         if self.buyer_inn.strip():
-            lines.append(f"  <buyer_inn>{escape(self.buyer_inn.strip())}</buyer_inn>")
-        lines.append(f"  <withdrawal_type>{escape(self.cause)}</withdrawal_type>")
+            body["buyer_inn"] = self.buyer_inn.strip()
+        body["action"] = self.cause
         if self.cause == "OTHER":
-            lines.append("  <withdrawal_type_other>"
-                         f"{escape(self.cause_other.strip())}</withdrawal_type_other>")
-        lines.append(f"  <withdrawal_date>{escape(self.date.strip())}</withdrawal_date>")
+            body["withdrawal_type_other"] = self.cause_other.strip()
+        body["action_date"] = self.date.strip()
         if self.doc_type:
-            lines.append(f"  <primary_document_type>{escape(self.doc_type)}"
-                         "</primary_document_type>")
-            lines.append("  <primary_document_number>"
-                         f"{escape(self.doc_number.strip())}</primary_document_number>")
-            lines.append("  <primary_document_date>"
-                         f"{escape(self.doc_date.strip())}</primary_document_date>")
+            body["document_type"] = self.doc_type
+            body["document_number"] = self.doc_number.strip()
+            body["document_date"] = self.doc_date.strip()
             if self.doc_type == "OTHER":
-                lines.append("  <primary_document_custom_name>"
-                             f"{escape(self.doc_name.strip())}"
-                             "</primary_document_custom_name>")
+                body["primary_document_custom_name"] = self.doc_name.strip()
+        if self.kpp.strip():
+            body["kpp"] = self.kpp.strip()
+        body["fias_id"] = fias(self.fias_id)
         if self.cause == "STATE_CONTRACT" and self.state_contract_id.strip():
-            lines.append("  <state_contract_id>"
-                         f"{escape(self.state_contract_id.strip())}</state_contract_id>")
-        lines.append("  <products_list>")
-        for code in self.codes:
-            lines.append("    <product>")
-            lines.append("      <cis><![CDATA["
-                         f"{_cdata(codes_module.parse(code).ki)}]]></cis>")
-            lines.append("    </product>")
-        lines.append("  </products_list>")
-        lines.append("</withdrawal>")
-        return "\n".join(lines) + "\n"
+            body["state_contract_id"] = self.state_contract_id.strip()
+        products = []
+        for index, code in enumerate(self.codes):
+            product: dict[str, object] = {"cis": codes_module.parse(code).ki}
+            if self.needs_price:
+                product["product_cost"] = kopecks(self.price_of(index))
+            products.append(product)
+        body["products"] = products
+        return json.dumps(body, ensure_ascii=False, indent=2) + "\n"
 
     @property
     def file_filters(self) -> str:
-        return "XML (*.xml)"
+        return "JSON (*.json)"
 
 
-def file_name(moment: datetime | None = None, extension: str = ".xml") -> str:
+def file_name(moment: datetime | None = None, extension: str = ".json") -> str:
     moment = moment or datetime.now()
     return f"Вывод из оборота {moment:%Y-%m-%d %H-%M}{extension}"
