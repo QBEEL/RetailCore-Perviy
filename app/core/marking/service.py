@@ -104,6 +104,27 @@ def forget_suz(contour: Contour = Contour.SANDBOX) -> None:
     suz.forget(contour)
 
 
+def suz_profiles(contour: Contour = Contour.SANDBOX) -> list[suz.Profile]:
+    """Профили СУЗ этого контура: по организации на каждый."""
+    return suz.profiles(contour)
+
+
+def save_suz_profile(name: str, credentials: suz.Credentials,
+                     contour: Contour = Contour.SANDBOX, inn: str = "",
+                     organisation: str = "") -> suz.Profile:
+    return suz.save_profile(name, credentials, contour, inn, organisation)
+
+
+def forget_suz_profile(name: str, contour: Contour = Contour.SANDBOX) -> bool:
+    return suz.forget_profile(name, contour)
+
+
+def use_suz_profile(name: str,
+                    contour: Contour = Contour.SANDBOX) -> suz.Profile | None:
+    """Профиль становится действующим набором реквизитов контура."""
+    return suz.use_profile(name, contour)
+
+
 def suz_ready(contour: Contour = Contour.SANDBOX) -> bool:
     """Заполнены ли реквизиты. О том, приняты ли они, говорит только проверка."""
     return suz.known(contour)

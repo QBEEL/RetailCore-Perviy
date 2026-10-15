@@ -275,7 +275,7 @@ class MarkingPage(QWidget):
         self.withdrawal_tab = WithdrawalTab(
             self.settings, self.notify, self,
             contour=lambda: self.contour, thumbprint=lambda: self.thumbprint,
-            inn=self._participant_inn)
+            inn=self._participant_inn, organisations=self._saved_organisations)
         self.withdrawal_tab.journal_changed.connect(self.reload_journal)
         self.tabs.addTab(self.withdrawal_tab, icons.icon("export"), "Вывод из оборота")
         # Продажа организации для её нужд: УПД с признаком вывода из оборота. Ей,
@@ -406,6 +406,22 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Станция управления заказами (СУЗ)", card))
         header.addStretch(1)
+        # Профиль — набор реквизитов одной организации. Выбор переключает все
+        # поля разом, и вписывать ОМС ID с токеном при смене организации не надо.
+        self.suz_profile_box = QComboBox(card)
+        self.suz_profile_box.setEditable(True)
+        self.suz_profile_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.suz_profile_box.setCompleter(None)
+        self.suz_profile_box.setMinimumWidth(230)
+        self.suz_profile_box.lineEdit().setPlaceholderText(
+            "Профиль — название организации")
+        self.suz_profile_box.setToolTip(
+            "Реквизиты СУЗ каждой организации запоминаются под своим названием. "
+            "Выберите профиль в списке — и ОМС ID, соединение, токен и ИНН "
+            "переключатся разом. Новый профиль: впишите название и нажмите "
+            "«Сохранить».")
+        self.suz_profile_box.activated.connect(self._use_suz_profile)
+        header.addWidget(self.suz_profile_box)
         self.suz_token_button = self._action(card, "Получить токен", "key",
                                              self.sign_in_suz)
         self.suz_token_button.setToolTip(
@@ -1110,6 +1126,8 @@ class MarkingPage(QWidget):
         self.settings.marking_contour = self.contour.value
         self.settings.save()
         self._set_busy(False)
+        # ИНН на вкладке вывода — того, под кем вошли, а не того, что был раньше.
+        self.withdrawal_tab.prefill_inn()
         self.notify(f"Вход выполнен: {service.current().title}", ToastKind.SUCCESS)
 
     def _on_sign_in_error(self, message: str) -> None:
@@ -1223,6 +1241,7 @@ class MarkingPage(QWidget):
             field.setText(value)
             field.blockSignals(False)
         self._suz_answer = ""
+        self._reload_suz_profiles()
         # Настроенное соединение не нужно держать развёрнутым: поля нужны один
         # раз, а место — каждый день. Ненастроенное — наоборот, показано сразу.
         self._set_suz_open(not saved.stripped().filled)
@@ -1247,7 +1266,7 @@ class MarkingPage(QWidget):
                                     else QLineEdit.EchoMode.Password)
 
     def save_suz(self) -> None:
-        saved = service.save_suz(self.suz_credentials, self.contour)
+        saved = self._store_suz(self.suz_credentials)
         self._show_suz(saved)
         if gaps := saved.missing:
             self.notify(f"Сохранено, но не хватает: {', '.join(gaps)}",
@@ -1286,7 +1305,7 @@ class MarkingPage(QWidget):
         """
         self._suz_answer = ""
         self._set_busy(False)
-        self._show_suz(service.save_suz(credentials, self.contour))
+        self._show_suz(self._store_suz(credentials))
         self.notify("Токен СУЗ получен по сертификату", ToastKind.SUCCESS)
         if credentials.filled:
             self.check_suz()
@@ -1322,7 +1341,7 @@ class MarkingPage(QWidget):
         # по дороге, и записать поверх него набранное в поле значило бы вернуть
         # протухший.
         renewed = credentials.token != self.suz_credentials.stripped().token
-        self._show_suz(service.save_suz(credentials, self.contour))
+        self._show_suz(self._store_suz(credentials))
         self._set_suz_open(False)
         self.notify(
             f"{answer} · токен обновлён по сертификату" if renewed
@@ -1338,9 +1357,70 @@ class MarkingPage(QWidget):
         self.notify(f"СУЗ не ответила: {message}", ToastKind.ERROR)
 
     def forget_suz(self) -> None:
+        """Забывает действующие реквизиты и профиль, под которым они записаны."""
+        name = self.suz_profile_box.currentText().strip()
         service.forget_suz(self.contour)
+        if name:
+            service.forget_suz_profile(name, self.contour)
         self._load_suz()
         self.notify(f"Реквизиты СУЗ забыты · {self.contour.title}", ToastKind.INFO)
+
+    # --- профили СУЗ -----------------------------------------------------------------
+
+    def _suz_profile_name(self, credentials: Credentials) -> str:
+        """Название для сохраняемого профиля: вписанное, иначе организация, иначе ОМС."""
+        typed = " ".join(self.suz_profile_box.currentText().split())
+        if typed:
+            return typed
+        if self.settings.marking_organisation.strip():
+            return self.settings.marking_organisation.strip()
+        if self.settings.marking_inn.strip():
+            return f"ИНН {self.settings.marking_inn.strip()}"
+        return f"ОМС {credentials.oms_id[:8]}"
+
+    def _store_suz(self, credentials: Credentials) -> Credentials:
+        """Сохраняет действующие реквизиты и записывает их профилем организации."""
+        saved = service.save_suz(credentials, self.contour)
+        if saved.oms_id:
+            service.save_suz_profile(
+                self._suz_profile_name(saved), saved, self.contour,
+                inn=self.settings.marking_inn,
+                organisation=self.settings.marking_organisation)
+            self._reload_suz_profiles()
+        return saved
+
+    def _reload_suz_profiles(self) -> None:
+        """Список профилей этого контура; в поле — профиль действующих реквизитов."""
+        profiles = service.suz_profiles(self.contour)
+        active = service.suz_credentials(self.contour).oms_id
+        box = self.suz_profile_box
+        box.blockSignals(True)
+        box.clear()
+        for profile in profiles:
+            box.addItem(profile.name, profile.name)
+        current = next((profile.name for profile in profiles
+                        if active and profile.credentials.oms_id == active), "")
+        box.setCurrentIndex(box.findData(current) if current else -1)
+        if not current:
+            box.setEditText("")
+        box.blockSignals(False)
+
+    def _use_suz_profile(self, index: int) -> None:
+        """Выбран профиль: его реквизиты становятся действующими — одним действием."""
+        name = self.suz_profile_box.itemData(index)
+        profile = service.use_suz_profile(str(name or ""), self.contour)
+        if profile is None:
+            return
+        # Токен по сертификату запрашивается за участника — того, чей профиль.
+        self.settings.marking_inn = profile.inn
+        self.settings.marking_organisation = profile.organisation
+        self.settings.save()
+        self._load_suz()
+        self.notify(
+            f"Профиль СУЗ: {profile.name}"
+            + (f" · ИНН {profile.inn}" if profile.inn else ""), ToastKind.SUCCESS)
+        self.reload_orders()
+        self._sync_state()
 
     # --- новый заказ ------------------------------------------------------------------
 

@@ -26,6 +26,12 @@
 кодов от имени организации. Наборов два, по одному на контур: песочница и бой —
 разные станции с разными устройствами, и путать их нельзя.
 
+Организаций у человека может быть несколько, и у каждой своя станция: вписывать
+её реквизиты заново при каждой смене — пытка. Поэтому рядом с действующим набором
+лежат **профили** — именованные наборы одного контура. Профиль выбирается одним
+действием и становится действующим; всё остальное в модуле работает с
+действующим набором и о профилях не знает.
+
 Что проверено обращением к живой системе, а не взято из описания: оба адреса
 отвечают на `/api/v3/ping` и на `/api/v3/auth/key`; непринятые реквизиты
 возвращаются кодом **400**, а не 401, и текст отказа лежит списком под
@@ -35,7 +41,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -170,6 +176,21 @@ class Credentials:
         return mask(self.token)
 
 
+@dataclass(frozen=True, slots=True)
+class Profile:
+    """Именованный набор реквизитов: одна организация — одна станция.
+
+    ИНН и название организации помнятся вместе с реквизитами: токен по
+    сертификату запрашивается за конкретного участника, и после смены профиля
+    запрашивать его надо за того, чей это профиль.
+    """
+
+    name: str
+    credentials: Credentials
+    inn: str = ""
+    organisation: str = ""
+
+
 def renewed(credentials: Credentials, token: str) -> Credentials:
     """Те же реквизиты с только что полученным токеном и отметкой времени."""
     return Credentials(
@@ -215,7 +236,14 @@ def save(credentials: Credentials, contour: Contour = Contour.SANDBOX) -> Creden
     cleaned = credentials.stripped()
     saved = _all()
     saved[contour.value] = cleaned
-    _write(saved)
+    # Токен живёт десять часов и обновляется сам: профиль той же станции должен
+    # получить свежий, иначе при возврате к нему вернулся бы протухший.
+    profiles = _profiles_all()
+    mine = profiles.get(contour.value, {})
+    for name, profile in list(mine.items()):
+        if cleaned.oms_id and profile.credentials.oms_id == cleaned.oms_id:
+            mine[name] = replace(profile, credentials=cleaned)
+    _write(saved, profiles)
     apply(cleaned, contour)
     return cleaned
 
@@ -230,6 +258,44 @@ def forget(contour: Contour = Contour.SANDBOX) -> None:
 
 def known(contour: Contour = Contour.SANDBOX) -> bool:
     return load(contour).filled
+
+
+def profiles(contour: Contour = Contour.SANDBOX) -> list[Profile]:
+    """Сохранённые профили контура по алфавиту."""
+    found = _profiles_all().get(contour.value, {})
+    return sorted(found.values(), key=lambda item: item.name.casefold())
+
+
+def save_profile(name: str, credentials: Credentials,
+                 contour: Contour = Contour.SANDBOX, inn: str = "",
+                 organisation: str = "") -> Profile:
+    """Запоминает набор под именем; одноимённый заменяется."""
+    label = " ".join(name.split())
+    if not label:
+        raise ValueError("У профиля должно быть название.")
+    profile = Profile(label, credentials.stripped(), inn.strip(), organisation.strip())
+    everything = _profiles_all()
+    everything.setdefault(contour.value, {})[label] = profile
+    _write(_all(), everything)
+    return profile
+
+
+def forget_profile(name: str, contour: Contour = Contour.SANDBOX) -> bool:
+    """Убирает профиль. Действующий набор остаётся: его забывают отдельно."""
+    everything = _profiles_all()
+    if everything.get(contour.value, {}).pop(" ".join(name.split()), None) is None:
+        return False
+    _write(_all(), everything)
+    return True
+
+
+def use_profile(name: str, contour: Contour = Contour.SANDBOX) -> Profile | None:
+    """Делает профиль действующим набором контура и ставит его адрес."""
+    profile = _profiles_all().get(contour.value, {}).get(" ".join(name.split()))
+    if profile is None:
+        return None
+    save(profile.credentials, contour)
+    return profile
 
 
 def restore() -> None:
@@ -260,39 +326,76 @@ DEFAULT_HOSTS: dict[Contour, str] = {
 }
 
 
-def _all() -> dict[str, Credentials]:
+def _raw() -> dict:
     try:
         with open(path(), encoding="utf-8") as handle:
             raw = json.load(handle)
     except (OSError, ValueError):
         return {}
-    if not isinstance(raw, dict):
-        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _credentials(item: dict) -> Credentials:
+    return Credentials(
+        oms_id=str(item.get("oms_id") or ""),
+        connection_id=str(item.get("connection_id") or ""),
+        token=str(item.get("token") or ""),
+        host=str(item.get("host") or ""),
+        issued_at=str(item.get("issued_at") or ""),
+    ).stripped()
+
+
+def _fields(item: Credentials) -> dict[str, str]:
+    return {
+        "oms_id": item.oms_id,
+        "connection_id": item.connection_id,
+        "token": item.token,
+        "host": item.host,
+        "issued_at": item.issued_at,
+    }
+
+
+def _all() -> dict[str, Credentials]:
+    raw = _raw()
     found: dict[str, Credentials] = {}
     for contour in (Contour.SANDBOX, Contour.PRODUCTION):
         item = raw.get(contour.value)
         if isinstance(item, dict):
-            found[contour.value] = Credentials(
-                oms_id=str(item.get("oms_id") or ""),
-                connection_id=str(item.get("connection_id") or ""),
-                token=str(item.get("token") or ""),
-                host=str(item.get("host") or ""),
-                issued_at=str(item.get("issued_at") or ""),
-            ).stripped()
+            found[contour.value] = _credentials(item)
     return found
 
 
-def _write(everything: dict[str, Credentials]) -> None:
-    payload = {
-        name: {
-            "oms_id": item.oms_id,
-            "connection_id": item.connection_id,
-            "token": item.token,
-            "host": item.host,
-            "issued_at": item.issued_at,
-        }
-        for name, item in everything.items()
-    }
+def _profiles_all() -> dict[str, dict[str, Profile]]:
+    section = _raw().get("profiles")
+    found: dict[str, dict[str, Profile]] = {}
+    if not isinstance(section, dict):
+        return found
+    for contour in (Contour.SANDBOX, Contour.PRODUCTION):
+        named = section.get(contour.value)
+        if not isinstance(named, dict):
+            continue
+        for name, item in named.items():
+            if isinstance(item, dict) and str(name).strip():
+                found.setdefault(contour.value, {})[str(name)] = Profile(
+                    name=str(name), credentials=_credentials(item),
+                    inn=str(item.get("inn") or "").strip(),
+                    organisation=str(item.get("organisation") or "").strip())
+    return found
+
+
+def _write(everything: dict[str, Credentials],
+           named: dict[str, dict[str, Profile]] | None = None) -> None:
+    """Пишет файл целиком. Профили, которых не передали, сохраняются как были."""
+    if named is None:
+        named = _profiles_all()
+    payload: dict[str, Any] = {name: _fields(item) for name, item in everything.items()}
+    if any(named.values()):
+        payload["profiles"] = {
+            contour: {
+                name: {**_fields(profile.credentials), "inn": profile.inn,
+                       "organisation": profile.organisation}
+                for name, profile in profiles.items()}
+            for contour, profiles in named.items() if profiles}
     target = path()
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if directory := os.path.dirname(target):

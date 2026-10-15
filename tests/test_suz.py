@@ -245,6 +245,84 @@ def test_токен_лежит_отдельно_от_общих_настроек
         assert json.load(handle)["sandbox"]["token"] == TOKEN
 
 
+# --- профили организаций ------------------------------------------------------------
+
+OTHER = suz.Credentials(oms_id="второй-омс", connection_id="второе-соединение",
+                        token="второй-токен", host="https://suz.example.ru")
+
+
+def test_профиль_запоминается_и_переживает_перезапуск():
+    suz.save_profile(" ИП  Саух ", FULL, Contour.SANDBOX, inn="250101802801",
+                     organisation="ИП Саух М.Н.")
+
+    [profile] = suz.profiles(Contour.SANDBOX)
+
+    assert profile.name == "ИП Саух"
+    assert profile.credentials == FULL
+    assert (profile.inn, profile.organisation) == ("250101802801", "ИП Саух М.Н.")
+    assert suz.profiles(Contour.PRODUCTION) == []
+
+
+def test_профиль_без_названия_не_создаётся():
+    with pytest.raises(ValueError):
+        suz.save_profile("   ", FULL, Contour.SANDBOX)
+
+
+def test_выбор_профиля_делает_его_действующим_и_ставит_адрес():
+    suz.save_profile("Один", FULL, Contour.SANDBOX)
+    suz.save_profile("Два", OTHER, Contour.SANDBOX)
+    suz.save(FULL, Contour.SANDBOX)
+
+    chosen = suz.use_profile("Два", Contour.SANDBOX)
+
+    assert chosen is not None and chosen.name == "Два"
+    assert suz.load(Contour.SANDBOX) == OTHER.stripped()
+    assert transport.HOSTS[("suz", Contour.SANDBOX)] == "https://suz.example.ru"
+    assert suz.use_profile("Нет такого", Contour.SANDBOX) is None
+    assert suz.load(Contour.SANDBOX) == OTHER.stripped()
+
+
+def test_обновлённый_токен_попадает_и_в_профиль_той_же_станции():
+    suz.save_profile("Один", FULL, Contour.SANDBOX)
+    suz.save_profile("Два", OTHER, Contour.SANDBOX)
+
+    suz.save(suz.renewed(FULL, "свежий-токен"), Contour.SANDBOX)
+
+    by_name = {item.name: item for item in suz.profiles(Contour.SANDBOX)}
+    assert by_name["Один"].credentials.token == "свежий-токен"
+    assert by_name["Два"].credentials.token == "второй-токен"
+
+
+def test_профили_не_теряются_при_сохранении_и_забывании_действующего_набора():
+    suz.save_profile("Один", FULL, Contour.SANDBOX)
+
+    suz.save(OTHER, Contour.SANDBOX)
+    suz.forget(Contour.SANDBOX)
+
+    assert [item.name for item in suz.profiles(Contour.SANDBOX)] == ["Один"]
+    assert not suz.known(Contour.SANDBOX)
+
+
+def test_профиль_можно_забыть():
+    suz.save_profile("Один", FULL, Contour.SANDBOX)
+    suz.save_profile("Два", OTHER, Contour.SANDBOX)
+
+    assert suz.forget_profile("Один", Contour.SANDBOX) is True
+    assert suz.forget_profile("Один", Contour.SANDBOX) is False
+
+    assert [item.name for item in suz.profiles(Contour.SANDBOX)] == ["Два"]
+
+
+def test_профили_идут_по_алфавиту_а_файл_старого_вида_читается():
+    suz.save(FULL, Contour.SANDBOX)    # файл без раздела профилей
+    assert suz.profiles(Contour.SANDBOX) == []
+    suz.save_profile("б", FULL, Contour.SANDBOX)
+    suz.save_profile("А", OTHER, Contour.SANDBOX)
+
+    assert [item.name for item in suz.profiles(Contour.SANDBOX)] == ["А", "б"]
+    assert suz.load(Contour.SANDBOX) == FULL
+
+
 def test_испорченный_файл_читается_как_пустой():
     os.makedirs(os.path.dirname(suz.path()), exist_ok=True)
     with open(suz.path(), "w", encoding="utf-8") as handle:

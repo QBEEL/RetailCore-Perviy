@@ -31,6 +31,7 @@ from app.core.marking.models import (
     OperationStatus,
 )
 from app.core.marking.orders import Buffer, Order, ReleaseMethod
+from app.core.marking import suz
 from app.core.marking.suz import Credentials
 from app.core.marking.session import Organisation, Session
 from app.core.marking.transport import MarkingError
@@ -76,6 +77,7 @@ def stub(monkeypatch):
                                      subject="CN=Иванов Евгений, ИНН=2536000000",
                                      has_private_key=True)],
         "crypto": True,
+        "profiles": {},
         "answer": [],
         "history": [],
         # Реквизиты СУЗ, сохранённые «в профиле»: настоящий файл в тестах не
@@ -126,6 +128,25 @@ def stub(monkeypatch):
     def forget_suz(contour=Contour.SANDBOX):
         state["suz"].pop(contour, None)
 
+    def suz_profiles(contour=Contour.SANDBOX):
+        return sorted(state["profiles"].get(contour, {}).values(),
+                      key=lambda item: item.name)
+
+    def save_suz_profile(name, credentials, contour=Contour.SANDBOX, inn="",
+                         organisation=""):
+        profile = suz.Profile(name, credentials.stripped(), inn, organisation)
+        state["profiles"].setdefault(contour, {})[name] = profile
+        return profile
+
+    def forget_suz_profile(name, contour=Contour.SANDBOX):
+        return state["profiles"].get(contour, {}).pop(name, None) is not None
+
+    def use_suz_profile(name, contour=Contour.SANDBOX):
+        profile = state["profiles"].get(contour, {}).get(name)
+        if profile is not None:
+            state["suz"][contour] = profile.credentials
+        return profile
+
     def check_suz(credentials, contour=Contour.SANDBOX, thumbprint="", inn=""):
         calls["suz_checked"].append((credentials.stripped(), contour))
         if state["suz_error"]:
@@ -152,6 +173,11 @@ def stub(monkeypatch):
     monkeypatch.setattr(marking_page.service, "suz_credentials", suz_credentials)
     monkeypatch.setattr(marking_page.service, "save_suz", save_suz)
     monkeypatch.setattr(marking_page.service, "forget_suz", forget_suz)
+    monkeypatch.setattr(marking_page.service, "suz_profiles", suz_profiles)
+    monkeypatch.setattr(marking_page.service, "save_suz_profile", save_suz_profile)
+    monkeypatch.setattr(marking_page.service, "forget_suz_profile",
+                        forget_suz_profile)
+    monkeypatch.setattr(marking_page.service, "use_suz_profile", use_suz_profile)
     monkeypatch.setattr(marking_page.service, "check_suz", check_suz)
     monkeypatch.setattr(marking_page.service, "restore_suz", lambda: None)
     monkeypatch.setattr(marking_page.service, "crypto_available",
@@ -859,6 +885,106 @@ def test_отказ_суз_ничего_не_сохраняет(application, tmp
 
     assert state["suz"] == {}
     assert "СУЗ не приняла токен" in page.suz_hint.text()
+
+
+OTHER_SUZ = Credentials(oms_id="oms-вторая", connection_id="соединение-2",
+                        token="токен-второй-организации")
+
+
+def test_профиль_суз_переключает_все_реквизиты_одним_выбором(application, tmp_path, stub):
+    _, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["profiles"] = {Contour.SANDBOX: {
+        "ИП Саух": suz.Profile("ИП Саух", SUZ, "250101802801", "ИП Саух М.Н."),
+        "ООО Ромашка": suz.Profile("ООО Ромашка", OTHER_SUZ, "2536000000",
+                                   "ООО «Ромашка»")}}
+    page = _page(application, tmp_path)
+    box = page.suz_profile_box
+
+    # Действующим реквизитам соответствует свой профиль — он и показан.
+    assert [box.itemText(i) for i in range(box.count())] == ["ИП Саух", "ООО Ромашка"]
+    assert box.currentText() == "ИП Саух"
+
+    box.activated.emit(box.findData("ООО Ромашка"))
+    _settle(application)
+
+    assert page.oms_edit.text() == "oms-вторая"
+    assert page.token_edit.text() == "токен-второй-организации"
+    assert state["suz"][Contour.SANDBOX] == OTHER_SUZ
+    # ИНН организации — для получения токена за неё по сертификату.
+    assert page.settings.marking_inn == "2536000000"
+    assert page.settings.marking_organisation == "ООО «Ромашка»"
+    assert box.currentText() == "ООО Ромашка"
+
+
+def test_реквизиты_нового_профиля_записываются_под_вписанным_названием(
+        application, tmp_path, stub):
+    _, state = stub
+    page = _page(application, tmp_path)
+    _fill_suz(page, SUZ)
+    page.suz_profile_box.setEditText("ИП Саух")
+
+    page.save_suz()
+
+    assert state["suz"][Contour.SANDBOX] == SUZ
+    [profile] = state["profiles"][Contour.SANDBOX].values()
+    assert profile.name == "ИП Саух" and profile.credentials == SUZ
+    assert page.suz_profile_box.currentText() == "ИП Саух"
+
+
+def test_без_названия_профиль_называется_по_организации(application, tmp_path, stub):
+    _, state = stub
+    page = _page(application, tmp_path)
+    page.settings.marking_organisation = "ООО «Ромашка»"
+    page.settings.marking_inn = "2536000000"
+    _fill_suz(page, SUZ)
+
+    page.save_suz()
+
+    [profile] = state["profiles"][Contour.SANDBOX].values()
+    assert profile.name == "ООО «Ромашка»" and profile.inn == "2536000000"
+
+
+def test_удачная_проверка_суз_тоже_запоминает_профиль(application, tmp_path, stub):
+    _, state = stub
+    page = _page(application, tmp_path)
+    _fill_suz(page, SUZ)
+    page.suz_profile_box.setEditText("ИП Саух")
+
+    page.check_suz()
+    _settle(application)
+
+    assert list(state["profiles"][Contour.SANDBOX]) == ["ИП Саух"]
+
+
+def test_забыть_реквизиты_убирает_и_их_профиль_но_не_чужие(application, tmp_path, stub):
+    _, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["profiles"] = {Contour.SANDBOX: {
+        "ИП Саух": suz.Profile("ИП Саух", SUZ),
+        "ООО Ромашка": suz.Profile("ООО Ромашка", OTHER_SUZ)}}
+    page = _page(application, tmp_path)
+
+    page.forget_suz()
+
+    assert list(state["profiles"][Contour.SANDBOX]) == ["ООО Ромашка"]
+    assert page.suz_profile_box.count() == 1
+    assert page.suz_profile_box.currentText() == ""
+
+
+def test_профили_суз_свои_у_каждого_контура(application, tmp_path, stub):
+    _, state = stub
+    state["profiles"] = {
+        Contour.SANDBOX: {"Песочница": suz.Profile("Песочница", SUZ)},
+        Contour.PRODUCTION: {"Бой": suz.Profile("Бой", OTHER_SUZ)}}
+    page = _page(application, tmp_path)
+    assert page.suz_profile_box.itemText(0) == "Песочница"
+
+    page.contour_box.setCurrentIndex(
+        page.contour_box.findData(Contour.PRODUCTION.value))
+
+    assert [page.suz_profile_box.itemText(i)
+            for i in range(page.suz_profile_box.count())] == ["Бой"]
 
 
 def test_токен_суз_не_видно_на_экране(application, tmp_path, stub):
