@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -55,6 +56,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -69,6 +71,7 @@ from ..core.marking import (
     Organisation,
     codes as codes_module,
 )
+from ..core.marking import deadlines
 from ..core.marking import issue as issue_module
 from ..core.marking import introduce as introduce_module
 from ..core.marking import orders as orders_module, service
@@ -264,6 +267,17 @@ class MarkingPage(QWidget):
         heading = QHBoxLayout()
         heading.setSpacing(12)
         heading.addWidget(Title("Маркировка", self))
+        # Памятка о сроках обязательной маркировки: можно ли продать вещь без
+        # кода, знать нужно каждому сотруднику, а не только тому, кто ведёт
+        # маркировку. Свёрнута, но о близкой дате напоминает прямо на кнопке.
+        self.deadlines_button = QPushButton("Сроки маркировки", self)
+        self.deadlines_button.setIcon(icons.icon("calendar"))
+        self.deadlines_button.setCheckable(True)
+        self.deadlines_button.setToolTip(
+            "Памятка: с какой даты по каждой товарной группе маркировка "
+            "обязательна и что ещё впереди")
+        self.deadlines_button.toggled.connect(self._toggle_deadlines)
+        heading.addWidget(self.deadlines_button)
         heading.addStretch(1)
         self.identity_badge = Badge("", Palette.TEXT_MUTED, Palette.SURFACE_ALT, self)
         self.identity_badge.setTextInteractionFlags(
@@ -274,6 +288,16 @@ class MarkingPage(QWidget):
         # занимал две строки и на каждой вкладке был на четыре пятых не о ней.
         self.subtitle = Subtitle(TAB_SUBTITLES[CHECK_TAB], self)
         root.addWidget(self.subtitle)
+
+        self.deadlines_card = Card(self)
+        self.deadlines_text = QTextBrowser(self.deadlines_card)
+        self.deadlines_text.setFrameShape(QFrame.Shape.NoFrame)
+        self.deadlines_text.setOpenExternalLinks(True)
+        self.deadlines_text.setMinimumHeight(260)
+        self.deadlines_text.setMaximumHeight(340)
+        self.deadlines_card.body().addWidget(self.deadlines_text)
+        self.deadlines_card.hide()
+        root.addWidget(self.deadlines_card)
 
         # Подвкладки, а не одна длинная страница: работы здесь три, и они не
         # пересекаются. Проверка кодов идёт через ГИС МТ по сертификату, заказ —
@@ -2999,11 +3023,44 @@ class MarkingPage(QWidget):
         if not self._busy:
             self.session_hint.setText(self._session_summary())
         self._sync_identity()
+        self._sync_deadlines()
         # Боевой контур помечается цветом всегда: в песочнице ошибка ничего не
         # стоит, а здесь — стоит, и знать об этом нужно до нажатия, а не после.
         self.session_hint.setStyleSheet(
             f"color: {Palette.DANGER};"
             if self.contour is Contour.PRODUCTION else "")
+
+    def _toggle_deadlines(self, shown: bool) -> None:
+        self.deadlines_card.setVisible(shown)
+        self._sync_deadlines()
+
+    def _sync_deadlines(self) -> None:
+        """Текст памятки и подпись кнопки — по сегодняшней дате.
+
+        Дата берётся каждый раз заново: окно живёт днями, и «через 12 дней»
+        вчерашнего открытия сегодня было бы неправдой.
+        """
+        # На кнопке — только ближайшая дата: подпись с названием группы раздувала
+        # её на пол-заголовка. Что за дата, видно в подсказке и в самой памятке.
+        found = deadlines.upcoming()
+        compact = "padding: 3px 10px; font-size: 12px;"
+        if found:
+            self.deadlines_button.setText(
+                f"Сроки маркировки · {deadlines.short_date(found[0][1].day)}")
+            self.deadlines_button.setToolTip(
+                "Скоро меняются сроки:" + "\n" + "\n".join(
+                    f"{item.day:%d.%m.%Y} — {group.title}" for group, item in found))
+            self.deadlines_button.setStyleSheet(
+                f"color: {Palette.WARNING}; font-weight: 600; {compact}")
+        else:
+            self.deadlines_button.setText("Сроки маркировки")
+            self.deadlines_button.setToolTip(
+                "Памятка: с какой даты по каждой товарной группе маркировка "
+                "обязательна и что ещё впереди")
+            self.deadlines_button.setStyleSheet(compact)
+        if self.deadlines_card.isVisible() or not self.deadlines_text.toPlainText():
+            self.deadlines_text.setHtml(deadlines.as_html(
+                muted=Palette.TEXT_MUTED, accent=Palette.WARNING))
 
     def _sync_identity(self) -> None:
         """Плашка в заголовке: под кем выполнен вход и в каком контуре.
