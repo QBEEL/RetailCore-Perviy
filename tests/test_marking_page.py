@@ -293,6 +293,97 @@ def test_без_входа_проверка_недоступна(application, tm
     assert not page.check_button.isEnabled()
 
 
+# --- плашка «под кем работаю» в заголовке --------------------------------------------
+
+def test_до_входа_в_заголовке_сказано_что_входа_нет(application, tmp_path, stub):
+    page = _page(application, tmp_path)
+
+    text = page.identity_badge.text()
+
+    assert text.startswith("Вход не выполнен") and Contour.SANDBOX.title in text
+
+
+def test_до_входа_показано_под_кем_вход_будет(application, tmp_path, stub):
+    page = _page(application, tmp_path)
+    page.settings.marking_inn = "2536000000"
+    page.settings.marking_organisation = "ООО «Ромашка»"
+
+    page._sync_state()
+
+    assert "будет под: ООО «Ромашка» · ИНН 2536000000" in page.identity_badge.text()
+
+
+def test_после_входа_видно_организацию_инн_и_контур_на_любой_вкладке(
+        application, tmp_path, stub):
+    from app.ui.marking_page import SALE_TAB, WITHDRAWAL_TAB
+
+    _, state = stub
+    state["signed"] = True
+    page = _page(application, tmp_path)
+
+    text = page.identity_badge.text()
+
+    assert text == "Вход: ООО «Ромашка» · ИНН 2536000000 · " + Contour.SANDBOX.title
+    # Плашка стоит в заголовке страницы, а не внутри вкладки, — видна везде.
+    for tab in (WITHDRAWAL_TAB, SALE_TAB):
+        page.tabs.setCurrentIndex(tab)
+        assert page.identity_badge.text() == text
+        assert not page.tabs.widget(tab).isAncestorOf(page.identity_badge)
+
+
+def test_вошли_плашка_зелёная_не_вошли_красная(application, tmp_path, stub):
+    from app.ui.theme import Palette
+
+    _, state = stub
+    page = _page(application, tmp_path)
+    assert Palette.DANGER in page.identity_badge.styleSheet()
+    assert Palette.SUCCESS not in page.identity_badge.styleSheet()
+
+    state["signed"] = True
+    page._sync_state()
+
+    assert Palette.SUCCESS in page.identity_badge.styleSheet()
+    assert Palette.DANGER not in page.identity_badge.styleSheet()
+
+
+def test_боевой_контур_назван_в_плашке_и_тоже_зелёный_при_входе(
+        application, tmp_path, stub):
+    from app.ui.theme import Palette
+
+    _, state = stub
+    state["signed"] = True
+    state["session"] = Session(contour=Contour.PRODUCTION, token="т",
+                               owner="Иванов Евгений", organisation="ООО «Ромашка»",
+                               inn="2536000000")
+    page = _page(application, tmp_path)
+
+    assert Contour.PRODUCTION.title in page.identity_badge.text()
+    assert Palette.SUCCESS in page.identity_badge.styleSheet()
+
+
+def test_плашка_следует_за_входом_и_выходом(application, tmp_path, stub):
+    _, state = stub
+    page = _page(application, tmp_path)
+    assert page.identity_badge.text().startswith("Вход не выполнен")
+
+    state["signed"] = True
+    page._sync_state()
+    assert page.identity_badge.text().startswith("Вход: ООО «Ромашка»")
+
+    page.sign_out()
+    assert page.identity_badge.text().startswith("Вход не выполнен")
+
+
+def test_в_плашке_виден_профиль_суз(application, tmp_path, stub):
+    _, state = stub
+    state["signed"] = True
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["profiles"] = {Contour.SANDBOX: {"ИП Саух": suz.Profile("ИП Саух", SUZ)}}
+    page = _page(application, tmp_path)
+
+    assert page.identity_badge.text().endswith("СУЗ: ИП Саух")
+
+
 def test_вход_запоминает_сертификат(application, tmp_path, stub):
     calls, _ = stub
     page = _page(application, tmp_path)
@@ -303,6 +394,115 @@ def test_вход_запоминает_сертификат(application, tmp_pat
     assert calls["signed_in"] == [("ААББ", "", Contour.SANDBOX)]
     assert page.settings.marking_thumbprint == "ААББ"
     assert "ООО «Ромашка»" in page.session_hint.text()
+
+
+# --- СУЗ следует за организацией входа -----------------------------------------------
+
+IVAN_SUZ = Credentials(oms_id="oms-иван", connection_id="соединение-ивана",
+                       token="токен-ивана-длинный")
+MARIA_SUZ = Credentials(oms_id="oms-мария", connection_id="соединение-марии",
+                        token="токен-марии-длинный")
+
+
+def _two_profiles(state) -> None:
+    state["profiles"] = {Contour.SANDBOX: {
+        "Иван": suz.Profile("Иван", IVAN_SUZ, IVAN.inn, IVAN.name),
+        "Мария": suz.Profile("Мария", MARIA_SUZ, MARIA.inn, MARIA.name)}}
+
+
+def test_вход_под_марией_переключает_суз_на_марию(application, tmp_path, stub):
+    _, state = stub
+    _two_profiles(state)
+    state["suz"] = {Contour.SANDBOX: IVAN_SUZ}
+    state["session"] = Session(contour=Contour.SANDBOX, token="т",
+                               owner="Саух Мария", organisation=MARIA.name,
+                               inn=MARIA.inn)
+    page = _page(application, tmp_path)
+    toasts: list[str] = []
+    page.notify = lambda text, kind: toasts.append(text)
+    assert page.oms_edit.text() == "oms-иван"
+
+    page.sign_in()
+    _settle(application)
+
+    assert page.oms_edit.text() == "oms-мария"
+    assert page.token_edit.text() == "токен-марии-длинный"
+    assert state["suz"][Contour.SANDBOX] == MARIA_SUZ
+    assert page.suz_profile_box.currentText() == "Мария"
+    assert any("«Мария»" in text for text in toasts)
+    assert "СУЗ: Мария" in page.identity_badge.text()
+
+
+def test_суз_уже_на_нужной_организации_не_переключается(application, tmp_path, stub):
+    _, state = stub
+    _two_profiles(state)
+    state["suz"] = {Contour.SANDBOX: MARIA_SUZ}
+    state["session"] = Session(contour=Contour.SANDBOX, token="т",
+                               owner="Саух Мария", organisation=MARIA.name,
+                               inn=MARIA.inn)
+    page = _page(application, tmp_path)
+    toasts: list[str] = []
+    page.notify = lambda text, kind: toasts.append(text)
+    asked = len(stub[0]["orders_asked"])
+
+    page.sign_in()
+    _settle(application)
+
+    assert not any("переключена" in text for text in toasts)
+    assert len(stub[0]["orders_asked"]) == asked
+
+
+def test_без_профиля_организации_суз_не_трогается_но_об_этом_говорится(
+        application, tmp_path, stub):
+    _, state = stub
+    state["profiles"] = {Contour.SANDBOX: {
+        "Иван": suz.Profile("Иван", IVAN_SUZ, IVAN.inn, IVAN.name)}}
+    state["suz"] = {Contour.SANDBOX: IVAN_SUZ}
+    state["session"] = Session(contour=Contour.SANDBOX, token="т",
+                               owner="Саух Мария", organisation=MARIA.name,
+                               inn=MARIA.inn)
+    page = _page(application, tmp_path)
+    toasts: list[str] = []
+    page.notify = lambda text, kind: toasts.append(text)
+
+    page.sign_in()
+    _settle(application)
+
+    assert state["suz"][Contour.SANDBOX] == IVAN_SUZ
+    assert any(MARIA.inn in text and "нет профиля СУЗ" in text for text in toasts)
+
+
+def test_реквизиты_без_профиля_не_теряются_при_переключении(application, tmp_path, stub):
+    _, state = stub
+    state["profiles"] = {Contour.SANDBOX: {
+        "Мария": suz.Profile("Мария", MARIA_SUZ, MARIA.inn, MARIA.name)}}
+    state["suz"] = {Contour.SANDBOX: IVAN_SUZ}      # вписаны до профилей
+    state["session"] = Session(contour=Contour.SANDBOX, token="т",
+                               owner="Саух Мария", organisation=MARIA.name,
+                               inn=MARIA.inn)
+    page = _page(application, tmp_path)
+
+    page.sign_in()
+    _settle(application)
+
+    saved = {item.credentials.oms_id for item in
+             state["profiles"][Contour.SANDBOX].values()}
+    assert saved == {"oms-иван", "oms-мария"}
+
+
+def test_профиль_запоминает_инн_вошедшей_организации(application, tmp_path, stub):
+    _, state = stub
+    state["signed"] = True
+    state["session"] = Session(contour=Contour.SANDBOX, token="т",
+                               owner="Саух Мария", organisation=MARIA.name,
+                               inn=MARIA.inn)
+    page = _page(application, tmp_path)
+    _fill_suz(page, MARIA_SUZ)
+
+    page.save_suz()
+
+    [profile] = state["profiles"][Contour.SANDBOX].values()
+    assert profile.inn == MARIA.inn and profile.organisation == MARIA.name
 
 
 # --- выбор организации ---------------------------------------------------------------

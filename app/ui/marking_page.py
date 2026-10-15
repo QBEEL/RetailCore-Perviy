@@ -82,7 +82,15 @@ from ..core.settings import AppSettings
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
-from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title
+from .widgets.common import (
+    Badge,
+    Card,
+    Hint,
+    MetricTile,
+    SectionTitle,
+    Subtitle,
+    Title,
+)
 from .widgets.expiry_tab import ExpiryTab
 from .widgets.issue_dialogs import IntroduceDialog, IssueDialog, PrintDialog
 from .widgets.order_dialog import OrderDialog, _plural
@@ -251,7 +259,17 @@ class MarkingPage(QWidget):
                                 Metrics.PAD)
         root.setSpacing(Metrics.GAP)
 
-        root.addWidget(Title("Маркировка", self))
+        # Под какой организацией работа идёт — на виду во всех вкладках: чтобы не
+        # листать к «Проверке кодов» ради одного вопроса.
+        heading = QHBoxLayout()
+        heading.setSpacing(12)
+        heading.addWidget(Title("Маркировка", self))
+        heading.addStretch(1)
+        self.identity_badge = Badge("", Palette.TEXT_MUTED, Palette.SURFACE_ALT, self)
+        self.identity_badge.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        heading.addWidget(self.identity_badge)
+        root.addLayout(heading)
         # Одна строка про открытую подвкладку. Общий абзац про все пять сразу
         # занимал две строки и на каждой вкладке был на четыре пятых не о ней.
         self.subtitle = Subtitle(TAB_SUBTITLES[CHECK_TAB], self)
@@ -1129,6 +1147,9 @@ class MarkingPage(QWidget):
         # ИНН на вкладке вывода — того, под кем вошли, а не того, что был раньше.
         self.withdrawal_tab.prefill_inn()
         self.notify(f"Вход выполнен: {service.current().title}", ToastKind.SUCCESS)
+        # Вошли за другую организацию — СУЗ должна работать за неё же, а не за
+        # ту, чьи реквизиты остались от прошлого раза.
+        self._follow_organisation()
 
     def _on_sign_in_error(self, message: str) -> None:
         self._set_busy(False)
@@ -1382,12 +1403,26 @@ class MarkingPage(QWidget):
         """Сохраняет действующие реквизиты и записывает их профилем организации."""
         saved = service.save_suz(credentials, self.contour)
         if saved.oms_id:
+            inn, organisation = self._login_organisation()
             service.save_suz_profile(
                 self._suz_profile_name(saved), saved, self.contour,
-                inn=self.settings.marking_inn,
-                organisation=self.settings.marking_organisation)
+                inn=inn, organisation=organisation)
             self._reload_suz_profiles()
         return saved
+
+    def _login_organisation(self) -> tuple[str, str]:
+        """ИНН и название организации: вошедшей, иначе выбранной для входа.
+
+        Вход по сертификату одной организации обходится без выбора из списка, и
+        тогда ИНН есть только у самой сессии — а профиль должен его помнить,
+        иначе при следующем входе его не найти.
+        """
+        if service.signed_in():
+            current = service.current()
+            if current.inn:
+                return current.inn, (current.organisation
+                                     or self.settings.marking_organisation)
+        return self.settings.marking_inn, self.settings.marking_organisation
 
     def _reload_suz_profiles(self) -> None:
         """Список профилей этого контура; в поле — профиль действующих реквизитов."""
@@ -1404,10 +1439,56 @@ class MarkingPage(QWidget):
         if not current:
             box.setEditText("")
         box.blockSignals(False)
+        if hasattr(self, "identity_badge"):
+            self._sync_identity()
+
+    def _follow_organisation(self) -> None:
+        """После входа переключает СУЗ на профиль вошедшей организации — по ИНН.
+
+        Профиля нет — реквизиты не трогаются, но об этом говорится прямо: заказ
+        кодов от чужого имени хуже, чем заказ, который не удался.
+        """
+        inn = (service.current().inn or "").strip()
+        if not inn:
+            return
+        profiles = service.suz_profiles(self.contour)
+        active = service.suz_credentials(self.contour).stripped()
+        match = next((item for item in profiles if item.inn == inn), None)
+        if match is None:
+            if active.oms_id:
+                self.notify(
+                    f"Для ИНН {inn} нет профиля СУЗ: действуют реквизиты прежней "
+                    "организации. Впишите реквизиты этой и нажмите «Сохранить».",
+                    ToastKind.WARNING)
+            return
+        if active.oms_id == match.credentials.oms_id:
+            return
+        self._keep_active_suz(profiles, active)
+        if service.use_suz_profile(match.name, self.contour) is None:
+            return
+        self._load_suz()
+        self.notify(f"СУЗ переключена на профиль «{match.name}» · ИНН {inn}",
+                    ToastKind.INFO)
+        self.reload_orders()
+        self._sync_state()
+
+    def _keep_active_suz(self, profiles: list, active: Credentials) -> None:
+        """Реквизиты без профиля перед заменой записываются профилем.
+
+        Они могли быть вписаны до появления профилей и нигде больше не лежат:
+        молча затереть их — значит заставить вписывать токен и ОМС ID заново.
+        """
+        if not active.oms_id or any(
+                item.credentials.oms_id == active.oms_id for item in profiles):
+            return
+        service.save_suz_profile(f"Прежние реквизиты (ОМС {active.oms_id[:8]})",
+                                 active, self.contour)
 
     def _use_suz_profile(self, index: int) -> None:
         """Выбран профиль: его реквизиты становятся действующими — одним действием."""
         name = self.suz_profile_box.itemData(index)
+        self._keep_active_suz(service.suz_profiles(self.contour),
+                              service.suz_credentials(self.contour).stripped())
         profile = service.use_suz_profile(str(name or ""), self.contour)
         if profile is None:
             return
@@ -2917,11 +2998,56 @@ class MarkingPage(QWidget):
             self._selected_batch() is not None and not self._busy)
         if not self._busy:
             self.session_hint.setText(self._session_summary())
+        self._sync_identity()
         # Боевой контур помечается цветом всегда: в песочнице ошибка ничего не
         # стоит, а здесь — стоит, и знать об этом нужно до нажатия, а не после.
         self.session_hint.setStyleSheet(
             f"color: {Palette.DANGER};"
             if self.contour is Contour.PRODUCTION else "")
+
+    def _sync_identity(self) -> None:
+        """Плашка в заголовке: под кем выполнен вход и в каком контуре.
+
+        Вошли — зелёным, не вошли — красным: цвет отвечает только на вопрос
+        «есть ли вход». Контур назван в тексте. Без входа показывается, под кем
+        он будет, — тот же вопрос, что и «под кем я сейчас».
+        """
+        if service.signed_in():
+            current = service.current()
+            who = current.organisation or current.owner or "организация не указана"
+            parts = [who]
+            if current.inn:
+                parts.append(f"ИНН {current.inn}")
+            parts.append(current.contour.title)
+            if profile := self._active_suz_profile():
+                parts.append(f"СУЗ: {profile}")
+            colours = (Palette.SUCCESS, Palette.SUCCESS_SOFT)
+            self.identity_badge.setText("Вход: " + " · ".join(parts))
+            self.identity_badge.setToolTip(
+                f"Вход выполнен под организацией {who}"
+                + (f", ИНН {current.inn}" if current.inn else "")
+                + f". Контур: {current.contour.title}. Сменить организацию — "
+                "на вкладке «Проверка кодов».")
+        else:
+            parts = ["Вход не выполнен"]
+            if self.settings.marking_inn:
+                name = self.settings.marking_organisation or "организация"
+                parts.append(f"будет под: {name} · ИНН {self.settings.marking_inn}")
+            parts.append(self.contour.title)
+            colours = (Palette.DANGER, Palette.DANGER_SOFT)
+            self.identity_badge.setText(" · ".join(parts))
+            self.identity_badge.setToolTip(
+                "Вход в систему маркировки на вкладке «Проверка кодов»: "
+                "сертификат → «Войти».")
+        self.identity_badge.set_colors(*colours)
+
+    def _active_suz_profile(self) -> str:
+        """Название профиля СУЗ, чьи реквизиты сейчас действуют, — если они есть."""
+        active = service.suz_credentials(self.contour).oms_id
+        if not active:
+            return ""
+        return next((profile.name for profile in service.suz_profiles(self.contour)
+                     if profile.credentials.oms_id == active), "")
 
     def _session_summary(self) -> str:
         if not self._crypto_available:
