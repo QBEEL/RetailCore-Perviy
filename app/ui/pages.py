@@ -48,6 +48,8 @@ PAGES = (
     Page("marking", "Маркировка", "marking", "Ctrl+M"),
     # Буквенное сочетание по той же причине, что у маркировки.
     Page("labels", "Этикетки", "label", "Ctrl+L"),
+    # Буквенное сочетание по той же причине, что у маркировки.
+    Page("notes", "Заметки", "notes", "Ctrl+N"),
     Page("reports", "Отчётность", "report", "Ctrl+6"),
     Page("catalog", "Каталог", "catalog", "Ctrl+7"),
     Page("history", "История данных", "history", "Ctrl+8"),

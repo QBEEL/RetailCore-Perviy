@@ -28,6 +28,7 @@ from .history_page import HistoryPage
 from .labels_page import LabelsPage
 from .marking_page import MarkingPage
 from .match_page import MatchPage
+from .notes_page import NotesPage
 from .order_page import OrderPage
 from .payments_page import PaymentsPage
 from .profile_page import ProfilePage
@@ -125,6 +126,7 @@ class MainWindow(QMainWindow):
         self.suppliers_page = SuppliersPage(settings, self.notify, self.pages)
         self.marking_page = MarkingPage(settings, self.notify, self.pages)
         self.labels_page = LabelsPage(settings, self.notify, self.pages)
+        self.notes_page = NotesPage(settings, self.notify, self.pages)
         self.reports_page = ReportsPage(settings, self.notify, self.pages)
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
@@ -136,7 +138,7 @@ class MainWindow(QMainWindow):
                                         self.sign_out)
         for page in (self.match_page, self.order_page, self.price_page, self.payments_page,
                      self.suppliers_page, self.marking_page, self.labels_page,
-                     self.reports_page,
+                     self.notes_page, self.reports_page,
                      self.catalog_page, self.history_page, self.settings_page,
                      self.admin_page, self.profile_page):
             self.pages.addWidget(_scrollable(page))
@@ -548,6 +550,8 @@ class MainWindow(QMainWindow):
             self.marking_page.restore()
         if page is self.labels_page:
             self.labels_page.restore()
+        if page is self.notes_page:
+            self.notes_page.restore()
         if page is self.reports_page:
             # Профили и правила общие: коллега мог завести правило объединения,
             # пока вкладка была закрыта, и собирать отчёт по устаревшему набору
@@ -623,6 +627,9 @@ class MainWindow(QMainWindow):
             # Страница решает сама: подвкладок на ней три, и «запустить» на
             # каждой значит своё.
             self.marking_page.run_current()
+        elif page is self.notes_page:
+            # Запускать там нечего; F5 перечитывает список страниц.
+            self.notes_page.restore()
         elif self.show_page(PAGE_MATCH):
             self.match_page.run_matching()
 
@@ -636,6 +643,9 @@ class MainWindow(QMainWindow):
             self.reports_page.save()
         elif page is self.marking_page:
             self.marking_page.save_current()
+        elif page is self.notes_page:
+            # Иначе Ctrl+S ушёл бы в сохранение результатов сопоставления.
+            self.notes_page.save_now()
         else:
             self.match_page.save_results()
 
@@ -656,6 +666,8 @@ class MainWindow(QMainWindow):
             self.payments_page.focus_search()
         elif page is self.suppliers_page:
             self.suppliers_page.focus_search()
+        elif page is self.notes_page:
+            self.notes_page.focus_search()
 
     # --- состояние окна -------------------------------------------------------
 
@@ -672,6 +684,8 @@ class MainWindow(QMainWindow):
         self.toasts.reposition()
 
     def closeEvent(self, event) -> None:
+        # Правка, не дождавшаяся таймера автосохранения, иначе пропала бы.
+        self.notes_page.flush()
         self.settings.window_geometry = self.saveGeometry().toBase64().data().decode()
         self.settings.splitter_sizes = self.match_page.splitter.sizes()
         self.settings.save()
