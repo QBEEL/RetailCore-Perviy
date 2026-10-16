@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Sequence
 
 from . import workbook
@@ -46,6 +46,8 @@ class PriceLabel:
     copies: int
     # Почему строку нельзя напечатать. Пусто — можно.
     problem: str = ""
+    # Цена со скидкой для шаблонов с двумя ценами; считается, в файле её нет.
+    price2: Decimal | None = None
 
     @property
     def title(self) -> str:
@@ -147,6 +149,26 @@ def format_price(price: Decimal | None) -> str:
     if price == price.to_integral_value():
         return f"{int(price)}"
     return f"{price:.2f}".replace(".", ",")
+
+
+def discounted(price: Decimal, percent: float) -> Decimal:
+    """Цена после скидки. Целая цена округляется до рубля, дробная — до копейки.
+
+    Округление «как в школе» (0,5 вверх): 469 − 10 % = 422,1 → 422, а 445 − 10 % =
+    400,5 → 401. На ценнике рубли без копеек привычнее, и касса округляет так же.
+    """
+    if not 0 < percent < 100:
+        raise ValueError("скидка должна быть больше 0 и меньше 100 процентов")
+    value = price * (Decimal(100) - Decimal(str(percent))) / Decimal(100)
+    step = Decimal(1) if price == price.to_integral_value() else Decimal("0.01")
+    return value.quantize(step, rounding=ROUND_HALF_UP)
+
+
+def apply_discount(labels: Sequence[PriceLabel], percent: float | None) -> None:
+    """Проставляет цену со скидкой всем позициям с ценой; `None` — убирает."""
+    for item in labels:
+        item.price2 = (discounted(item.price, percent)
+                       if percent is not None and item.price is not None else None)
 
 
 def parse_rows(rows: Sequence[Sequence[Any]]) -> list[PriceLabel]:
