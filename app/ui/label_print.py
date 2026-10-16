@@ -124,7 +124,7 @@ def preview(spec: LabelSpec, code: str = SAMPLE_CODE, name: str = "Назван�
     return image
 
 
-def _printer(spec: LabelSpec, printer_name: str, pdf_path: str) -> QPrinter:
+def make_printer(spec: LabelSpec, printer_name: str, pdf_path: str) -> QPrinter:
     printer = QPrinter(QPrinter.PrinterMode.HighResolution)
     if pdf_path:
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
@@ -165,7 +165,7 @@ def print_codes(codes: list[str], name: str, spec: LabelSpec, printer_name: str,
         except datamatrix.DataMatrixError as error:
             raise PrintError(f"Код не помещается в DataMatrix: {error}") from None
 
-    printer = _printer(spec, printer_name, pdf_path)
+    printer = make_printer(spec, printer_name, pdf_path)
     painter = QPainter()
     if not painter.begin(printer):
         raise PrintError(

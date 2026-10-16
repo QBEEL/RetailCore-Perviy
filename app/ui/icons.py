@@ -59,6 +59,7 @@ NAMES = {
     "edit": "mdi6.pencil-outline",
     "key": "mdi6.key-variant",
     "marking": "mdi6.barcode-scan",
+    "label": "mdi6.label-outline",
     "certificate": "mdi6.certificate-outline",
     "close": "mdi6.close",
     "expand": "mdi6.arrow-expand-vertical",

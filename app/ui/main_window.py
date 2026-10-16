@@ -25,6 +25,7 @@ from ..core.vpn import VpnManager
 from . import icons
 from .catalog_page import CatalogPage
 from .history_page import HistoryPage
+from .labels_page import LabelsPage
 from .marking_page import MarkingPage
 from .match_page import MatchPage
 from .order_page import OrderPage
@@ -123,6 +124,7 @@ class MainWindow(QMainWindow):
         self.payments_page = PaymentsPage(settings, self.notify, self.pages, self.show_supplier)
         self.suppliers_page = SuppliersPage(settings, self.notify, self.pages)
         self.marking_page = MarkingPage(settings, self.notify, self.pages)
+        self.labels_page = LabelsPage(settings, self.notify, self.pages)
         self.reports_page = ReportsPage(settings, self.notify, self.pages)
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
@@ -133,7 +135,8 @@ class MainWindow(QMainWindow):
         self.profile_page = ProfilePage(settings, self.notify, self.pages,
                                         self.sign_out)
         for page in (self.match_page, self.order_page, self.price_page, self.payments_page,
-                     self.suppliers_page, self.marking_page, self.reports_page,
+                     self.suppliers_page, self.marking_page, self.labels_page,
+                     self.reports_page,
                      self.catalog_page, self.history_page, self.settings_page,
                      self.admin_page, self.profile_page):
             self.pages.addWidget(_scrollable(page))
@@ -543,6 +546,8 @@ class MainWindow(QMainWindow):
             # вставляют и вынимают, и список, прочитанный при запуске, может не
             # иметь отношения к тому, что подключено сейчас.
             self.marking_page.restore()
+        if page is self.labels_page:
+            self.labels_page.restore()
         if page is self.reports_page:
             # Профили и правила общие: коллега мог завести правило объединения,
             # пока вкладка была закрыта, и собирать отчёт по устаревшему набору
