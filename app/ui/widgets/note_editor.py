@@ -12,12 +12,14 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
-from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QRectF, QUrl, Qt, Signal
 from PySide6.QtGui import (
+    QColor,
     QDesktopServices,
     QFont,
     QKeyEvent,
     QMouseEvent,
+    QPainter,
     QTextBlock,
     QTextBlockFormat,
     QTextCharFormat,
@@ -52,6 +54,33 @@ def _sample(kind: str) -> tuple[QTextBlockFormat, QTextCharFormat]:
     fragments = block.begin()
     text_format = fragments.fragment().charFormat() if not fragments.atEnd() else QTextCharFormat()
     return QTextBlockFormat(block.blockFormat()), QTextCharFormat(text_format)
+
+
+@lru_cache(maxsize=1)
+def _inline_code_format() -> QTextCharFormat:
+    """Формат кода внутри строки — тот, что Qt ставит на `текст` в обратных кавычках."""
+    document = QTextDocument()
+    document.setMarkdown("a `b` c")
+    fragments = document.firstBlock().begin()
+    while not fragments.atEnd():
+        fmt = fragments.fragment().charFormat()
+        if fmt.fontFixedPitch():
+            return QTextCharFormat(fmt)
+        fragments += 1
+    return QTextCharFormat()
+
+
+# Свойства текста, которыми Qt отличает код от обычного текста.
+_CODE_TEXT_PROPERTIES = (
+    QTextFormat.Property.FontFamilies, QTextFormat.Property.FontFamily,
+    QTextFormat.Property.FontFixedPitch, QTextFormat.Property.FontPointSize,
+)
+# Цитата и код различаются фоном; у цитаты ещё полоса слева (см. paintEvent).
+_CODE_BACKGROUND = "#f1f5f9"
+_QUOTE_BACKGROUND = Palette.PRIMARY_SOFT
+_QUOTE_BAR = Palette.PRIMARY
+_QUOTE_BAR_WIDTH = 3
+_LINE_BREAK = " "
 
 
 @lru_cache(maxsize=1)
@@ -106,8 +135,54 @@ class NoteEditor(QTextEdit):
 
     def load_markdown(self, text: str) -> None:
         self.setMarkdown(text)
+        self._split_line_breaks()
+        self._decorate_all()
         self.document().setModified(False)
         self.document().clearUndoRedoStacks()
+
+    def _split_line_breaks(self) -> None:
+        """Перенос строки внутри абзаца делаем новым абзацем.
+
+        Qt читает Markdown с «мягким» переносом внутри одного блока, а там нет ни
+        флажка на второй строке, ни возможности выделить строку отдельно: любое
+        оформление ляжет на весь блок. Каждая строка должна быть своим блоком.
+        """
+        cursor = QTextCursor(self.document())
+        cursor.beginEditBlock()
+        block = self.document().begin()
+        while block.isValid():
+            index = block.text().find(_LINE_BREAK)
+            if index >= 0:
+                at = QTextCursor(block)
+                at.setPosition(block.position() + index)
+                at.setPosition(block.position() + index + 1, QTextCursor.MoveMode.KeepAnchor)
+                at.removeSelectedText()
+                at.insertBlock()
+            block = block.next()
+        cursor.endEditBlock()
+
+    def _decorate_all(self) -> None:
+        block = self.document().begin()
+        while block.isValid():
+            self._decorate(block)
+            block = block.next()
+
+    @staticmethod
+    def _decorate(block: QTextBlock) -> None:
+        """Фон цитаты и кода. В Markdown его нет, поэтому ставится при каждом чтении."""
+        kind = kind_of(block)
+        fmt = QTextBlockFormat()
+        if kind == CODE:
+            fmt.setBackground(QColor(_CODE_BACKGROUND))
+            fmt.setTopMargin(0)
+            fmt.setBottomMargin(0)
+        elif kind == QUOTE:
+            fmt.setBackground(QColor(_QUOTE_BACKGROUND))
+            fmt.setTopMargin(2)
+            fmt.setBottomMargin(2)
+        else:
+            return
+        QTextCursor(block).mergeBlockFormat(fmt)
 
     # --- состояние для панели --------------------------------------------------
 
@@ -119,6 +194,15 @@ class NoteEditor(QTextEdit):
 
     def is_italic(self) -> bool:
         return self.fontItalic()
+
+    def is_inline_code(self) -> bool:
+        """Курсор стоит в коде внутри строки (или выделен такой код)."""
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            probe = QTextCursor(self.document())
+            probe.setPosition(cursor.selectionStart() + 1)
+            return probe.charFormat().fontFixedPitch()
+        return self.currentCharFormat().fontFixedPitch()
 
     # --- знаки в строке --------------------------------------------------------
 
@@ -154,8 +238,59 @@ class NoteEditor(QTextEdit):
 
     # --- блоки -----------------------------------------------------------------
 
+    def toggle_inline_code(self) -> None:
+        """Код только на выделенном куске строки, а не на всём абзаце."""
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        cursor.beginEditBlock()
+        try:
+            if not self.is_inline_code():
+                cursor.mergeCharFormat(_inline_code_format())
+            else:
+                spans = []
+                block = self.document().findBlock(start)
+                fragments = block.begin()
+                while not fragments.atEnd():
+                    fragment = fragments.fragment()
+                    first = max(start, fragment.position())
+                    last = min(end, fragment.position() + fragment.length())
+                    if first < last:
+                        spans.append((first, last, fragment.charFormat()))
+                    fragments += 1
+                for first, last, fmt in spans:
+                    for prop in _CODE_TEXT_PROPERTIES:
+                        fmt.clearProperty(prop)
+                    span = QTextCursor(self.document())
+                    span.setPosition(first)
+                    span.setPosition(last, QTextCursor.MoveMode.KeepAnchor)
+                    span.setCharFormat(fmt)
+        finally:
+            cursor.endEditBlock()
+        self.state_changed.emit()
+
+    def _selection_inside_one_line(self) -> bool:
+        """Выделен кусок одной строки, а не вся строка и не несколько строк."""
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return False
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        block = self.document().findBlock(start)
+        if (block.position() != self.document().findBlock(end - 1).position()
+                or kind_of(block) == CODE):
+            return False
+        return not (start <= block.position() and end >= block.position() + block.length() - 1)
+
     def toggle_kind(self, kind: str) -> None:
-        """Применяет вид к выделенным блокам; если уже применён ко всем — снимает."""
+        """Применяет вид к выделенным блокам; если уже применён ко всем — снимает.
+
+        Код на части строки — это код внутри строки, как в Notion: остальной текст
+        строки остаётся обычным.
+        """
+        if kind == CODE and self._selection_inside_one_line():
+            self.toggle_inline_code()
+            return
         blocks = self._selected_blocks()
         target = PLAIN if all(kind_of(b) == kind for b in blocks) else kind
         cursor = self.textCursor()
@@ -183,14 +318,22 @@ class NoteEditor(QTextEdit):
         self.setTextCursor(cursor)
 
     def _selected_blocks(self) -> list[QTextBlock]:
+        """Строки, которых коснулось выделение.
+
+        Выделение «целой строки» (тройной щелчок, Shift+вниз) заканчивается в
+        начале следующей. Эту строку выделенной не считаем — иначе оформление
+        ляжет и на неё.
+        """
         cursor = self.textCursor()
-        block = self.document().findBlock(cursor.selectionStart())
-        last = self.document().findBlock(cursor.selectionEnd())
-        blocks = [block]
-        while block != last and block.isValid():
-            block = block.next()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        if end > start:
+            end -= 1
+        blocks = []
+        block = self.document().findBlock(start)
+        while block.isValid() and block.position() <= end:
             blocks.append(block)
-        return [b for b in blocks if b.isValid()]
+            block = block.next()
+        return blocks
 
     def _to_plain(self, block: QTextBlock) -> None:
         """Обычный абзац: без списка, заголовка, цитаты и кода, но с выделением внутри строки."""
@@ -227,6 +370,7 @@ class NoteEditor(QTextEdit):
         cursor.mergeCharFormat(text_format)
         # Пустая строка: формат нужен тексту, который будет набран.
         cursor.mergeBlockCharFormat(text_format)
+        self._decorate(block)
 
     def _make_list(self, blocks: list[QTextBlock], kind: str) -> None:
         style = (QTextListFormat.Style.ListDecimal if kind == NUMBER
@@ -260,11 +404,46 @@ class NoteEditor(QTextEdit):
             if event.key() == Qt.Key.Key_I:
                 self.toggle_italic()
                 return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
-                modifiers & Qt.KeyboardModifier.ShiftModifier):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # Shift+Enter в обычном Qt — перенос внутри абзаца: у пункта списка он
+            # остаётся без флажка, а выделить такую строку отдельно нельзя. Здесь
+            # любой Enter начинает новую строку-блок.
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  modifiers & ~Qt.KeyboardModifier.ShiftModifier, "\r")
             if self._handle_enter():
                 return
         super().keyPressEvent(event)
+
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        """Вставка: каждая строка буфера — своя строка-блок (в списке — свой пункт)."""
+        if source.hasText():
+            text = source.text().replace("\r\n", "\n").replace("\r", "\n").replace(_LINE_BREAK, "\n")
+            self.textCursor().insertText(text)
+            self.ensureCursorVisible()
+            return
+        super().insertFromMimeData(source)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        # Полоса слева у цитаты: фон один не отличает её от выделения.
+        painter = QPainter(self.viewport())
+        layout = self.document().documentLayout()
+        shift_x = self.horizontalScrollBar().value()
+        shift_y = self.verticalScrollBar().value()
+        height = self.viewport().height()
+        block = self.document().begin()
+        while block.isValid():
+            area = layout.blockBoundingRect(block).translated(-shift_x, -shift_y)
+            if area.top() > height:
+                break
+            if area.bottom() >= 0 and kind_of(block) == QUOTE:
+                painter.fillRect(
+                    QRectF(area.left() + block.blockFormat().leftMargin() - 12, area.top(),
+                           _QUOTE_BAR_WIDTH, area.height()),
+                    QColor(_QUOTE_BAR))
+            block = block.next()
+        painter.end()
 
     def _handle_enter(self) -> bool:
         """Enter как в привычных редакторах: пустой пункт списка заканчивает список,
@@ -334,6 +513,8 @@ class NoteToolbar(QWidget):
                 (CODE, "mdi6.code-tags", "Блок кода")):
             self._kind_buttons[kind] = self._button(layout, icon_name, tip, self._kind_action(kind))
         self._button(layout, "mdi6.minus", "Разделитель", editor.insert_rule, checkable=False)
+        self._kind_buttons[CODE].setToolTip(
+            "Код: выделенный кусок строки или вся строка, если ничего не выделено")
         layout.addStretch(1)
 
         editor.state_changed.connect(self.refresh)
@@ -358,6 +539,6 @@ class NoteToolbar(QWidget):
     def refresh(self) -> None:
         kind = self.editor.current_kind()
         for code, button in self._kind_buttons.items():
-            button.setChecked(code == kind)
+            button.setChecked(code == kind or (code == CODE and self.editor.is_inline_code()))
         self.bold.setChecked(self.editor.is_bold())
         self.italic.setChecked(self.editor.is_italic())

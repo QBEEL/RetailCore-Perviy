@@ -302,3 +302,103 @@ class TestEditor:
         put_cursor(box, 1)
         assert bar._kind_buttons[ne.CHECK].isChecked()
         assert not bar._kind_buttons[ne.H1].isChecked()
+
+
+def kinds(box: ne.NoteEditor) -> list[tuple[str, str]]:
+    return [(ne.kind_of(b), b.text()) for b in _blocks(box)]
+
+
+def select_text(box: ne.NoteEditor, block: int, start: int, end: int) -> None:
+    """Выделение внутри строки: символы start..end блока с номером block."""
+    first = box.document().findBlockByNumber(block)
+    cursor = QTextCursor(box.document())
+    cursor.setPosition(first.position() + start)
+    cursor.setPosition(first.position() + end, QTextCursor.MoveMode.KeepAnchor)
+    box.setTextCursor(cursor)
+
+
+def shift_enter(box: ne.NoteEditor) -> None:
+    # Событие подаётся прямо: QTest с модификатором оставляет его «зажатым» для остальных тестов.
+    box.keyPressEvent(QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier, "\r"))
+
+
+class TestLines:
+    """Каждая строка — свой блок: флажок, код и выделение действуют на неё одну."""
+
+    def test_shift_enter_in_checklist_starts_a_new_item_with_its_own_box(self, app) -> None:
+        box = editor(app, "- [ ] первое")
+        put_cursor(box, 0)
+        shift_enter(box)
+        box.insertPlainText("второе")
+        assert kinds(box) == [(ne.CHECK, "первое"), (ne.CHECK, "второе")]
+        assert box.markdown() == "- [ ] первое\n- [ ] второе"
+
+    def test_line_break_inside_paragraph_is_split_on_load(self, app) -> None:
+        # Жёсткий перенос Markdown Qt читает как перенос внутри одного блока.
+        box = editor(app, "- [ ] первое\\\nвторое\n- [ ] третье")
+        assert kinds(box) == [(ne.CHECK, "первое"), (ne.CHECK, "второе"), (ne.CHECK, "третье")]
+
+    def test_pasted_lines_become_items_of_the_checklist(self, app) -> None:
+        from PySide6.QtCore import QMimeData
+        box = editor(app, "- [ ] пункт")
+        put_cursor(box, 0)
+        data = QMimeData()
+        data.setText("\r\nдва\r\nтри")
+        box.insertFromMimeData(data)
+        assert kinds(box) == [(ne.CHECK, "пункт"), (ne.CHECK, "два"), (ne.CHECK, "три")]
+
+    def test_selecting_a_whole_line_does_not_touch_the_next_one(self, app) -> None:
+        box = editor(app, "один\n\nдва\n\nтри")
+        # Так выделяет тройной щелчок: от начала строки до начала следующей.
+        cursor = QTextCursor(box.document().findBlockByNumber(1))
+        cursor.setPosition(box.document().findBlockByNumber(1).position())
+        cursor.setPosition(box.document().findBlockByNumber(2).position(),
+                           QTextCursor.MoveMode.KeepAnchor)
+        box.setTextCursor(cursor)
+        assert [b.text() for b in box._selected_blocks()] == ["два"]
+        box.toggle_kind(ne.CODE)
+        assert kinds(box) == [(ne.PLAIN, "один"), (ne.CODE, "два"), (ne.PLAIN, "три")]
+
+    def test_checklist_on_one_selected_line_leaves_the_others(self, app) -> None:
+        box = editor(app, "один\n\nдва\n\nтри")
+        select_text(box, 1, 0, 3)
+        box.toggle_kind(ne.CHECK)
+        assert kinds(box) == [(ne.PLAIN, "один"), (ne.CHECK, "два"), (ne.PLAIN, "три")]
+
+    def test_selected_piece_of_a_line_becomes_inline_code(self, app) -> None:
+        box = editor(app, "слово другое слово")
+        select_text(box, 0, 6, 12)
+        box.toggle_kind(ne.CODE)
+        # Блок остался обычным, кодом стал только выделенный кусок.
+        assert kinds(box) == [(ne.PLAIN, "слово другое слово")]
+        assert box.markdown().startswith("слово `другое` слово")
+        select_text(box, 0, 6, 12)
+        assert box.is_inline_code()
+        box.toggle_kind(ne.CODE)
+        assert "`" not in box.markdown()
+
+    def test_code_without_selection_still_makes_the_whole_line_code(self, app) -> None:
+        box = editor(app, "одна строка")
+        put_cursor(box, 0)
+        box.toggle_kind(ne.CODE)
+        assert kinds(box) == [(ne.CODE, "одна строка")]
+
+    def test_quote_and_code_blocks_are_tinted_even_after_reopening(self, app) -> None:
+        box = editor(app, "> цитата\n\n```\nкод\n```\n\nобычный")
+        backgrounds = [b.blockFormat().background().style() != Qt.BrushStyle.NoBrush
+                       for b in _blocks(box)]
+        assert backgrounds == [True, True, False]
+        # Снятие вида убирает и фон.
+        put_cursor(box, 0)
+        box.toggle_kind(ne.QUOTE)
+        assert _blocks(box)[0].blockFormat().background().style() == Qt.BrushStyle.NoBrush
+
+    def test_quote_bar_is_painted(self, app) -> None:
+        box = editor(app, "> цитата\n\nобычный")
+        box.resize(400, 200)
+        image = box.viewport().grab().toImage()
+        rect = box.cursorRect(QTextCursor(box.document().findBlockByNumber(0)))
+        bar_x = rect.x() - 12 + 1
+        pixel = image.pixelColor(bar_x, rect.center().y())
+        assert (pixel.red(), pixel.green(), pixel.blue()) != (255, 255, 255)
