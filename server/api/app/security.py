@@ -10,16 +10,20 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 from . import db
 from .settings import settings
+
+log = logging.getLogger(__name__)
 
 # Параметры scrypt. 2^15 подобрано под одноядерный сервер: проверка пароля
 # занимает около 60 мс — незаметно при входе и дорого при переборе.
@@ -100,7 +104,42 @@ class User:
         return self.is_admin or responsible in self.responsible
 
 
-def current_user(token: str = Depends(scheme)) -> User:
+_VERSION = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$")
+_PLATFORMS = ("windows", "macos", "linux")
+# Как часто обновлять «последнее обращение»: чаще нет смысла, а запись на каждый
+# запрос добавила бы нагрузку на базу ради цифры, которой хватает с точностью до часа.
+SEEN_EVERY = timedelta(hours=1)
+
+
+def note_client(row: dict, version: str | None, platform: str | None) -> None:
+    """Запоминает, какой версией приложения человек пользуется.
+
+    Версия приходит от клиента, поэтому ей не доверяют: мусор вместо «3.9.2»
+    отбрасывается. Запись — только при смене версии или раз в час. Сбой записи
+    не должен мешать работе: версия — справка для администратора, а не условие входа.
+    """
+    if not version or not _VERSION.match(version.strip()):
+        return
+    version = version.strip()
+    platform = (platform or "").strip().lower()
+    platform = platform if platform in _PLATFORMS else ""
+    seen = row.get("app_seen_at")
+    fresh = seen is not None and datetime.now(timezone.utc) - seen < SEEN_EVERY
+    if (row.get("app_version") == version and (row.get("app_platform") or "") == platform
+            and fresh):
+        return
+    try:
+        db.execute(
+            "UPDATE app_user SET app_version = %s, app_platform = %s,"
+            "                    app_seen_at = now() WHERE id = %s",
+            (version, platform, row["id"]))
+    except Exception:  # noqa: BLE001 — справка не должна ронять запрос
+        log.warning("Версию приложения не записать", exc_info=True)
+
+
+def current_user(token: str = Depends(scheme),
+                 x_app_version: str | None = Header(default=None),
+                 x_app_platform: str | None = Header(default=None)) -> User:
     denied = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Требуется вход",
@@ -120,7 +159,7 @@ def current_user(token: str = Depends(scheme)) -> User:
 
     row = db.fetch_one(
         "SELECT u.id, u.login, u.full_name, u.is_admin, u.is_active,"
-        "       u.token_version,"
+        "       u.token_version, u.app_version, u.app_platform, u.app_seen_at,"
         "       COALESCE(array_agg(r.responsible)"
         "                FILTER (WHERE r.responsible IS NOT NULL), '{}') AS responsible"
         " FROM app_user u"
@@ -135,6 +174,7 @@ def current_user(token: str = Depends(scheme)) -> User:
     # отключали: вход, выданный до этого, нужно получить заново.
     if version != int(row["token_version"]):
         raise denied
+    note_client(row, x_app_version, x_app_platform)
     return User(
         id=row["id"],
         login=row["login"],

@@ -30,6 +30,8 @@ _SELECT = (
     "                   FROM user_page_denied p"
     "                  WHERE p.user_id = u.id), '{}') AS denied_pages,"
     "       u.ai_daily_limit AS ai_limit,"
+    "       COALESCE(u.app_version, '') AS app_version,"
+    "       COALESCE(u.app_platform, '') AS app_platform, u.app_seen_at,"
     "       COALESCE((SELECT a.requests FROM ai_usage a WHERE a.user_id = u.id"
     "                    AND a.day = (now() AT TIME ZONE 'Europe/Moscow')::date), 0)"
     "         AS ai_used"

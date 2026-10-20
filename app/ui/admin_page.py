@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..core.payments import admin, data, dds, transport
 from ..core.payments.admin import Account, Entry, Scope
 from ..core.suppliers import directory
@@ -74,6 +75,15 @@ def write_journal(entries: list[Entry], path: str) -> None:
 
 def _moment(value: datetime | None) -> str:
     return f"{value:%d.%m.%Y %H:%M}" if value else ""
+
+
+def _version_text(account: Account) -> str:
+    """«3.9.2 · Windows»; прочерк, если приложение себя не называет."""
+    if not account.app_version:
+        return "—"
+    system = {"windows": "Windows", "macos": "macOS", "linux": "Linux"}.get(
+        account.app_platform, "")
+    return f"{account.app_version} · {system}" if system else account.app_version
 
 
 def _ai_usage_text(account: Account) -> str:
@@ -170,10 +180,19 @@ class AdminPage(QWidget):
             Column("Имён в 1С", lambda a: len(a.responsible), 90,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             Column("Кто в 1С", lambda a: ", ".join(a.responsible), 320),
+            Column("Версия", _version_text, 130,
+                   color=lambda a: QColor(Palette.TEXT_FAINT) if not a.app_version else None,
+                   sort_key=lambda a: admin.version_key(a.app_version)),
+            Column("Был на связи", lambda a: _moment(a.app_seen_at), 130,
+                   sort_key=lambda a: a.app_seen_at or datetime.min),
             Column("Заведена", lambda a: _moment(a.created_at), 130,
                    sort_key=lambda a: a.created_at or datetime.min),
         ], page)
         self.accounts_table.item_activated.connect(self.edit_account)
+        # Кто уже перешёл на нынешнюю версию: пока этих людей не все, прежний адрес
+        # обновлений нужен, и закрывать исходный репозиторий рано.
+        self.versions = Hint("", page)
+        layout.addWidget(self.versions)
         layout.addWidget(self.accounts_table, 1)
 
         actions = QHBoxLayout()
@@ -488,6 +507,10 @@ class AdminPage(QWidget):
         # править их некому, и это стоит замечать до того, как спросят.
         linked = {name for account in self.accounts for name in account.responsible}
         self.hint.setText(f"без учётной записи в 1С: {len(set(self._known) - linked)}")
+        summary, _behind = admin.update_summary(self.accounts, __version__)
+        self.versions.setText(
+            summary + ". Прочерк в колонке «Версия» — приложение старше 3.9.2, "
+            "оно себя не называет.")
 
         if not self._scope.supported:
             # Раздел открылся, а удалять нечем: сервер старой версии такого

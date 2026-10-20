@@ -40,6 +40,11 @@ class Account:
     # 0 — ИИ человеку закрыт. ai_used — сколько обращений сегодня.
     ai_limit: int | None = None
     ai_used: int = 0
+    # Версия приложения у человека и когда он последний раз обращался к серверу.
+    # Пусто — версия старше той, что научилась себя называть.
+    app_version: str = ""
+    app_platform: str = ""
+    app_seen_at: datetime | None = None
 
     @property
     def title(self) -> str:
@@ -299,7 +304,37 @@ def _account(row: dict) -> Account:
         is_admin=bool(row["is_admin"]), is_active=bool(row["is_active"]),
         created_at=_moment(row.get("created_at")),
         ai_limit=None if row.get("ai_limit") is None else int(row["ai_limit"]),
-        ai_used=int(row.get("ai_used") or 0))
+        ai_used=int(row.get("ai_used") or 0),
+        app_version=str(row.get("app_version") or ""),
+        app_platform=str(row.get("app_platform") or ""),
+        app_seen_at=_moment(row.get("app_seen_at")) if row.get("app_seen_at") else None)
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return ()
+
+
+def update_summary(accounts: list[Account], current: str) -> tuple[str, list[Account]]:
+    """Кто ещё не перешёл на версию `current` или новее.
+
+    Считаются только действующие учётки. Пустая версия — у человека приложение
+    старше той, что умеет себя называть, значит, оно точно не новее. Возвращает
+    строку для показа и список тех, кто отстал.
+    """
+    active = [account for account in accounts if account.is_active]
+    behind = [account for account in active
+              if not account.app_version
+              or version_key(account.app_version) < version_key(current)]
+    done = len(active) - len(behind)
+    text = f"Версия {current} или новее: {done} из {len(active)}"
+    if behind:
+        text += ". Ещё нет: " + ", ".join(account.title for account in behind[:6])
+        if len(behind) > 6:
+            text += f" и ещё {len(behind) - 6}"
+    return text, behind
 
 
 # --- учётные записи ------------------------------------------------------------

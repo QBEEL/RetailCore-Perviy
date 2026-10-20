@@ -242,6 +242,11 @@ class UserOut(BaseModel):
     # Личный предел ИИ-правки (null — общий) и сколько обращений сегодня.
     ai_limit: int | None = None
     ai_used: int = 0
+    # Версия приложения и когда человек последний раз обращался к серверу. Пусто —
+    # у человека версия, которая себя не называет (старше 3.9.2).
+    app_version: str = ""
+    app_platform: str = ""
+    app_seen_at: datetime | None = None
     is_admin: bool
     is_active: bool
     created_at: datetime

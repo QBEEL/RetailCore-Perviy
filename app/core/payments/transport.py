@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import ssl
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,10 +26,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from ... import __version__
 from .. import net
 from .safe_files import safe_name
 
 TIMEOUT = 120
+
+
+def _platform() -> str:
+    return ("windows" if sys.platform.startswith("win")
+            else "macos" if sys.platform == "darwin" else "linux")
+
+
+# Кто обращается: версия и система. Сервер запоминает их у учётки, и администратор
+# видит, кто уже обновился. Ничего другого о компьютере не отправляется.
+CLIENT_HEADERS = {"X-App-Version": __version__, "X-App-Platform": _platform()}
 # Сервер отдаёт всю историю одним ответом — несколько мегабайт JSON. На
 # офисном канале это секунды, поэтому таймаут заметно больше обычного.
 
@@ -157,7 +169,7 @@ def _failure(error: urllib.error.HTTPError) -> ServerError:
 
 def _request(method: str, path: str, *, params: dict | None = None,
              body: Any = None, authorized: bool = True) -> Any:
-    data, headers = None, {"Accept": "application/json"}
+    data, headers = None, {"Accept": "application/json", **CLIENT_HEADERS}
     if body is not None:
         data = json.dumps(body, default=_encode).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -227,6 +239,7 @@ def upload(path: str, source: str) -> Any:
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Authorization": f"Bearer {session.token}",
             "Accept": "application/json",
+            **CLIENT_HEADERS,
         }, method="POST")
     return _send(request)
 
@@ -236,7 +249,7 @@ def download(path: str, target: str) -> str:
     if not session.active:
         raise AuthError("Вход в систему не выполнен")
     request = urllib.request.Request(
-        _url(path), headers={"Authorization": f"Bearer {session.token}"})
+        _url(path), headers={"Authorization": f"Bearer {session.token}", **CLIENT_HEADERS})
     partial = target + ".part"
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT, context=net.context) as response:
