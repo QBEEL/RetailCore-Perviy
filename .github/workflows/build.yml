@@ -75,7 +75,7 @@ jobs:
         with:
           name: RetailCore-Windows
           path: dist/RetailCore.exe
-          retention-days: 30
+          retention-days: 1
 
   # ─────────────────────────────── macOS ──────────────────────────────────
   build-macos:
@@ -139,7 +139,7 @@ jobs:
         with:
           name: RetailCore-macOS
           path: dist/RetailCore.dmg
-          retention-days: 30
+          retention-days: 1
 
   # ─────────────────────────────── Release ────────────────────────────────
   release:
