@@ -146,6 +146,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
+    env:
+      # На уровне задачи, а не шага: условие шага не видит собственный env.
+      # Секрета нет — публикация в публичный репозиторий пропускается, а не рушит
+      # релиз.
+      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
     steps:
       # Код нужен ради tools/ и CHANGELOG.md: манифест собирается здесь.
       - name: Checkout
@@ -203,11 +208,30 @@ jobs:
               print(f"{key} сходится с {name}")
           PY
 
-      - name: Create GitHub Release
+      # Старый адрес: версии до 3.9.1 ищут обновления в этом репозитории, пока
+      # он публичен. Шаг убирается, когда все копии перешли на новый адрес.
+      - name: Create GitHub Release (legacy repository)
         uses: softprops/action-gh-release@v2
         with:
           name: RetailCore ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          files: |
+            artifacts/RetailCore.exe
+            artifacts/RetailCore.dmg
+            artifacts/version.json
+
+      # Публичный репозиторий только для сборок. Исходный репозиторий может быть
+      # закрытым: клиент скачивает обновления отсюда, без токена. Токен хранится
+      # секретом и даёт запись только в этот репозиторий.
+      - name: Create GitHub Release (public releases repository)
+        if: ${{ env.RELEASES_TOKEN != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: QBEEL/RetailCore-Releases
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: RetailCore ${{ steps.version.outputs.tag }}
+          body: RetailCore ${{ steps.version.outputs.tag }}
           files: |
             artifacts/RetailCore.exe
             artifacts/RetailCore.dmg

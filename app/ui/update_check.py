@@ -11,8 +11,12 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from .. import __version__
 from ..core import updater
 
+# Репозиторий только для готовых сборок: исходники лежат в закрытом, а публичным
+# должен быть тот, откуда клиент скачивает обновления без токена. До 3.9.1
+# клиенты смотрели в QBEEL/RetailCore-Perviy, поэтому сборки выкладываются и туда,
+# пока все не обновятся (см. .github/workflows/build.yml).
 GITHUB_OWNER = "QBEEL"
-GITHUB_REPO = "RetailCore-Perviy"
+GITHUB_REPO = "RetailCore-Releases"
 
 _API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 _MANIFEST_ASSET = "version.json"
