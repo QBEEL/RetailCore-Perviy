@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from .models import (
     Operation,
     OperationKind,
     OperationStatus,
+    PermitDoc,
     fingerprint,
     parse_state,
 )
@@ -250,19 +252,47 @@ def remember_checks(items: Sequence[CodeInfo], contour: Contour,
         connection.executemany(
             "INSERT INTO code_check (code, gtin, serial, state, valid, found,"
             "                        owner_inn, owner_name, product_name, contour,"
-            "                        checked_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "                        checked_at, permits)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(code) DO UPDATE SET"
             "   gtin = excluded.gtin, serial = excluded.serial,"
             "   state = excluded.state, valid = excluded.valid,"
             "   found = excluded.found, owner_inn = excluded.owner_inn,"
             "   owner_name = excluded.owner_name,"
             "   product_name = excluded.product_name,"
-            "   contour = excluded.contour, checked_at = excluded.checked_at",
+            "   contour = excluded.contour, checked_at = excluded.checked_at,"
+            "   permits = excluded.permits",
             [(item.code, item.gtin, item.serial, item.state.value,
               int(item.valid), int(item.found), item.owner_inn, item.owner_name,
-              item.product_name, contour.value, now) for item in items])
+              item.product_name, contour.value, now, _permits_text(item))
+             for item in items])
         connection.commit()
+
+
+def _permits_text(item: CodeInfo) -> str:
+    if item.permits is None:
+        return ""
+    docs = [{"type": doc.kind, "number": doc.number, "date": doc.date,
+             "group": doc.status_group, "color": doc.color} for doc in item.permits]
+    return json.dumps({"docs": docs, "exempt": item.permit_exempt}, ensure_ascii=False)
+
+
+def _permits_from(text: str) -> tuple[list[PermitDoc] | None, str]:
+    """Обратно из базы. Испорченная запись — «не спрашивали», а не «нет РД»."""
+    if not text:
+        return None, ""
+    try:
+        data = json.loads(text)
+        docs = [PermitDoc(kind=str(doc.get("type") or ""),
+                          number=str(doc.get("number") or ""),
+                          date=str(doc.get("date") or ""),
+                          status_group=doc.get("group") if isinstance(
+                              doc.get("group"), int) else None,
+                          color=str(doc.get("color") or ""))
+                for doc in data.get("docs") or []]
+        return docs, str(data.get("exempt") or "")
+    except (ValueError, AttributeError, TypeError):
+        return None, ""
 
 
 def known_checks(codes: Sequence[str], contour: Contour,
@@ -286,6 +316,7 @@ def known_checks(codes: Sequence[str], contour: Contour,
                 f"SELECT * FROM code_check WHERE contour = ? AND code IN ({marks})",
                 (contour.value, *part)).fetchall()
             for row in rows:
+                permits, exempt = _permits_from(row["permits"] or "")
                 result[row["code"]] = CodeInfo(
                     code=row["code"],
                     gtin=row["gtin"] or "",
@@ -296,6 +327,8 @@ def known_checks(codes: Sequence[str], contour: Contour,
                     owner_inn=row["owner_inn"] or "",
                     owner_name=row["owner_name"] or "",
                     product_name=row["product_name"] or "",
+                    permits=permits,
+                    permit_exempt=exempt,
                 )
     return result
 

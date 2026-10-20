@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.marking import CodeInfo, Organisation
+from ...core.marking import CodeInfo, Organisation, PermitState
 from .. import icons
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
@@ -306,7 +306,8 @@ class CodeInfoDialog(QDialog):
             ("Серийный номер", info.serial or "—"),
             ("Владелец", owner),
             ("Срок годности", expires),
-            ("Замечания", "\n".join(info.problems) or "—"),
+            ("Разрешительные документы", permits_text(info)),
+            ("Замечания", "\n".join(info.remarks) or "—"),
             ("Код", info.code or "—"),
         )
         form = QFormLayout()
@@ -361,6 +362,19 @@ class CodeInfoDialog(QDialog):
             button.setToolTip(blocked)
         button.clicked.connect(lambda _checked=False: self._choose(action))
         return button
+
+
+def permits_text(info: CodeInfo) -> str:
+    """Разрешительные документы кода одним текстом: для карточки и подсказки."""
+    state = info.permit_state
+    if state is PermitState.UNKNOWN:
+        return "сведения не получены — проверьте код заново"
+    if state is PermitState.EXEMPT:
+        return f"не требуются: {info.permit_exempt}"
+    if state is PermitState.MISSING:
+        return ("нет. 1С не примет товар («Некорректный статус РД»). Внести РД "
+                "в код может только тот, кто вводил его в оборот, — поставщик")
+    return "\n".join(doc.title for doc in info.permits or [])
 
 
 class NomenclatureDialog(QDialog):

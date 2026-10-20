@@ -226,6 +226,117 @@ def parse_state(value: Any) -> CodeState:
     return _STATE_ALIASES.get(str(value or "").strip().lower(), CodeState.UNKNOWN)
 
 
+class PermitState(str, Enum):
+    """Что с разрешительной документацией (РД) кода: декларацией, сертификатом.
+
+    Сведения о РД записываются в сам код при вводе в оборот. 1С на приёмке
+    требует у кода действующий РД и на код без него отвечает «Некорректный
+    статус РД — статус неизвестен», хотя сам код в обороте и ГИС МТ его
+    пропускает. Исправить это может только тот, кто вводил код в оборот.
+    """
+
+    VALID = "valid"
+    # Документ есть, но реестр его не подтвердил: «неизвестный статус» или
+    # аварийный режим. ГИС МТ такое пропускает, 1С может не принять.
+    UNCONFIRMED = "unconfirmed"
+    # Жёлтая группа: истёк, приостановлен. Оборот разрешён, ввод — нет.
+    LAPSED = "lapsed"
+    INVALID = "invalid"
+    MISSING = "missing"
+    EXEMPT = "exempt"
+    # Сведений нет: ответ получен до того, как РД стали разбирать, или код не
+    # найден. Это не «РД нет» — это «не спрашивали».
+    UNKNOWN = "unknown"
+
+    @property
+    def title(self) -> str:
+        return PERMIT_STATE_TITLES[self]
+
+    @property
+    def troubled(self) -> bool:
+        """Повод разбираться до приёмки: 1С такой код, скорее всего, не примет."""
+        return self not in (PermitState.VALID, PermitState.EXEMPT, PermitState.UNKNOWN)
+
+    @property
+    def remark(self) -> str:
+        """Замечание к коду; пусто, если с РД всё в порядке или о нём не знаем."""
+        return PERMIT_STATE_REMARKS.get(self, "")
+
+
+PERMIT_STATE_REMARKS: dict[PermitState, str] = {
+    PermitState.MISSING: "нет разрешительного документа (РД) — 1С не примет",
+    PermitState.INVALID: "разрешительный документ недействителен — 1С не примет",
+    PermitState.LAPSED: "разрешительный документ истёк или приостановлен",
+    PermitState.UNCONFIRMED: "статус разрешительного документа неизвестен",
+}
+
+PERMIT_STATE_TITLES: dict[PermitState, str] = {
+    PermitState.VALID: "Есть",
+    PermitState.UNCONFIRMED: "Статус неизвестен",
+    PermitState.LAPSED: "Истёк / приостановлен",
+    PermitState.INVALID: "Недействителен",
+    PermitState.MISSING: "Нет",
+    PermitState.EXEMPT: "Не требуется",
+    PermitState.UNKNOWN: "—",
+}
+
+# Справочник True API «Группы статусов разрешительных документов». Номера
+# групп, а не цвета: цвет в ответе есть не всегда. Номер, которого здесь нет,
+# считается жёлтым — новая группа должна насторожить, а не пройти молча.
+_GREEN_GROUPS = frozenset({1})
+_UNCONFIRMED_GROUPS = frozenset({4, 6, 26, 27, 28, 29, 30})
+_RED_GROUPS = frozenset({3, 16, 17, 18, 19, 20})
+_COLOR_STATES: dict[str, PermitState] = {
+    "green": PermitState.VALID,
+    "yellow": PermitState.LAPSED,
+    "sand": PermitState.LAPSED,
+    "amber": PermitState.LAPSED,
+    "red": PermitState.INVALID,
+}
+
+PERMIT_KIND_TITLES: dict[str, str] = {
+    "CONFORMITY_DECLARATION": "Декларация о соответствии",
+    "CONFORMITY_CERTIFICATE": "Сертификат соответствия",
+    "CONFORMITY_CERTIFICATE_OR_DECLARATION": "Сертификат или декларация",
+    "STATE_REGISTRATION_CERTIFICATE": "Свидетельство о госрегистрации",
+    "REGISTRATION_CERTIFICATE": "Регистрационное удостоверение",
+}
+
+# Чем лучше, тем раньше: у кода бывает десяток документов, и судят о нём по
+# лучшему из них.
+_PERMIT_ORDER = (PermitState.VALID, PermitState.UNCONFIRMED, PermitState.LAPSED,
+                 PermitState.INVALID)
+
+
+@dataclass(slots=True)
+class PermitDoc:
+    """Один разрешительный документ кода, как его вернула ГИС МТ."""
+
+    kind: str = ""
+    number: str = ""
+    date: str = ""
+    status_group: int | None = None
+    color: str = ""
+
+    @property
+    def state(self) -> PermitState:
+        if self.status_group is not None:
+            if self.status_group in _GREEN_GROUPS:
+                return PermitState.VALID
+            if self.status_group in _UNCONFIRMED_GROUPS:
+                return PermitState.UNCONFIRMED
+            if self.status_group in _RED_GROUPS:
+                return PermitState.INVALID
+            return PermitState.LAPSED
+        return _COLOR_STATES.get(self.color.strip().lower(), PermitState.UNCONFIRMED)
+
+    @property
+    def title(self) -> str:
+        kind = PERMIT_KIND_TITLES.get(self.kind, self.kind or "Документ")
+        date = f" от {self.date[:10]}" if self.date else ""
+        return f"{kind} {self.number}{date} · {self.state.title.lower()}"
+
+
 @dataclass(slots=True)
 class CodeInfo:
     """Что ГИС МТ знает о коде. Ответ проверки, сложенный в свой тип."""
@@ -245,11 +356,38 @@ class CodeInfo:
     # ИНН, с которым сравнивается владелец кода. Берётся из сертификата, под
     # которым выполнен вход, и заполняется при разборе ответа.
     our_inn: str = ""
+    # Разрешительные документы кода. `None` — сведений нет (см.
+    # `PermitState.UNKNOWN`), пустой список — ГИС МТ ответила, что их нет.
+    permits: list[PermitDoc] | None = None
+    # Почему РД не нужен, если в карточке товара указано такое основание.
+    permit_exempt: str = ""
 
     @property
     def ours(self) -> bool:
         """Наш ли это код. Чужой в приёмке — повод остановиться и разобраться."""
         return bool(self.owner_inn) and self.our_inn.strip() == self.owner_inn.strip()
+
+    @property
+    def permit_state(self) -> PermitState:
+        if self.permits is None:
+            return PermitState.UNKNOWN
+        if not self.permits:
+            return PermitState.EXEMPT if self.permit_exempt else PermitState.MISSING
+        states = {doc.state for doc in self.permits}
+        return next(state for state in _PERMIT_ORDER if state in states)
+
+    @property
+    def remarks(self) -> list[str]:
+        """Замечания для таблицы и выгрузки: ответ системы и вывод о РД.
+
+        Вывод о РД не кладётся в `problems`: те приходят из ответа и не
+        хранятся в кэше, а РД хранится и после чтения из кэша должен давать то
+        же замечание.
+        """
+        notes = list(self.problems)
+        if remark := self.permit_state.remark:
+            notes.append(remark)
+        return notes
 
     @property
     def title(self) -> str:

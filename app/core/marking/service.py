@@ -23,6 +23,7 @@ from .models import (
     Operation,
     OperationKind,
     OperationStatus,
+    PermitDoc,
     ProductGroup,
     parse_state,
 )
@@ -340,6 +341,10 @@ def check(
         return []
 
     known = store.known_checks(prepared, where, db_path) if use_cache else {}
+    # Ответ, сохранённый до того, как стали разбирать РД, о документах ничего
+    # не знает. Такой код спрашивается заново — один раз, дальше он в кэше с РД.
+    known = {code: item for code, item in known.items()
+             if item.permits is not None or not item.found}
     missing = [code for code in prepared if code not in known]
     fetched: dict[str, CodeInfo] = {}
     total = len(missing)
@@ -467,7 +472,35 @@ def _info(row: dict) -> CodeInfo:
         item.problems.append(f"{error} ({code_of_error})" if code_of_error else error)
     elif not item.valid:
         item.problems.append("код не признан системой маркировки")
+    if item.found:
+        item.permits, item.permit_exempt = _permits(merged)
     return item
+
+
+def _permits(row: dict) -> tuple[list[PermitDoc], str]:
+    """Разрешительные документы кода и основание, по которому они не нужны.
+
+    Массив `certDoc` ГИС МТ не присылает вовсе, если у кода нет сведений о РД,
+    поэтому его отсутствие у найденного кода — это ответ «документов нет», а
+    не пропуск. Основание приходит, только если оно указано в карточке товара.
+    """
+    docs: list[PermitDoc] = []
+    for entry in row.get("certDoc") or []:
+        if not isinstance(entry, dict):
+            continue
+        group = str(entry.get("statusGroup") or "").strip()
+        docs.append(PermitDoc(
+            kind=str(entry.get("type") or ""),
+            number=str(entry.get("number") or ""),
+            date=str(entry.get("date") or ""),
+            status_group=int(group) if group.isdigit() else None,
+            color=str(entry.get("permitDocStatusGroup") or ""),
+        ))
+    details = row.get("certDocRequirementDetails")
+    exempt = ""
+    if isinstance(details, dict):
+        exempt = str(details.get("notRequiredReason") or "") or "основание указано"
+    return docs, exempt
 
 
 def _first(row: dict, names: Sequence[str]) -> str:

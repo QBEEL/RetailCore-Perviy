@@ -685,6 +685,89 @@ def test_только_замечания_отбирает_строки(applicati
     assert page.tile_missing._value.text() == "1"
 
 
+def test_код_без_РД_виден_и_попадает_в_замечания(application, tmp_path, stub):
+    """Код в обороте, но без РД: 1С его не примет, и в таблице это должно быть видно."""
+    from app.core.marking import PermitDoc
+
+    page = _page(application, tmp_path)
+    page._show_result([_info("code-ok", permits=[PermitDoc(status_group=1)]),
+                       _info("code-bare", permits=[]),
+                       _info("code-old")])
+
+    assert page.tile_permits._value.text() == "1"
+    assert page.result.item(0, 4).text() == "Есть"
+    assert page.result.item(1, 4).text() == "Нет"
+    assert "поставщик" in page.result.item(1, 4).toolTip()
+    assert "РД" in page.result_hint.text()
+
+    page.problems_box.setChecked(True)
+
+    assert page.result.rowCount() == 1
+    assert page._shown[0].code == "code-bare"
+    assert "нет разрешительного документа" in page.result.item(0, 5).text()
+
+
+def test_отбор_без_РД_оставляет_только_их_даже_среди_чужих(application, tmp_path,
+                                                         stub):
+    """До приёмки все коды УПД чужие, и «Только замечания» показывает все."""
+    from app.core.marking import PermitDoc
+
+    supplier = {"owner_inn": "7700000000", "owner_name": "ООО «Поставщик»"}
+    page = _page(application, tmp_path)
+    page._show_result([_info("code-ok", permits=[PermitDoc(status_group=1)], **supplier),
+                       _info("code-bare", permits=[], **supplier)])
+
+    page.problems_box.setChecked(True)
+    assert page.result.rowCount() == 2
+
+    page.permits_box.setChecked(True)
+    assert [item.code for item in page._shown] == ["code-bare"]
+    assert page.result_export.isEnabled()
+
+
+def test_выгрузка_берёт_видимые_коды(application, tmp_path, stub, monkeypatch):
+    from openpyxl import load_workbook
+
+    from app.core.marking import PermitDoc
+    from app.ui import marking_page
+
+    target = tmp_path / "коды.xlsx"
+    monkeypatch.setattr(marking_page.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *_a, **_k: (str(target), "")))
+    page = _page(application, tmp_path)
+    page._show_result([_info("0104600000000014215AAAAAAAAAAAA",
+                             permits=[PermitDoc(status_group=1)]),
+                       _info("0104600000000021215BBBBBBBBBBBB", permits=[],
+                             gtin="04600000000021")])
+    page.permits_box.setChecked(True)
+
+    page.export_result()
+    _settle(application)
+
+    sheet = load_workbook(target).active
+    rows = list(sheet.iter_rows(min_row=2, values_only=True))
+    assert len(rows) == 1
+    assert rows[0][0] == "0104600000000021215BBBBBBBBBBBB"
+    assert rows[0][1] == "04600000000021"        # ведущий ноль не потерян
+    assert rows[0][6] == "Нет"
+    assert "1С не примет" in rows[0][8]
+
+
+def test_карточка_кода_называет_РД(application):
+    from app.core.marking import PermitDoc
+    from app.ui.widgets.marking_dialogs import CodeInfoDialog, permits_text
+
+    item = _info(PERFUME, permits=[PermitDoc(
+        kind="CONFORMITY_DECLARATION", number="ЕАЭС N RU Д-FR.РА01.В.00001/25",
+        date="2025-03-01T00:00:00.000Z", status_group=1)])
+
+    CodeInfoDialog(item)
+
+    assert "Декларация о соответствии ЕАЭС N RU Д-FR.РА01.В.00001/25 от 2025-03-01" \
+        in permits_text(item)
+    assert "не получены" in permits_text(_info(PERFUME))
+
+
 def test_результат_показывает_все_коды_без_обрезки(application, tmp_path, stub):
     """В документе бывает больше тысячи кодов, и глазами просят увидеть каждый."""
     page = _page(application, tmp_path)

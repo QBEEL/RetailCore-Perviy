@@ -75,7 +75,17 @@ def _step_1(connection: sqlite3.Connection) -> None:
     connection.executescript(_V1)
 
 
-_MIGRATIONS = (_step_1,)
+def _step_2(connection: sqlite3.Connection) -> None:
+    """Разрешительные документы кода — JSON `{"docs": [...], "exempt": ""}`.
+
+    Пустая строка у записей, сделанных раньше, означает «не спрашивали», а не
+    «документов нет»: иначе весь прежний кэш разом покраснел бы.
+    """
+    connection.execute(
+        "ALTER TABLE code_check ADD COLUMN permits TEXT NOT NULL DEFAULT ''")
+
+
+_MIGRATIONS = (_step_1, _step_2)
 VERSION = len(_MIGRATIONS)
 
 

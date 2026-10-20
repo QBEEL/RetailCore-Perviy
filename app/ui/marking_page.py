@@ -69,9 +69,10 @@ from ..core.marking import (
     Operation,
     OperationKind,
     Organisation,
+    PermitState,
     codes as codes_module,
 )
-from ..core.marking import deadlines
+from ..core.marking import check_export, deadlines
 from ..core.marking import issue as issue_module
 from ..core.marking import introduce as introduce_module
 from ..core.marking import orders as orders_module, service
@@ -102,6 +103,7 @@ from .widgets.marking_dialogs import (
     NomenclatureDialog,
     OrderConfirmDialog,
     OrganisationDialog,
+    permits_text,
 )
 from .widgets.toast import ToastKind
 from .widgets.sale_tab import SaleTab
@@ -110,6 +112,10 @@ from .widgets.withdrawal_tab import WithdrawalTab
 # Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
 # занимает то, что осталось от окна, и на тысяче кодов это пять строк.
 RESULT_EXPANDED_HEIGHT = 640
+
+_RESULT_INTRO = ("Проверка спрашивает «Честный ЗНАК» о каждом коде: чей он, в "
+                 "обороте ли, не выведен ли уже и есть ли у него разрешительный "
+                 "документ (РД) — без него 1С не примет товар.")
 
 # Пауза перед пересчётом сводки по кодам. Сканер вводит код посимвольно, и
 # разбор на каждое нажатие превратил бы одну пачку в тысячу разборов.
@@ -727,6 +733,21 @@ class MarkingPage(QWidget):
         self.problems_box = QCheckBox("Только замечания", card)
         self.problems_box.stateChanged.connect(self._fill_result)
         header.addWidget(self.problems_box)
+        # Отдельный отбор, а не «Только замечания»: до приёмки владелец у всех
+        # кодов УПД — поставщик, и «чужими» с замечаниями оказываются все.
+        self.permits_box = QCheckBox("Только без РД", card)
+        self.permits_box.setToolTip(
+            "Коды без действующего разрешительного документа — их 1С не примет. "
+            "Этот список выгружают и отправляют поставщику")
+        self.permits_box.stateChanged.connect(self._fill_result)
+        header.addWidget(self.permits_box)
+        self.result_export = self._action(card, "Выгрузить в Excel", "export",
+                                          self.export_result)
+        self.result_export.setToolTip(
+            "Сохранить коды, которые сейчас видны в таблице, с учётом отбора — "
+            "например, список кодов без РД для поставщика")
+        self.result_export.setEnabled(False)
+        header.addWidget(self.result_export)
         self.result_expand = self._action(card, "Развернуть", "expand",
                                           self._toggle_result)
         self.result_expand.setToolTip(
@@ -741,14 +762,19 @@ class MarkingPage(QWidget):
         self.tile_elsewhere = MetricTile("Не в обороте", Palette.WARNING, card)
         self.tile_alien = MetricTile("Чужих", Palette.INFO, card)
         self.tile_missing = MetricTile("Не найдено", Palette.DANGER, card)
+        self.tile_permits = MetricTile("Без РД", Palette.DANGER, card)
+        self.tile_permits.setToolTip(
+            "Коды без действующей разрешительной документации (декларации или "
+            "сертификата). 1С на приёмке отвечает по ним «Некорректный статус "
+            "РД». Исправляет тот, кто вводил код в оборот, — поставщик")
         for tile in (self.tile_circulation, self.tile_elsewhere, self.tile_alien,
-                     self.tile_missing):
+                     self.tile_missing, self.tile_permits):
             tiles.addWidget(tile, 1)
         body.addLayout(tiles)
 
-        self.result = QTableWidget(0, 5, card)
+        self.result = QTableWidget(0, 6, card)
         self.result.setHorizontalHeaderLabels(
-            ["Товар", "Код", "Состояние", "Владелец", "Замечания"])
+            ["Товар", "Код", "Состояние", "Владелец", "РД", "Замечания"])
         self.result.verticalHeader().setVisible(False)
         self.result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -760,15 +786,13 @@ class MarkingPage(QWidget):
         # Замечание бывает длинным, поэтому ему отведена своя ширина — иначе
         # одна многословная строка сжимает название товара до многоточия.
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        head.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.result.setColumnWidth(4, 240)
+        head.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.result.setColumnWidth(5, 240)
         body.addWidget(self.result, 1)
 
-        self.result_hint = Hint(
-            "Проверка спрашивает «Честный ЗНАК» о каждом коде: чей он, в обороте "
-            "ли и не выведен ли уже.", card)
+        self.result_hint = Hint(_RESULT_INTRO, card)
         body.addWidget(self.result_hint)
         return card
 
@@ -2287,13 +2311,16 @@ class MarkingPage(QWidget):
             sum(1 for i in found if i.found and not i.state.sellable))
         self.tile_alien.set_value(sum(1 for i in found if i.owner_inn and not i.ours))
         self.tile_missing.set_value(sum(1 for i in found if not i.found))
+        self.tile_permits.set_value(sum(1 for i in found if i.permit_state.troubled))
         self._fill_result()
         self.reload_journal()
 
     def _troubled(self, item: CodeInfo) -> bool:
-        """Код, на котором стоит остановиться: чужой, не в обороте или неизвестный."""
+        """Код, на котором стоит остановиться: чужой, не в обороте, неизвестный
+        или без действующего разрешительного документа."""
         return (bool(item.problems) or not item.found or not item.state.sellable
-                or (bool(item.owner_inn) and not item.ours))
+                or (bool(item.owner_inn) and not item.ours)
+                or item.permit_state.troubled)
 
     def _toggle_result(self) -> None:
         self._toggle_table(self.result, self.result_expand)
@@ -2406,8 +2433,11 @@ class MarkingPage(QWidget):
 
     def _fill_result(self) -> None:
         shown = [item for item in self._result
-                 if not self.problems_box.isChecked() or self._troubled(item)]
+                 if (not self.problems_box.isChecked() or self._troubled(item))
+                 and (not self.permits_box.isChecked()
+                      or item.permit_state.troubled)]
         self._shown = shown
+        self.result_export.setEnabled(bool(shown))
         # Тысячи строк с перерисовкой на каждую ячейку заметно подвешивают окно.
         self.result.setUpdatesEnabled(False)
         self.result.setRowCount(len(shown))
@@ -2419,7 +2449,8 @@ class MarkingPage(QWidget):
                      f"{item.gtin} · {item.serial}" if item.gtin else item.code[:40],
                      item.state.title,
                      owner,
-                     "; ".join(item.problems))
+                     item.permit_state.title,
+                     "; ".join(item.remarks))
             for column, text in enumerate(cells):
                 cell = QTableWidgetItem(text)
                 # Подсказка на каждой ячейке: длинное название и длинное
@@ -2428,17 +2459,43 @@ class MarkingPage(QWidget):
                 cell.setToolTip(text)
                 if column == 2:
                     cell.setForeground(QColor(_state_color(item)))
+                elif column == 4:
+                    cell.setToolTip(permits_text(item))
+                    if colour := _permit_color(item):
+                        cell.setForeground(QColor(colour))
                 self.result.setItem(row, column, cell)
         self.result.setUpdatesEnabled(True)
         if not self._result:
-            self.result_hint.setText(
-                "Проверка спрашивает «Честный ЗНАК» о каждом коде: чей он, в "
-                "обороте ли и не выведен ли уже.")
+            self.result_hint.setText(_RESULT_INTRO)
             return
         troubled = sum(1 for item in self._result if self._troubled(item))
-        self.result_hint.setText(
-            f"Проверено кодов: {len(self._result)} · требуют внимания: {troubled}"
-            f" · двойной щелчок по строке покажет сведения о коде")
+        text = (f"Проверено кодов: {len(self._result)} · требуют внимания: {troubled}"
+                f" · двойной щелчок по строке покажет сведения о коде")
+        if any(item.permit_state.troubled for item in self._result):
+            text += (". Коды без действующего РД 1С не примет («Некорректный статус "
+                     "РД»): РД в код вносит поставщик, который вводил товар в оборот")
+        self.result_hint.setText(text)
+
+    def export_result(self) -> None:
+        """Коды из таблицы — в Excel, как они видны сейчас, с учётом отбора."""
+        if not self._shown:
+            self.notify("В таблице нет кодов для выгрузки", ToastKind.WARNING)
+            return
+        folder = os.path.dirname(self._upd.source) if self._upd else ""
+        suggested = check_export.default_name(
+            folder, only_permits=self.permits_box.isChecked())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Выгрузить коды", suggested, "Excel (*.xlsx)")
+        if not path:
+            return
+        run_task(
+            check_export.save,
+            list(self._shown), path,
+            on_result=lambda saved: self.notify(
+                f"Коды выгружены: {os.path.basename(saved)}", ToastKind.SUCCESS),
+            on_error=lambda message: self.notify(
+                f"Не удалось выгрузить коды: {message}", ToastKind.ERROR),
+        )
 
     # --- журнал --------------------------------------------------------------------
 
@@ -3286,3 +3343,14 @@ def _state_color(item: CodeInfo) -> str:
     if item.state.sellable:
         return Palette.SUCCESS
     return Palette.WARNING
+
+
+def _permit_color(item: CodeInfo) -> str:
+    state = item.permit_state
+    if state is PermitState.VALID:
+        return Palette.SUCCESS
+    if state in (PermitState.MISSING, PermitState.INVALID):
+        return Palette.DANGER
+    if state.troubled:
+        return Palette.WARNING
+    return ""

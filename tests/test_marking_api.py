@@ -13,6 +13,8 @@ from app.core.marking import (
     Contour,
     OperationKind,
     OperationStatus,
+    PermitDoc,
+    PermitState,
     fingerprint,
     group_of,
     parse_state,
@@ -598,3 +600,160 @@ def test_answer_puts_details_inside_cis_info():
     assert len(result) == 1
     assert not result[0].found
     assert "не найден" in result[0].problems[0]
+
+
+# --- разрешительная документация (РД) ---------------------------------------------
+
+def _answer(**cis_info):
+    """Одна запись ответа `cises/info` по найденному коду в обороте."""
+    return [{"cisInfo": {"requestedCis": "к-1", "cis": "к-1", "gtin": "0" * 14,
+                         "status": "INTRODUCED", **cis_info}}]
+
+
+def _doc(group, number="ЕАЭС N RU Д-FR.РА01.В.00001/25"):
+    return {"type": "CONFORMITY_DECLARATION", "number": number,
+            "date": "2025-01-01T00:00:00.000Z", "indx": 1, "statusGroup": group}
+
+
+def test_code_without_cert_doc_has_no_permit():
+    """Так 1С видит «Некорректный статус РД — статус неизвестен».
+
+    Случай из жизни: УПД на духи, 18 кодов одной партии импортёра без `certDoc`,
+    хотя код в обороте. ГИС МТ не присылает массив вовсе, если РД нет.
+    """
+    item = service._parse_check(_answer(), ["к-1"])[0]
+
+    assert item.state is CodeState.INTRODUCED
+    assert item.permits == []
+    assert item.permit_state is PermitState.MISSING
+    assert item.permit_state.troubled
+
+
+def test_valid_declaration_is_fine():
+    item = service._parse_check(_answer(certDoc=[_doc(1)]), ["к-1"])[0]
+
+    assert item.permit_state is PermitState.VALID
+    assert not item.permit_state.troubled
+    assert item.permits[0].number.endswith("00001/25")
+
+
+def test_code_is_judged_by_its_best_document():
+    """У кода бывает десяток деклараций, и одной истёкшей среди них мало."""
+    item = service._parse_check(
+        _answer(certDoc=[_doc(11), _doc(1, "другой")]), ["к-1"])[0]
+
+    assert item.permit_state is PermitState.VALID
+
+
+@pytest.mark.parametrize("group, expected", [
+    (1, PermitState.VALID),
+    (4, PermitState.UNCONFIRMED),      # «неизвестный статус» — ГИС МТ пропустит
+    (27, PermitState.UNCONFIRMED),     # аварийный режим
+    (2, PermitState.LAPSED),           # приостановлен
+    (11, PermitState.LAPSED),          # истёк срок
+    (7, PermitState.LAPSED),           # не найден в реестре РА
+    (3, PermitState.INVALID),
+    (18, PermitState.INVALID),
+    (99, PermitState.LAPSED),          # новая группа должна насторожить
+])
+def test_status_groups_follow_the_true_api_reference(group, expected):
+    assert PermitDoc(status_group=group).state is expected
+
+
+def test_status_group_may_come_as_a_colour_or_a_string():
+    assert PermitDoc(color="green").state is PermitState.VALID
+    assert PermitDoc(color="Red").state is PermitState.INVALID
+    item = service._parse_check(_answer(certDoc=[_doc("3")]), ["к-1"])[0]
+    assert item.permit_state is PermitState.INVALID
+
+
+def test_reason_from_the_card_means_no_permit_is_needed():
+    item = service._parse_check(_answer(certDocRequirementDetails={
+        "notRequiredReason": "не подлежит", "isRequired": True}), ["к-1"])[0]
+
+    assert item.permit_state is PermitState.EXEMPT
+    assert not item.permit_state.troubled
+
+
+def test_not_found_code_says_nothing_about_permits():
+    """Про ненайденный код РД неизвестен — это не «РД нет»."""
+    item = service._parse_check([{
+        "cisInfo": {"requestedCis": "к-1"},
+        "errorMessage": "КМ/КИ не найден", "errorCode": "404"}], ["к-1"])[0]
+
+    assert item.permit_state is PermitState.UNKNOWN
+    assert not item.permit_state.troubled
+
+
+def test_permits_survive_the_cache(tmp_path):
+    path = str(tmp_path / "marking.db")
+    item = service._parse_check(_answer(certDoc=[_doc(11)]), ["к-1"])[0]
+    bare = service._parse_check(_answer(), ["к-1"])[0]
+    bare.code = "к-2"
+
+    store.remember_checks([item, bare], Contour.SANDBOX, path)
+    known = store.known_checks(["к-1", "к-2"], Contour.SANDBOX, path)
+
+    assert known["к-1"].permits[0].status_group == 11
+    assert known["к-1"].permit_state is PermitState.LAPSED
+    assert known["к-2"].permit_state is PermitState.MISSING
+
+
+def test_old_cache_is_upgraded_without_turning_red(tmp_path):
+    """Ответы, сохранённые до разбора РД, — «не спрашивали», а не «нет РД»."""
+    import sqlite3
+
+    from app.core.marking import schema
+
+    path = str(tmp_path / "marking.db")
+    with sqlite3.connect(path) as connection:
+        schema._step_1(connection)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            "INSERT INTO code_check (code, state, found, contour, checked_at)"
+            " VALUES ('к-1', 'introduced', 1, 'sandbox', '2026-10-01T00:00:00')")
+    connection.close()
+
+    known = store.known_checks(["к-1"], Contour.SANDBOX, path)
+
+    assert known["к-1"].permit_state is PermitState.UNKNOWN
+
+
+def test_cached_answer_without_permits_is_asked_again(monkeypatch, tmp_path):
+    """Иначе после обновления колонка «РД» пустовала бы до ручной перепроверки."""
+    path = str(tmp_path / "marking.db")
+    from app.core.marking.models import CodeInfo
+
+    store.remember_checks(
+        [CodeInfo(code="0104600000000001215AAAAAAAAAAAA", found=True,
+                  state=CodeState.INTRODUCED),
+         CodeInfo(code="0104600000000001215BBBBBBBBBBBB", found=True,
+                  state=CodeState.INTRODUCED, permits=[])],
+        Contour.SANDBOX, path)
+    sent: list[list[str]] = []
+    monkeypatch.setattr(service, "_ask", lambda batch, contour: (
+        sent.append(list(batch)) or [_fake_info(code) for code in batch]))
+
+    service.check(["0104600000000001215AAAAAAAAAAAA",
+                   "0104600000000001215BBBBBBBBBBBB"],
+                  contour=Contour.SANDBOX, db_path=path)
+
+    assert sent == [["0104600000000001215AAAAAAAAAAAA"]]
+
+
+def test_permit_remark_joins_the_problems():
+    """Замечание о РД выводится из сохранённых сведений, а не из ответа."""
+    from app.core.marking.models import CodeInfo
+
+    item = CodeInfo(code="к-1", found=True, permits=[], problems=["ответ системы"])
+
+    assert item.remarks == ["ответ системы",
+                            "нет разрешительного документа (РД) — 1С не примет"]
+    assert CodeInfo(code="к-2", found=True).remarks == []
+
+
+def test_export_refuses_an_empty_list(tmp_path):
+    from app.core.marking import check_export
+
+    with pytest.raises(ValueError):
+        check_export.save([], str(tmp_path / "пусто.xlsx"))
