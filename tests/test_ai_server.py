@@ -49,10 +49,16 @@ class Usage:
 
     def __init__(self, limit: int) -> None:
         self.requests = 0
-        self.limit = limit
+        # Личный предел учётки; None — не задан, действует общий.
+        self.own: int | None = limit
 
     def fetch_one(self, query, params=None):
-        if self.requests >= self.limit:
+        if "SELECT ai_daily_limit" in query:
+            return {"ai_daily_limit": self.own}
+        if "EXTRACT(EPOCH" in query:
+            return {"used": self.requests, "reset": 3725.4}
+        limit = params[2]
+        if self.requests >= limit:
             return None
         self.requests += 1
         return {"requests": self.requests}
@@ -94,6 +100,24 @@ def ok(text: str):
 
 
 BODY = {"instruction": "Сделай короче", "text": "Очень длинный текст заметки"}
+
+
+class TestUserLimitField:
+    def test_missing_field_is_not_a_change(self) -> None:
+        from server_app.schemas import UserIn  # noqa: PLC0415
+
+        # Приложение без поддержки предела его не присылает: сохранение учётки не
+        # должно сбросить заданное администратором значение.
+        assert "ai_limit" not in UserIn(login="km").model_fields_set
+        assert "ai_limit" in UserIn(login="km", ai_limit=None).model_fields_set
+
+    @pytest.mark.parametrize("value", [-1, 1001])
+    def test_limit_is_bounded(self, value) -> None:
+        from pydantic import ValidationError  # noqa: PLC0415
+        from server_app.schemas import UserIn  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            UserIn(login="km", ai_limit=value)
 
 
 class TestEdit:
@@ -173,6 +197,42 @@ class TestEdit:
 
         monkeypatch.setattr(ai.httpx, "Client", google(slow))
         assert client.post("/api/ai/edit", json=BODY).status_code == 504
+
+    def test_personal_limit_replaces_the_common_one(self, client, monkeypatch) -> None:
+        monkeypatch.setattr(ai.httpx, "Client", google(ok("x")))
+        client.usage.own = 1
+        assert client.post("/api/ai/edit", json=BODY).status_code == 200
+        second = client.post("/api/ai/edit", json=BODY)
+        assert second.status_code == 429 and "(1 обращений)" in second.json()["detail"]
+
+    def test_unset_limit_falls_back_to_the_common_one(self, client, monkeypatch) -> None:
+        monkeypatch.setattr(ai.httpx, "Client", google(ok("x")))
+        client.usage.own = None
+        object.__setattr__(ai.settings, "ai_daily_limit", 1)
+        try:
+            assert client.post("/api/ai/edit", json=BODY).status_code == 200
+            assert client.post("/api/ai/edit", json=BODY).status_code == 429
+        finally:
+            object.__setattr__(ai.settings, "ai_daily_limit", 20)
+
+    def test_zero_limit_closes_the_feature(self, client, monkeypatch) -> None:
+        monkeypatch.setattr(ai.httpx, "Client", google(
+            lambda request: pytest.fail("запрос к Google не нужен")))
+        client.usage.own = 0
+        response = client.post("/api/ai/edit", json=BODY)
+        assert response.status_code == 403 and "закрыл" in response.json()["detail"]
+        assert client.usage.requests == 0
+
+    def test_usage_reports_limit_and_reset(self, client, monkeypatch) -> None:
+        monkeypatch.setattr(ai.httpx, "Client", google(ok("x")))
+        client.post("/api/ai/edit", json=BODY)
+        answer = client.get("/api/ai/usage").json()
+        assert answer == {"used": 1, "limit": 2, "reset_seconds": 3725,
+                          "max_text": 20000, "max_instruction": 500, "configured": True}
+
+    def test_usage_without_key_says_not_configured(self, client) -> None:
+        object.__setattr__(ai.settings, "gemini_key", "")
+        assert client.get("/api/ai/usage").json()["configured"] is False
 
     @pytest.mark.parametrize("body", [
         {"instruction": "", "text": "текст"},

@@ -76,6 +76,15 @@ def _moment(value: datetime | None) -> str:
     return f"{value:%d.%m.%Y %H:%M}" if value else ""
 
 
+def _ai_usage_text(account: Account) -> str:
+    """«3 из 20» — обращений к ИИ сегодня из предела; «закрыто» при нуле."""
+    if account.ai_limit is None:
+        return f"{account.ai_used} (общий)" if account.ai_used else "общий"
+    if account.ai_limit == 0:
+        return "закрыто"
+    return f"{account.ai_used} из {account.ai_limit}"
+
+
 class AdminPage(QWidget):
     """Страница администрирования."""
 
@@ -156,6 +165,8 @@ class AdminPage(QWidget):
                    color=lambda a: None if a.is_active else QColor(Palette.TEXT_FAINT)),
             Column("Направления", lambda a: ", ".join(a.directions), 140),
             Column("Разделы", lambda a: pages.describe(a.denied_pages), 220),
+            Column("ИИ сегодня", _ai_usage_text, 110,
+                   sort_key=lambda a: a.ai_used),
             Column("Имён в 1С", lambda a: len(a.responsible), 90,
                    align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             Column("Кто в 1С", lambda a: ", ".join(a.responsible), 320),

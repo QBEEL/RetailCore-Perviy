@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -123,6 +124,7 @@ class AccountDialog(QDialog):
 
         self.pages: list[tuple[str, QCheckBox]] = []
         self._build_pages(root)
+        self._build_ai(root)
 
         root.addWidget(SectionTitle("Чьи оплаты считаются своими"))
         root.addWidget(Hint(
@@ -241,6 +243,43 @@ class AccountDialog(QDialog):
             parent.toggled.connect(follow)
             follow(parent.isChecked())
 
+    def _build_ai(self, root: QVBoxLayout) -> None:
+        """Сколько раз в сутки человек может просить ИИ поправить заметку.
+
+        Запросы идут с общего платного ключа, поэтому предел можно задать каждому:
+        активному — побольше, тому, кому ИИ не нужен, — ноль.
+        """
+        root.addWidget(SectionTitle("ИИ-правка заметок"))
+        row = QHBoxLayout()
+        row.setSpacing(Metrics.GAP)
+        self.ai_own = QCheckBox("Свой предел обращений в сутки", self)
+        self.ai_own.setChecked(self.account.ai_limit is not None)
+        row.addWidget(self.ai_own)
+        self.ai_limit = QSpinBox(self)
+        self.ai_limit.setRange(0, 1000)
+        self.ai_limit.setSuffix(" в сутки")
+        self.ai_limit.setValue(self.account.ai_limit if self.account.ai_limit is not None else 0)
+        self.ai_limit.setEnabled(self.ai_own.isChecked())
+        self.ai_own.toggled.connect(self.ai_limit.setEnabled)
+        self.ai_own.toggled.connect(lambda _: self._ai_hint())
+        self.ai_limit.valueChanged.connect(lambda _: self._ai_hint())
+        row.addWidget(self.ai_limit)
+        row.addStretch(1)
+        root.addLayout(row)
+        self.ai_note = Hint("", self)
+        root.addWidget(self.ai_note)
+        self._ai_hint()
+
+    def _ai_hint(self) -> None:
+        used = f" Сегодня использовано: {self.account.ai_used}." if self.account.id else ""
+        if not self.ai_own.isChecked():
+            text = "Не отмечено — действует общий предел сервера."
+        elif self.ai_limit.value() == 0:
+            text = "Ноль закрывает ИИ-правку: кнопка в заметках скажет, что её отключили."
+        else:
+            text = f"Не больше {self.ai_limit.value()} обращений в сутки, счётчик обнуляется в полночь по Москве."
+        self.ai_note.setText(text + used)
+
     def _accept(self) -> None:
         login = self.login.text().strip().lower()
         if not login:
@@ -271,4 +310,5 @@ class AccountDialog(QDialog):
                                      if not box.isChecked()]
         self.account.is_admin = self.is_admin.isChecked()
         self.account.is_active = self.is_active.isChecked()
+        self.account.ai_limit = self.ai_limit.value() if self.ai_own.isChecked() else None
         return self.account

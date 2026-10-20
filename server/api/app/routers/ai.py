@@ -52,7 +52,30 @@ def _fail(code: int, detail: str) -> HTTPException:
     return HTTPException(status_code=code, detail=detail)
 
 
-def _claim(user_id: int, chars: int) -> bool:
+class UsageOut(BaseModel):
+    """Сколько обращений использовано сегодня и сколько можно всего."""
+
+    used: int
+    # Предел человека: личный, заданный администратором, или общий сервера.
+    # 0 — ИИ человеку закрыт.
+    limit: int
+    # Через сколько секунд счётчик обнулится (полночь по Москве).
+    reset_seconds: int
+    # Самый длинный текст, который принимает один запрос, в знаках.
+    max_text: int = MAX_TEXT
+    max_instruction: int = MAX_INSTRUCTION
+    # Ключ на сервере задан. Без него правка невозможна у всех.
+    configured: bool
+
+
+def limit_of(user_id: int) -> int:
+    """Предел обращений в сутки: личный, если администратор его задал."""
+    row = db.fetch_one("SELECT ai_daily_limit FROM app_user WHERE id = %s", (user_id,))
+    own = row["ai_daily_limit"] if row else None
+    return settings.ai_daily_limit if own is None else int(own)
+
+
+def _claim(user_id: int, chars: int, limit: int) -> bool:
     """Занимает одно обращение из дневного предела. Ложь — предел исчерпан.
 
     Проверка и счёт — одним оператором: два одновременных запроса не пройдут
@@ -65,7 +88,7 @@ def _claim(user_id: int, chars: int) -> bool:
         "   SET requests = ai_usage.requests + 1, chars = ai_usage.chars + EXCLUDED.chars"
         "   WHERE ai_usage.requests < %s"
         " RETURNING requests",
-        (user_id, chars, settings.ai_daily_limit))
+        (user_id, chars, limit))
     return row is not None
 
 
@@ -147,15 +170,33 @@ def _extract(data: dict) -> str:
     return result
 
 
+@router.get("/usage", response_model=UsageOut, summary="Сколько обращений осталось")
+def usage(user: User = Depends(security.current_user)) -> UsageOut:
+    row = db.fetch_one(
+        "SELECT COALESCE((SELECT requests FROM ai_usage WHERE user_id = %s"
+        "                  AND day = (now() AT TIME ZONE 'Europe/Moscow')::date), 0) AS used,"
+        "       EXTRACT(EPOCH FROM (((now() AT TIME ZONE 'Europe/Moscow')::date + 1)"
+        "                           AT TIME ZONE 'Europe/Moscow') - now()) AS reset",
+        (user.id,))
+    return UsageOut(used=int(row["used"]), limit=limit_of(user.id),
+                    reset_seconds=max(int(row["reset"]), 0),
+                    configured=bool(settings.gemini_key))
+
+
 @router.post("/edit", response_model=EditOut, summary="Править текст по просьбе")
 def edit(form: EditIn, user: User = Depends(security.current_user)) -> EditOut:
     if not settings.gemini_key:
         raise _fail(status.HTTP_503_SERVICE_UNAVAILABLE,
                     "ИИ на сервере не настроен. Сообщите администратору")
+    limit = limit_of(user.id)
+    if limit <= 0:
+        raise _fail(status.HTTP_403_FORBIDDEN,
+                    "Администратор закрыл вам ИИ-правку. Если она нужна, попросите открыть")
     chars = len(form.text) + len(form.instruction)
-    if not _claim(user.id, chars):
+    if not _claim(user.id, chars, limit):
         raise _fail(status.HTTP_429_TOO_MANY_REQUESTS,
-                    f"Лимит ИИ на сегодня исчерпан ({settings.ai_daily_limit} обращений)")
+                    f"Лимит ИИ на сегодня исчерпан ({limit} обращений). "
+                    "Счётчик обнуляется в полночь по Москве")
     try:
         return EditOut(text=_ask(form.instruction.strip(), form.text))
     except HTTPException:

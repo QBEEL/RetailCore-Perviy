@@ -31,11 +31,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core import ai
 from ..core.notes import markdown_io, store
+from ..core.payments import transport
 from ..core.settings import AppSettings
 from . import icons
+from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.ai_edit_dialog import AiEditDialog
+from .widgets.usage_meter import UsageMeter
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title, fade_in
 from .widgets.note_editor import NoteEditor, NoteToolbar
 from .widgets.toast import ToastKind
@@ -105,8 +109,10 @@ class NotesPage(QWidget):
         self._timer.setSingleShot(True)
         self._timer.setInterval(SAVE_DELAY_MS)
         self._timer.timeout.connect(self._save_now)
+        self._ai_usage: ai.Usage | None = None
         self._build()
         self._reload_tree()
+        self.refresh_ai_usage()
 
     # --- интерфейс ------------------------------------------------------------
 
@@ -228,6 +234,10 @@ class NotesPage(QWidget):
         self.status = QLabel("", box)
         self.status.setStyleSheet(f"color: {Palette.TEXT_FAINT};")
         footer.addWidget(self.status, 1)
+        # Остаток обращений к ИИ на сегодня: полоса заполняется по мере расхода, а
+        # подсказка объясняет, когда счётчик обнулится и кто задаёт предел.
+        self.ai_meter = UsageMeter("ИИ сегодня", box, compact=True)
+        footer.addWidget(self.ai_meter)
         self.undo_ai_button = QPushButton("Вернуть как было", box)
         self.undo_ai_button.setToolTip("Вернуть текст, каким он был до ИИ-правки")
         self.undo_ai_button.setVisible(False)
@@ -256,6 +266,7 @@ class NotesPage(QWidget):
     def restore(self) -> None:
         """Вкладку открыли: перечитываем дерево, оставаясь на той же странице."""
         self._reload_tree(select=self._current)
+        self.refresh_ai_usage()
 
     def focus_search(self) -> None:
         self.search.setFocus()
@@ -499,6 +510,21 @@ class NotesPage(QWidget):
 
     # --- ИИ-правка ------------------------------------------------------------
 
+    def refresh_ai_usage(self) -> None:
+        """Перечитывает остаток обращений. Без входа в оплаты спрашивать некого."""
+        if not transport.session.active:
+            self._ai_usage = None
+            self.ai_meter.show_message(
+                "нужен вход", "Для ИИ-правки войдите в оплаты: текст обрабатывает сервер.")
+            return
+        run_task(ai.usage, on_result=self._ai_usage_loaded,
+                 on_error=lambda message: self.ai_meter.show_message("нет данных", message))
+
+    def _ai_usage_loaded(self, usage: object) -> None:
+        if isinstance(usage, ai.Usage):
+            self._ai_usage = usage
+            self.ai_meter.show_usage(usage)
+
     def ai_edit(self) -> None:
         if self._current is None:
             return
@@ -518,8 +544,12 @@ class NotesPage(QWidget):
             except OSError:
                 # Согласие не запомнилось — спросим в следующий раз, это не беда.
                 pass
-        dialog = AiEditDialog(self.editor.markdown(), self.editor.selection_markdown(), self)
-        if dialog.exec() != AiEditDialog.DialogCode.Accepted:
+        dialog = AiEditDialog(self.editor.markdown(), self.editor.selection_markdown(), self,
+                              usage=self._ai_usage)
+        accepted = dialog.exec() == AiEditDialog.DialogCode.Accepted
+        # Обращение могло быть потрачено, даже если результат не взяли.
+        self.refresh_ai_usage()
+        if not accepted:
             return
         self._before_ai = self.editor.markdown()
         if dialog.for_selection:

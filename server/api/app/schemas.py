@@ -224,6 +224,10 @@ class UserIn(BaseModel):
     # приложения и здесь не проверяются: их список живёт в клиенте и меняется
     # с каждой версией, а справочник на сервере пришлось бы догонять миграцией.
     denied_pages: list[str] = []
+    # Обращений к ИИ-правке в сутки. Не передан — не менять (так старое
+    # приложение, не знающее о поле, не сбросит заданный предел); null —
+    # общий предел сервера; 0 — ИИ человеку закрыт.
+    ai_limit: int | None = Field(default=None, ge=0, le=1000)
     is_admin: bool = False
     is_active: bool = True
 
@@ -235,6 +239,9 @@ class UserOut(BaseModel):
     responsible: list[str]
     directions: list[str] = []
     denied_pages: list[str] = []
+    # Личный предел ИИ-правки (null — общий) и сколько обращений сегодня.
+    ai_limit: int | None = None
+    ai_used: int = 0
     is_admin: bool
     is_active: bool
     created_at: datetime

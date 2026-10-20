@@ -36,6 +36,10 @@ class Account:
     is_admin: bool = False
     is_active: bool = True
     created_at: datetime | None = None
+    # Личный предел обращений к ИИ-правке в сутки: None — общий предел сервера,
+    # 0 — ИИ человеку закрыт. ai_used — сколько обращений сегодня.
+    ai_limit: int | None = None
+    ai_used: int = 0
 
     @property
     def title(self) -> str:
@@ -293,7 +297,9 @@ def _account(row: dict) -> Account:
         directions=list(row.get("directions", []) or []),
         denied_pages=list(row.get("denied_pages", []) or []),
         is_admin=bool(row["is_admin"]), is_active=bool(row["is_active"]),
-        created_at=_moment(row.get("created_at")))
+        created_at=_moment(row.get("created_at")),
+        ai_limit=None if row.get("ai_limit") is None else int(row["ai_limit"]),
+        ai_used=int(row.get("ai_used") or 0))
 
 
 # --- учётные записи ------------------------------------------------------------
@@ -307,7 +313,7 @@ def create(account: Account) -> tuple[Account, str]:
     answer = transport.post("/api/users", {
         "login": account.login, "full_name": account.full_name,
         "responsible": account.responsible, "directions": account.directions,
-        "denied_pages": account.denied_pages,
+        "denied_pages": account.denied_pages, "ai_limit": account.ai_limit,
         "is_admin": account.is_admin, "is_active": account.is_active})
     account.id = int(answer["id"])
     account.login = answer["login"]
@@ -318,7 +324,7 @@ def save(account: Account) -> Account:
     return _account(transport.put(f"/api/users/{account.id}", {
         "login": account.login, "full_name": account.full_name,
         "responsible": account.responsible, "directions": account.directions,
-        "denied_pages": account.denied_pages,
+        "denied_pages": account.denied_pages, "ai_limit": account.ai_limit,
         "is_admin": account.is_admin, "is_active": account.is_active}))
 
 

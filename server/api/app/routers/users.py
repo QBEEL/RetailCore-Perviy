@@ -1,9 +1,11 @@
 """Учётные записи. Всё, кроме «кто я», доступно только администратору."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import db, security
+from .. import auditlog, db, security
 from ..schemas import UserIn, UserOut
 from ..security import User
 
@@ -26,7 +28,11 @@ _SELECT = (
     # каждое столько раз, сколько у человека закрыто вкладок.
     "       COALESCE((SELECT array_agg(p.page_code ORDER BY p.page_code)"
     "                   FROM user_page_denied p"
-    "                  WHERE p.user_id = u.id), '{}') AS denied_pages"
+    "                  WHERE p.user_id = u.id), '{}') AS denied_pages,"
+    "       u.ai_daily_limit AS ai_limit,"
+    "       COALESCE((SELECT a.requests FROM ai_usage a WHERE a.user_id = u.id"
+    "                    AND a.day = (now() AT TIME ZONE 'Europe/Moscow')::date), 0)"
+    "         AS ai_used"
     " FROM app_user u LEFT JOIN user_responsible r ON r.user_id = u.id"
 )
 
@@ -56,6 +62,14 @@ def _save_pages(user_id: int, codes: list[str]) -> None:
         db.execute(
             "INSERT INTO user_page_denied (user_id, page_code) VALUES (%s, %s)"
             " ON CONFLICT DO NOTHING", (user_id, code))
+
+
+def _save_ai_limit(user_id: int, form: UserIn) -> None:
+    """Личный предел ИИ-правки. Не переданный клиентом — остаётся как был."""
+    if "ai_limit" not in form.model_fields_set:
+        return
+    db.execute("UPDATE app_user SET ai_daily_limit = %s WHERE id = %s",
+               (form.ai_limit, user_id))
 
 
 @router.get("/me", response_model=UserOut, summary="Кто я")
@@ -91,6 +105,7 @@ def create_user(form: UserIn,
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], name))
     _save_directions(row["id"], form.directions)
     _save_pages(row["id"], form.denied_pages)
+    _save_ai_limit(row["id"], form)
     db.execute(
         "INSERT INTO audit_log (user_id, entity, entity_id, action)"
         " VALUES (%s, 'app_user', %s, 'create')", (user.id, row["id"]))
@@ -102,7 +117,8 @@ def create_user(form: UserIn,
 @router.put("/{user_id}", response_model=UserOut, summary="Изменить учётку")
 def update_user(user_id: int, form: UserIn,
                 user: User = Depends(security.admin_only)) -> UserOut:
-    if not db.fetch_one("SELECT 1 FROM app_user WHERE id = %s", (user_id,)):
+    old = db.fetch_one("SELECT ai_daily_limit FROM app_user WHERE id = %s", (user_id,))
+    if not old:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="Учётная запись не найдена")
     if user_id == user.id and not form.is_admin:
@@ -125,9 +141,17 @@ def update_user(user_id: int, form: UserIn,
                    " VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, name))
     _save_directions(user_id, form.directions)
     _save_pages(user_id, form.denied_pages)
+    old_limit = old["ai_daily_limit"]
+    _save_ai_limit(user_id, form)
+    changes = {}
+    if "ai_limit" in form.model_fields_set and form.ai_limit != old_limit:
+        # Смена предела — решение администратора о расходах: в журнале видно, кто
+        # и с какого значения на какое.
+        changes = {"ai_limit": form.ai_limit, auditlog.WAS: {"ai_limit": old_limit}}
     db.execute(
-        "INSERT INTO audit_log (user_id, entity, entity_id, action)"
-        " VALUES (%s, 'app_user', %s, 'update')", (user.id, user_id))
+        "INSERT INTO audit_log (user_id, entity, entity_id, action, changes)"
+        " VALUES (%s, 'app_user', %s, 'update', %s)",
+        (user.id, user_id, json.dumps(changes, ensure_ascii=False)))
     return UserOut(**db.fetch_one(_SELECT + " WHERE u.id = %s GROUP BY u.id",
                                   (user_id,)))
 
