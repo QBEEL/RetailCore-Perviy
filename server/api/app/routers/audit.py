@@ -32,6 +32,9 @@ ACTIONS = {
     "upload": "выгрузка локальной базы",
     "wipe": "удаление данных",
     "wipe_denied": "удаление отклонено: неверный пароль",
+    "accept": "принято в работу",
+    "close": "закрытие",
+    "reopen": "возврат из архива",
 }
 
 ENTITIES = {
@@ -42,6 +45,10 @@ ENTITIES = {
     "database": "база данных",
     "dds_item": "статья ДДС",
     "instead_of": "оплата вместо другого",
+    "claim": "заявка Торг-2",
+    "claim_brand": "бренд Торг-2",
+    "torg_act": "акт ТОРГ-2",
+    "torg_setting": "реквизиты ТОРГ-2",
 }
 
 
@@ -84,6 +91,9 @@ def _subject(row: dict, changes: dict[str, Any]) -> str:
         return row["t_user"] or ""
     if entity == "dds_item":
         return row["t_dds"] or changes.get("title") or ""
+    if entity in ("claim", "claim_brand", "torg_act", "torg_setting"):
+        # Заявка может быть удалена, поэтому название берётся из снимка.
+        return (changes.get(auditlog.ABOUT) or {}).get("title", "")
     if entity == "budget" and row["entity_id"]:
         year, month = divmod(row["entity_id"], 100)
         return f"{month:02d}.{year}"

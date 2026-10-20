@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -24,6 +25,8 @@ from ..core.settings import AppSettings
 from ..core.vpn import VpnManager
 from . import icons
 from .catalog_page import CatalogPage
+from .claims_page import ClaimsPage
+from .claims_watch import ClaimsWatcher, NavBadge, describe
 from .history_page import HistoryPage
 from .labels_page import LabelsPage
 from .marking_page import MarkingPage
@@ -51,6 +54,7 @@ from .widgets.update_dialog import UpdateDialog
 # числами: новый раздел в середине списка иначе тихо сдвинул бы половину из них.
 PAGE_PAYMENTS = index_of("payments")
 PAGE_SUPPLIERS = index_of("suppliers")
+PAGE_CLAIMS = index_of("claims")
 PAGE_MARKING = index_of("marking")
 PAGE_REPORTS = index_of("reports")
 PAGE_ADMIN = index_of("admin")
@@ -63,7 +67,7 @@ PAGE_PROFILE = len(PAGES)
 # а половина их кнопок ответила бы ошибкой на первое же нажатие. Маркировки
 # здесь нет: она ходит в «Честный ЗНАК» напрямую и своей базой, а разбор кодов
 # работает и вовсе без сети.
-SERVER_PAGES = (PAGE_PAYMENTS, PAGE_SUPPLIERS, PAGE_REPORTS, PAGE_ADMIN)
+SERVER_PAGES = (PAGE_PAYMENTS, PAGE_SUPPLIERS, PAGE_CLAIMS, PAGE_REPORTS, PAGE_ADMIN)
 
 # Наименьший размер окна при развёрнутом меню; свёрнутое отдаёт окну свою ширину.
 MIN_WINDOW_WIDTH = 1120
@@ -124,6 +128,7 @@ class MainWindow(QMainWindow):
             settings, self.notify, self.pages, self.show_supplier, self.plan_payment)
         self.payments_page = PaymentsPage(settings, self.notify, self.pages, self.show_supplier)
         self.suppliers_page = SuppliersPage(settings, self.notify, self.pages)
+        self.claims_page = ClaimsPage(settings, self.notify, self.pages)
         self.marking_page = MarkingPage(settings, self.notify, self.pages)
         self.labels_page = LabelsPage(settings, self.notify, self.pages)
         self.notes_page = NotesPage(settings, self.notify, self.pages)
@@ -137,7 +142,7 @@ class MainWindow(QMainWindow):
         self.profile_page = ProfilePage(settings, self.notify, self.pages,
                                         self.sign_out)
         for page in (self.match_page, self.order_page, self.price_page, self.payments_page,
-                     self.suppliers_page, self.marking_page, self.labels_page,
+                     self.suppliers_page, self.claims_page, self.marking_page, self.labels_page,
                      self.notes_page, self.reports_page,
                      self.catalog_page, self.history_page, self.settings_page,
                      self.admin_page, self.profile_page):
@@ -148,6 +153,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         self.toasts = ToastManager(self)
+        self.claims_watcher = ClaimsWatcher(self)
+        self.claims_watcher.unseen_changed.connect(self._claims_badge.set_count)
+        self.claims_watcher.arrived.connect(self._claims_arrived)
+        self.claims_page.inbox_changed.connect(self.claims_watcher.poll)
+        self._claims_watching = False
+        self._tray: QSystemTrayIcon | None = None
         self.match_page.busy_changed.connect(self._set_busy)
         self._build_status_bar()
         self._build_actions()
@@ -284,6 +295,10 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _=False, i=index: self.show_page(i))
             self._nav_group.addButton(button, index)
             layout.addWidget(button)
+            if index == PAGE_CLAIMS:
+                # Цифра непрочитанных заявок: в свёрнутом меню подписи нет, и
+                # она единственное, что говорит, что в разделе есть что открыть.
+                self._claims_badge = NavBadge(button)
             if index == PAGE_ADMIN:
                 # Раздел появляется, только когда в общую базу вошёл
                 # администратор. Показывать кнопку, которая ответит «нет прав»,
@@ -447,6 +462,7 @@ class MainWindow(QMainWindow):
             if button := self._nav_group.button(index):
                 button.setVisible(transport.session.may_open(page.code))
         self.reports_page.apply_access()
+        self._sync_claims_watch()
         if not self._page_allowed(self.pages.currentIndex()):
             # Без уведомления: при запуске человек ничего не нажимал, а
             # объяснять закрытый раздел тому, кто его и не открывал, незачем.
@@ -468,6 +484,50 @@ class MainWindow(QMainWindow):
             if self._page_allowed(index):
                 return index
         return PAGE_PROFILE
+
+    def _sync_claims_watch(self) -> None:
+        """Включает опрос заявок, когда он нужен, и выключает, когда нет.
+
+        Нужен он вошедшему в общую базу, у кого раздел не закрыт: тому, кому
+        Торг-2 закрыли, уведомления о нём — шум, а без сервера спрашивать некого.
+        """
+        wanted = (transport.session.active and not self.offline
+                  and transport.session.may_open("claims"))
+        if wanted and not self._claims_watching:
+            self.claims_watcher.start()
+        elif not wanted and self._claims_watching:
+            self.claims_watcher.stop()
+        self._claims_watching = wanted
+
+    def _claims_arrived(self, items: list, unseen: int) -> None:
+        """На человека поставили заявку: всплывашка в программе и, если окно не
+        на виду, системное уведомление — иначе о ней узнают к вечеру."""
+        text = describe(items, unseen)
+        self.notify(text, ToastKind.WARNING)
+        if not self.isActiveWindow():
+            self._system_notice("Торг-2", text)
+
+    def _system_notice(self, title: str, text: str) -> None:
+        """Системное уведомление Windows. Значок в трее живёт, пока оно на
+        экране, и убирается: постоянный значок у программы, которой он не
+        нужен, — лишний."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        if self._tray is not None:
+            self._tray.hide()
+            self._tray.deleteLater()
+        tray = QSystemTrayIcon(icons.app_icon(), self)
+        tray.messageClicked.connect(self._open_claims_from_notice)
+        tray.show()
+        tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Information, 10_000)
+        QTimer.singleShot(15_000, tray.hide)
+        self._tray = tray
+
+    def _open_claims_from_notice(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.show_page(PAGE_CLAIMS)
 
     def show_page(self, index: int) -> bool:
         """Открывает раздел. Ложь — он закрыт, и переход не состоялся."""
@@ -539,6 +599,10 @@ class MainWindow(QMainWindow):
             # Показатели читаются заново: закрепление меняет администратор, и
             # цифра, показанная при запуске, к обеду может устареть.
             self.profile_page.restore()
+        if page is self.claims_page:
+            # Заявки заводят и закрывают другие люди: список, прочитанный при
+            # запуске, к обеду устарел.
+            self.claims_page.restore()
         if page is self.suppliers_page:
             # Список читается при каждом открытии: поставщик мог появиться,
             # пока пользователь сравнивал цены на соседней вкладке.
@@ -630,6 +694,8 @@ class MainWindow(QMainWindow):
         elif page is self.notes_page:
             # Запускать там нечего; F5 перечитывает список страниц.
             self.notes_page.restore()
+        elif page is self.claims_page:
+            self.claims_page.restore()
         elif self.show_page(PAGE_MATCH):
             self.match_page.run_matching()
 
@@ -668,6 +734,8 @@ class MainWindow(QMainWindow):
             self.suppliers_page.focus_search()
         elif page is self.notes_page:
             self.notes_page.focus_search()
+        elif page is self.claims_page:
+            self.claims_page.focus_search()
 
     # --- состояние окна -------------------------------------------------------
 

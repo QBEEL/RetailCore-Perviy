@@ -10,6 +10,8 @@ from .routers import (
     audit,
     auth,
     budgets,
+    claim_brands,
+    claims,
     dds,
     files,
     imports,
@@ -19,6 +21,7 @@ from .routers import (
     reports,
     suppliers,
     sync,
+    torg,
     users,
 )
 
@@ -44,6 +47,8 @@ app.include_router(audit.router)
 app.include_router(payments.router)
 app.include_router(files.router)
 app.include_router(budgets.router)
+app.include_router(claims.router)
+app.include_router(claim_brands.router)
 app.include_router(dds.router)
 app.include_router(recipients.router)
 app.include_router(imports.router)
@@ -51,6 +56,7 @@ app.include_router(maintenance.router)
 app.include_router(reports.router)
 app.include_router(suppliers.router)
 app.include_router(sync.router)
+app.include_router(torg.router)
 app.include_router(users.router)
 
 
