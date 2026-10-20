@@ -14,6 +14,17 @@ class Settings:
     # входа по паролю, а не от последнего продления.
     session_days: int
     files_dir: str
+    # ИИ-правка заметок. Ключ необязателен: без него остальное работает, а
+    # запрос к ИИ получает понятный отказ.
+    gemini_key: str = ""
+    # Название модели у Google меняется, поэтому оно в окружении, а не в коде.
+    ai_model: str = "gemini-3.5-flash-lite"
+    # Обращений к ИИ на человека за сутки. Квота ключа общая (500 запросов в сутки
+    # у этой модели), поэтому предел на человека — двадцать: два десятка
+    # пользователей укладываются, а один не выберет квоту за всех.
+    ai_daily_limit: int = 20
+    # Исходящий прокси до Google, если сервер стоит там, где API закрыт.
+    ai_proxy: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -32,6 +43,10 @@ class Settings:
             token_hours=int(os.environ.get("API_TOKEN_HOURS", "12")),
             session_days=int(os.environ.get("API_SESSION_DAYS", "7")),
             files_dir=os.environ.get("API_FILES_DIR", "/srv/files"),
+            gemini_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+            ai_model=os.environ.get("AI_MODEL", "").strip() or "gemini-3.5-flash-lite",
+            ai_daily_limit=int(os.environ.get("AI_DAILY_LIMIT", "20") or 20),
+            ai_proxy=os.environ.get("AI_HTTPS_PROXY", "").strip(),
         )
 
 

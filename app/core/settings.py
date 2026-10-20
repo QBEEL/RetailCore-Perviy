@@ -128,6 +128,9 @@ class AppSettings:
     # Название сервера, выбранного из подписки: по нему при обновлении списка
     # находится тот же сервер. Название не секретно, в отличие от самой ссылки.
     vpn_server: str = ""
+    # Человек согласился, что текст заметки для ИИ-правки уходит на сервер оплат и
+    # дальше в Gemini. Спрашивается один раз; заметки сами по себе остаются здесь.
+    ai_consent: bool = False
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -347,6 +350,7 @@ class AppSettings:
         self.marking_places = _string_tables(data.get("marking_places"))
         self.vpn_enabled = bool(data.get("vpn_enabled", False))
         self.vpn_server = str(data.get("vpn_server", ""))
+        self.ai_consent = bool(data.get("ai_consent", False))
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -432,6 +436,7 @@ class AppSettings:
             "marking_places": self.marking_places,
             "vpn_enabled": self.vpn_enabled,
             "vpn_server": self.vpn_server,
+            "ai_consent": self.ai_consent,
         }
 
     def remember_payment_import(self, path: str) -> None:

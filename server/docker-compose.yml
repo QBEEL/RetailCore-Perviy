@@ -45,6 +45,11 @@ services:
       API_TOKEN_HOURS: ${API_TOKEN_HOURS:-12}
       API_SESSION_DAYS: ${API_SESSION_DAYS:-7}
       API_FILES_DIR: /srv/files
+      # ИИ-правка заметок. Без ключа остальной сервер работает как обычно.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_DAILY_LIMIT: ${AI_DAILY_LIMIT:-20}
+      AI_HTTPS_PROXY: ${AI_HTTPS_PROXY:-}
     volumes:
       # Та же папка, что копирует backup.sh: вложения переживают пересборку
       # образа и попадают в резервную копию.

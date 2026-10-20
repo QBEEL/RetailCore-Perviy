@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from . import db
 from .routers import (
+    ai,
     audit,
     auth,
     budgets,
@@ -43,6 +44,7 @@ app = FastAPI(
 )
 
 app.include_router(auth.router)
+app.include_router(ai.router)
 app.include_router(audit.router)
 app.include_router(payments.router)
 app.include_router(files.router)

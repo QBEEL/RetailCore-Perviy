@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
+    QTextDocumentFragment,
     QTextFormat,
     QTextListFormat,
 )
@@ -139,6 +140,29 @@ class NoteEditor(QTextEdit):
         self._decorate_all()
         self.document().setModified(False)
         self.document().clearUndoRedoStacks()
+
+    def selection_markdown(self) -> str:
+        """Выделенное в Markdown; пусто, если ничего не выделено."""
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return ""
+        return QTextDocumentFragment(cursor).toMarkdown().strip()
+
+    def replace_selection_markdown(self, text: str) -> None:
+        """Заменяет выделенное оформленным текстом из Markdown одним шагом отмены.
+
+        Текст сначала читается тем же путём, что и страница целиком, — со
+        строками-блоками и фоном цитат, — и только потом вставляется.
+        """
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return
+        scratch = NoteEditor()
+        scratch.load_markdown(text)
+        cursor.beginEditBlock()
+        cursor.insertFragment(QTextDocumentFragment(scratch.document()))
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
 
     def _split_line_breaks(self) -> None:
         """Перенос строки внутри абзаца делаем новым абзацем.

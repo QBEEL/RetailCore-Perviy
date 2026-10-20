@@ -35,6 +35,7 @@ from ..core.notes import markdown_io, store
 from ..core.settings import AppSettings
 from . import icons
 from .theme import Metrics, Palette
+from .widgets.ai_edit_dialog import AiEditDialog
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title, fade_in
 from .widgets.note_editor import NoteEditor, NoteToolbar
 from .widgets.toast import ToastKind
@@ -97,6 +98,9 @@ class NotesPage(QWidget):
         self._loading = False
         self._reloading = False
         self._dirty = False
+        # Текст страницы до последней ИИ-правки: штатная отмена Qt после загрузки
+        # Markdown пуста, поэтому «вернуть как было» держит свой снимок.
+        self._before_ai: str | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(SAVE_DELAY_MS)
@@ -113,7 +117,8 @@ class NotesPage(QWidget):
         root.addWidget(Title("Заметки", self))
         root.addWidget(Subtitle(
             "Личные страницы, списки дел и черновики. Хранятся на этом компьютере и "
-            "сохраняются сами.", self))
+            "сохраняются сами. Текст уходит с компьютера, только если вы сами "
+            "попросите ИИ его поправить.", self))
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -223,6 +228,17 @@ class NotesPage(QWidget):
         self.status = QLabel("", box)
         self.status.setStyleSheet(f"color: {Palette.TEXT_FAINT};")
         footer.addWidget(self.status, 1)
+        self.undo_ai_button = QPushButton("Вернуть как было", box)
+        self.undo_ai_button.setToolTip("Вернуть текст, каким он был до ИИ-правки")
+        self.undo_ai_button.setVisible(False)
+        self.undo_ai_button.clicked.connect(self.undo_ai)
+        footer.addWidget(self.undo_ai_button)
+        self.ai_button = QPushButton("ИИ…", box)
+        self.ai_button.setIcon(icons.icon("mdi6.auto-fix"))
+        self.ai_button.setToolTip(
+            "Поправить текст по просьбе: сделать короче, исправить ошибки и так далее")
+        self.ai_button.clicked.connect(self.ai_edit)
+        footer.addWidget(self.ai_button)
         self.export_button = QPushButton("Экспорт…", box)
         self.export_button.setToolTip("Сохранить страницу в файл .md")
         self.export_button.clicked.connect(self.export_page)
@@ -352,6 +368,9 @@ class NotesPage(QWidget):
         self._current = note_id
         self._dirty = False
         self._timer.stop()
+        # Снимок до ИИ-правки относился к прежней странице.
+        self._before_ai = None
+        self.undo_ai_button.setVisible(False)
         if note_id is None:
             self.stack.setCurrentIndex(0)
             return
@@ -477,6 +496,49 @@ class NotesPage(QWidget):
     def hideEvent(self, event) -> None:
         self.flush()
         super().hideEvent(event)
+
+    # --- ИИ-правка ------------------------------------------------------------
+
+    def ai_edit(self) -> None:
+        if self._current is None:
+            return
+        if not self.settings.ai_consent:
+            answer = QMessageBox.question(
+                self, "ИИ-правка",
+                "Для ИИ-правки текст страницы отправляется на сервер оплат и дальше "
+                "в Google Gemini. Остальные заметки остаются на этом компьютере.\n\n"
+                "Продолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.settings.ai_consent = True
+            try:
+                self.settings.save()
+            except OSError:
+                # Согласие не запомнилось — спросим в следующий раз, это не беда.
+                pass
+        dialog = AiEditDialog(self.editor.markdown(), self.editor.selection_markdown(), self)
+        if dialog.exec() != AiEditDialog.DialogCode.Accepted:
+            return
+        self._before_ai = self.editor.markdown()
+        if dialog.for_selection:
+            self.editor.replace_selection_markdown(dialog.result)
+        else:
+            self.editor.load_markdown(dialog.result)
+        # Для замены выделенного сработал contentsChanged, для всей страницы — тоже:
+        # load_markdown идёт вне _loading, то есть как правка человека.
+        self._mark_dirty()
+        self.undo_ai_button.setVisible(True)
+        self.notify("Текст заменён. «Вернуть как было» вернёт прежний.", ToastKind.SUCCESS)
+
+    def undo_ai(self) -> None:
+        if self._before_ai is None or self._current is None:
+            return
+        self.editor.load_markdown(self._before_ai)
+        self._before_ai = None
+        self.undo_ai_button.setVisible(False)
+        self._mark_dirty()
 
     # --- файлы ----------------------------------------------------------------
 
