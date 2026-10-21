@@ -66,6 +66,8 @@ NAMES = {
     "close": "mdi6.close",
     "expand": "mdi6.arrow-expand-vertical",
     "collapse": "mdi6.arrow-collapse-vertical",
+    "mail": "mdi6.email-outline",
+    "send": "mdi6.send-outline",
 }
 
 

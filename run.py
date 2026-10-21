@@ -49,6 +49,7 @@ def selftest(argv: list[str]) -> int:
     ok &= _check_charts(report)
     ok &= _check_payments(report)
     ok &= _check_pdf(report)
+    ok &= _check_mail(report)
 
     report.append("РЕЗУЛЬТАТ: " + ("успешно" if ok else "есть ошибки"))
     text = "\n".join(report)
@@ -206,6 +207,33 @@ def _check_pdf(report: list[str]) -> bool:
         report.append(f"счета PDF: ОШИБКА — {error}")
         return False
     report.append("счета PDF: pdfminer и таблицы кодировок на месте")
+    return True
+
+
+def _check_mail(report: list[str]) -> bool:
+    """Почта опирается на стандартные imaplib и smtplib и на шифрование системы.
+
+    В сборке без них модуль почты импортируется, но письмо не уходит, а пароль
+    не сохраняется. Шифруется и расшифровывается тестовая строка: на диск и в
+    настройки пользователя она не попадает.
+    """
+    try:
+        import imaplib  # noqa: F401
+        import smtplib  # noqa: F401
+
+        from app.core.mail import secret
+
+        if sys.platform.startswith("win"):
+            sample = "проверка".encode("utf-8")
+            if secret._unprotect(secret._protect(sample)) != sample:
+                report.append("почта: ОШИБКА — шифрование пароля исказило данные")
+                return False
+            report.append("почта: imaplib, smtplib и шифрование пароля работают")
+        else:
+            report.append("почта: imaplib и smtplib на месте")
+    except Exception as error:  # noqa: BLE001 — отчёт важнее аккуратного типа
+        report.append(f"почта: ОШИБКА — {error}")
+        return False
     return True
 
 

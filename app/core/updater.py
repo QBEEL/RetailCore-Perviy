@@ -172,7 +172,7 @@ def _install_macos(dmg_path: str, current_path: str | None = None) -> None:
     shutil.rmtree(previous, ignore_errors=True)
     # `open -n` поднимает ещё одну копию, не спрашивая LaunchServices о уже
     # запущенной: та через мгновение закроется, и ждать её здесь нельзя.
-    subprocess.Popen(["open", "-n", bundle], env=child_environment(),
+    subprocess.Popen(["open", "-n", bundle], env=restart_environment(),
                      close_fds=True)
 
 
@@ -196,8 +196,20 @@ def _install_windows(new_exe_path: str, current_path: str | None = None) -> None
         os.remove(old_path)
     os.rename(current, old_path)
     os.replace(new_exe_path, current)
-    subprocess.Popen([current], env=child_environment(), close_fds=True,
+    subprocess.Popen([current], env=restart_environment(), close_fds=True,
                       creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+
+
+# Копию, запущенную самообновлением, отличает эта переменная: старая ещё
+# работает, и единственный экземпляр (ui/single_instance.py) должен её дождаться,
+# а не решить, что программа уже запущена.
+RESTART_VARIABLE = "RETAILCORE_RESTARTED"
+
+
+def restart_environment() -> dict[str, str]:
+    environment = child_environment()
+    environment[RESTART_VARIABLE] = "1"
+    return environment
 
 
 def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:

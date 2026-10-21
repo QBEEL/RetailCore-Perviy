@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core import pdf_invoice
+from ...core import mail, pdf_invoice
 from .. import icons
 from ..theme import Metrics, Palette
 from .inputs import SelectBox
@@ -93,6 +93,13 @@ class FilePicker(QFrame):
         browse.setIcon(icons.icon("open"))
         browse.clicked.connect(self.browse)
         row.addWidget(browse)
+
+        self.mail_button = QPushButton("Из почты", self)
+        self.mail_button.setIcon(icons.icon("mail"))
+        self.mail_button.setToolTip("Взять счёт или прайс из вложений во входящих письмах")
+        self.mail_button.clicked.connect(self.browse_mail)
+        row.addWidget(self.mail_button)
+        self.refresh_mail_button()
 
         # Книга из PDF создаётся рядом с ним, а PDF часто открыт прямо из
         # почты — из временной папки, которую никто потом не найдёт. Поэтому
@@ -237,6 +244,27 @@ class FilePicker(QFrame):
         start = os.path.dirname(self._path) if self._path else ""
         path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", start, self._filter)
         if path:
+            self.set_path(path)
+
+    def refresh_mail_button(self) -> None:
+        """Кнопка нужна только тем, у кого подключена почта.
+
+        Без ящика она вела бы в окно с советом идти в настройки — лишняя
+        кнопка у тех, кому почта не нужна.
+        """
+        self.mail_button.setVisible(mail.config.configured)
+
+    def showEvent(self, event) -> None:
+        # Ящик подключают и отключают в настройках, пока другие разделы закрыты:
+        # при каждом показе поля состояние кнопки сверяется заново.
+        self.refresh_mail_button()
+        super().showEvent(event)
+
+    def browse_mail(self) -> None:
+        """Вложение из входящих: скачивается в «Загрузки» и открывается как обычный файл."""
+        from .mail_dialogs import pick_from_mail
+
+        if path := pick_from_mail(self.window()):
             self.set_path(path)
 
     def _on_typed(self) -> None:

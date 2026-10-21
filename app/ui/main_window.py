@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QFrame,
     QHBoxLayout,
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_TITLE, __version__
-from ..core import changelog
+from ..core import changelog, mail
 from ..core.settings import AppSettings
 from ..core.vpn import VpnManager
 from . import icons
@@ -38,6 +39,7 @@ from .profile_page import ProfilePage
 from .price_page import PricePage
 from .reports_page import ReportsPage
 from .settings_page import SettingsPage
+from .tray import AppTray
 from ..core.payments import data as payments_data
 from ..core.payments import transport
 from .admin_page import AdminPage
@@ -101,6 +103,9 @@ class MainWindow(QMainWindow):
                  vpn: VpnManager | None = None) -> None:
         super().__init__()
         self.settings = settings
+        # Ящик нужен полям выбора файла и кнопкам «Отправить письмом» в
+        # глубине разделов: они берут его отсюда, а не по цепочке параметров.
+        mail.config.bind(settings)
         self.vpn = vpn
         # Запуск без сервера: вход был раньше и льготный срок ещё не вышел.
         # Работа с файлами продолжается, разделы общей базы закрыты.
@@ -136,7 +141,8 @@ class MainWindow(QMainWindow):
         self.catalog_page = CatalogPage(settings, self.notify, self.pages)
         self.history_page = HistoryPage(settings, self.notify, self.pages)
         self.settings_page = SettingsPage(
-            settings, self.notify, self.pages, self._check_updates_now, vpn)
+            settings, self.notify, self.pages, self._check_updates_now, vpn,
+            self._apply_tray_setting)
         self.admin_page = AdminPage(settings, self.notify, self.pages,
                                     self.payments_page.invalidate)
         self.profile_page = ProfilePage(settings, self.notify, self.pages,
@@ -159,7 +165,17 @@ class MainWindow(QMainWindow):
         self.claims_watcher.arrived.connect(self._claims_arrived)
         self.claims_page.inbox_changed.connect(self.claims_watcher.poll)
         self._claims_watching = False
-        self._tray: QSystemTrayIcon | None = None
+        # Временный значок для одного системного уведомления, когда постоянного нет.
+        self._notice_tray: QSystemTrayIcon | None = None
+        # Постоянный значок: окно прячется сюда вместо закрытия. Выйти из
+        # программы по-настоящему — только через `quit_application`.
+        self.tray: AppTray | None = None
+        self._quitting = False
+        self._tray_announced = False
+        if session_manager := QGuiApplication.instance():
+            # Windows завершает сеанс, закрывая окна: отказ из closeEvent
+            # повис бы окном «программа мешает выключению».
+            session_manager.commitDataRequest.connect(self._session_ending)
         self.match_page.busy_changed.connect(self._set_busy)
         self._build_status_bar()
         self._build_actions()
@@ -181,6 +197,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2000, self.update_dialog.run_silent)
         if vpn is not None and vpn.supported:
             self._watch_vpn(vpn)
+        self._apply_tray_setting()
 
     def _watch_vpn(self, vpn: VpnManager) -> None:
         """Следит за туннелем: упавший sing-box нужно заметить сразу.
@@ -441,7 +458,7 @@ class MainWindow(QMainWindow):
         from .widgets.login_dialog import sign_out as forget_session
 
         forget_session()
-        self.close()
+        self.quit_application()
 
     def _sync_admin_access(self) -> None:
         """Показывает раздел администрирования, если вошёл администратор."""
@@ -509,26 +526,77 @@ class MainWindow(QMainWindow):
             self._system_notice("Торг-2", text)
 
     def _system_notice(self, title: str, text: str) -> None:
-        """Системное уведомление Windows. Значок в трее живёт, пока оно на
-        экране, и убирается: постоянный значок у программы, которой он не
-        нужен, — лишний."""
+        """Системное уведомление Windows.
+
+        Есть постоянный значок в трее — уведомление идёт через него. Нет —
+        значок живёт, пока оно на экране, и убирается: постоянный значок у
+        программы, которой он не нужен, — лишний.
+        """
+        if self.tray is not None and self.tray.visible:
+            self.tray.message(title, text)
+            return
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        if self._tray is not None:
-            self._tray.hide()
-            self._tray.deleteLater()
+        if self._notice_tray is not None:
+            self._notice_tray.hide()
+            self._notice_tray.deleteLater()
         tray = QSystemTrayIcon(icons.app_icon(), self)
         tray.messageClicked.connect(self._open_claims_from_notice)
         tray.show()
         tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Information, 10_000)
         QTimer.singleShot(15_000, tray.hide)
-        self._tray = tray
+        self._notice_tray = tray
 
     def _open_claims_from_notice(self) -> None:
+        self.restore_window()
+        self.show_page(PAGE_CLAIMS)
+
+    # --- трей ------------------------------------------------------------------
+
+    def _apply_tray_setting(self) -> None:
+        """Включает или выключает значок по настройке; зовётся и из настроек."""
+        wanted = self.settings.tray_on_close and AppTray.available()
+        if wanted and self.tray is None:
+            self.tray = AppTray(self)
+            self.tray.open_requested.connect(self.restore_window)
+            self.tray.quit_requested.connect(self.quit_application)
+            self.tray.message_clicked.connect(self._open_claims_from_notice)
+        if self.tray is not None:
+            if wanted:
+                self.tray.show()
+            else:
+                self.tray.hide()
+        # Пока окно можно спрятать, спрятанное окно — не «последнее закрытое».
+        QApplication.setQuitOnLastWindowClosed(not wanted)
+
+    def restore_window(self) -> None:
+        """Показывает окно из трея или сворачивания и выводит его вперёд."""
         self.showNormal()
         self.raise_()
         self.activateWindow()
-        self.show_page(PAGE_CLAIMS)
+
+    def quit_application(self) -> None:
+        """Настоящий выход: крестик окна его не вызывает, он только прячет окно."""
+        self._quitting = True
+        self.close()
+
+    def _session_ending(self, *_args: object) -> None:
+        self._quitting = True
+
+    def _hides_to_tray(self) -> bool:
+        return (not self._quitting and self.settings.tray_on_close
+                and self.tray is not None and self.tray.visible)
+
+    def _announce_tray(self) -> None:
+        # Один раз за запуск: иначе каждое закрытие окна сопровождалось бы
+        # уведомлением, которое все быстро перестали бы читать.
+        if self.tray is None or self._tray_announced:
+            return
+        self._tray_announced = True
+        self.tray.message(
+            APP_TITLE,
+            "Программа продолжает работать в трее. Вернуть окно — щелчок по "
+            "значку, выйти — правая кнопка → «Выйти».", 6000)
 
     def show_page(self, index: int) -> bool:
         """Открывает раздел. Ложь — он закрыт, и переход не состоялся."""
@@ -668,7 +736,7 @@ class MainWindow(QMainWindow):
         self._add_action("Ctrl+R", self.match_page.open_last_session)
         self._add_action("Ctrl+P", lambda: self.show_page(PAGE_PROFILE))
         self._add_action("Ctrl+B", self.toggle_sidebar)
-        self._add_action("Ctrl+Q", self.close)
+        self._add_action("Ctrl+Q", self.quit_application)
 
     def _add_action(self, shortcut, handler) -> None:
         action = QAction(self)
@@ -753,9 +821,21 @@ class MainWindow(QMainWindow):
         self.toasts.reposition()
 
     def closeEvent(self, event) -> None:
+        self._save_state()
+        if self._hides_to_tray():
+            event.ignore()
+            self.hide()
+            self._announce_tray()
+            return
+        super().closeEvent(event)
+        if self.tray is not None:
+            self.tray.hide()
+        # Без «выйти при закрытии последнего окна» цикл событий сам не остановится.
+        QApplication.quit()
+
+    def _save_state(self) -> None:
         # Правка, не дождавшаяся таймера автосохранения, иначе пропала бы.
         self.notes_page.flush()
         self.settings.window_geometry = self.saveGeometry().toBase64().data().decode()
         self.settings.splitter_sizes = self.match_page.splitter.sizes()
         self.settings.save()
-        super().closeEvent(event)

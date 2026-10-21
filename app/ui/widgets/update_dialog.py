@@ -328,7 +328,8 @@ class UpdateDialog(QWidget):
         """
         window = self.parentWidget()
         if window is not None:
-            window.close()
+            # Крестик главного окна прячет его в трей; для выхода есть свой метод.
+            getattr(window, "quit_application", window.close)()
         QApplication.exit(0)
 
     def _remind_later(self, manifest: updater.ReleaseManifest) -> None:

@@ -131,6 +131,17 @@ class AppSettings:
     # Человек согласился, что текст заметки для ИИ-правки уходит на сервер оплат и
     # дальше в Gemini. Спрашивается один раз; заметки сами по себе остаются здесь.
     ai_consent: bool = False
+    # Ящик mail.ru человека. Пароль приложения сюда не попадает: он лежит в
+    # системном хранилище (core/mail/secret.py), а `settings.json` копируют и
+    # пересылают.
+    mail_address: str = ""
+    # Имя в поле «От кого»: получатель видит «Иван Петров», а не один адрес.
+    mail_sender_name: str = ""
+    # Кому писали недавно — подсказка в окне письма.
+    mail_recent_to: list[str] = field(default_factory=list)
+    # Крестик окна прячет программу в трей, а не закрывает: она продолжает
+    # следить за заявками Торг-2. Выйти можно из меню значка или по Ctrl+Q.
+    tray_on_close: bool = True
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -351,6 +362,10 @@ class AppSettings:
         self.vpn_enabled = bool(data.get("vpn_enabled", False))
         self.vpn_server = str(data.get("vpn_server", ""))
         self.ai_consent = bool(data.get("ai_consent", False))
+        self.tray_on_close = bool(data.get("tray_on_close", self.tray_on_close))
+        self.mail_address = str(data.get("mail_address", "")).strip()
+        self.mail_sender_name = str(data.get("mail_sender_name", "")).strip()
+        self.mail_recent_to = [p for p in data.get("mail_recent_to", []) if isinstance(p, str)]
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -437,6 +452,10 @@ class AppSettings:
             "vpn_enabled": self.vpn_enabled,
             "vpn_server": self.vpn_server,
             "ai_consent": self.ai_consent,
+            "tray_on_close": self.tray_on_close,
+            "mail_address": self.mail_address,
+            "mail_sender_name": self.mail_sender_name,
+            "mail_recent_to": self.mail_recent_to,
         }
 
     def remember_payment_import(self, path: str) -> None:

@@ -42,6 +42,7 @@ from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title, fade_in
 from .widgets.ledger_tab import LedgerTab
 from .widgets.locked import Lockable
+from .widgets.mail_dialogs import send_files
 from .widgets.receipts_tab import ReceiptsTab
 from .widgets.report_dialogs import ProfileDialog, StoreRulesDialog
 from .widgets.toast import ToastKind
@@ -231,8 +232,13 @@ class ReportsPage(QWidget):
         self.build_button.setObjectName("Primary")
         self.save_button = self._action(card, "Сохранить файл", "export", self.save)
         self.save_button.setEnabled(False)
+        self.mail_button = self._action(card, "Отправить письмом", "send", self.send_mail)
+        self.mail_button.setToolTip("Отправить сохранённый отчёт по почте")
+        self.mail_button.setEnabled(False)
+        self._saved_path = ""
         header.addWidget(self.build_button)
         header.addWidget(self.save_button)
+        header.addWidget(self.mail_button)
         body.addLayout(header)
 
         tiles = QHBoxLayout()
@@ -457,6 +463,7 @@ class ReportsPage(QWidget):
             tile.set_value(0)
         self.warnings.setVisible(False)
         self.save_button.setEnabled(False)
+        self._set_saved("")
         self.result_hint.setText("Список исходников очищен.")
 
     def set_store_hint(self) -> None:
@@ -569,6 +576,7 @@ class ReportsPage(QWidget):
             self.warnings.setVisible(False)
 
         self.save_button.setEnabled(result.ok)
+        self._set_saved("")
         self._update_actions()
         shown = min(len(table.rows), PREVIEW_LIMIT)
         tail = (f" Показаны первые {shown} из {len(table.rows)}."
@@ -606,6 +614,18 @@ class ReportsPage(QWidget):
     def _on_saved(self, path: str) -> None:
         self.notify(f"Отчёт сохранён: {os.path.basename(path)}", ToastKind.SUCCESS)
         self.result_hint.setText(f"Готово: {path}")
+        self._set_saved(path)
+
+    def _set_saved(self, path: str) -> None:
+        """Последний сохранённый отчёт. Собрали заново — прежний файл уже не тот."""
+        self._saved_path = path
+        self.mail_button.setEnabled(bool(path))
+
+    def send_mail(self) -> None:
+        if not self._saved_path:
+            return
+        name = os.path.splitext(os.path.basename(self._saved_path))[0]
+        send_files(self, [self._saved_path], subject=name)
 
 
 def _load_settings() -> tuple[list[ReportProfile], list[StoreRule]]:

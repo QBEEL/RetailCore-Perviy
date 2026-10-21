@@ -44,6 +44,7 @@ from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.claim_dialogs import ClaimDialog, CloseDialog
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title, fade_in
+from .widgets.mail_dialogs import send_files
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 from .widgets.torg_dialogs import BrandsDialog, TorgDialog, TorgSettingsDialog
@@ -133,12 +134,18 @@ class ClaimsPage(QWidget):
         self.torg_button.setToolTip(
             "Акт ТОРГ-2 по выделенным заявкам — готовый файл Excel, он сразу "
             "приложится к заявкам. Выделить несколько: Ctrl или Shift + щелчок.")
+        self.act_mail_button = self._action(
+            card, "Отправить акт", "send", self.send_act_mail)
+        self.act_mail_button.setToolTip(
+            "Отправить письмом последний составленный акт ТОРГ-2")
+        self.act_mail_button.setEnabled(False)
+        self._last_act: tuple[int, str] | None = None
         self.reopen_button = self._action(card, "Вернуть из архива", "reset", self.reopen_selected)
         self.delete_button = self._action(card, "Удалить", "trash", self.delete_selected)
         self.delete_button.setObjectName("Danger")
         for button in (self.new_button, self.open_button, self.accept_button,
-                       self.close_button, self.torg_button, self.reopen_button,
-                       self.delete_button):
+                       self.close_button, self.torg_button, self.act_mail_button,
+                       self.reopen_button, self.delete_button):
             actions.addWidget(button)
         actions.addStretch(1)
         refresh = self._action(card, "Обновить", "refresh", self.restore)
@@ -556,11 +563,20 @@ class ClaimsPage(QWidget):
                     ToastKind.SUCCESS)
         for failure in failures:
             self.notify(failure, ToastKind.ERROR)
+        self._last_act = (act.number, path)
+        self.act_mail_button.setEnabled(True)
         try:
             os.startfile(path)  # noqa: S606 — открыть готовый файл в Excel
         except (OSError, AttributeError):
             pass
         self._changed()
+
+    def send_act_mail(self) -> None:
+        """Письмо с последним актом этого запуска: файл тот, что только что сохранён."""
+        if self._last_act is None:
+            return
+        number, path = self._last_act
+        send_files(self, [path], subject=f"Акт ТОРГ-2 №{number}")
 
     def edit_brands(self) -> None:
         BrandsDialog(self._brands, transport.session.is_admin, self).exec()

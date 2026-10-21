@@ -1,6 +1,7 @@
 """Точка входа приложения."""
 from __future__ import annotations
 
+import os
 import sys
 
 from PySide6.QtCore import Qt
@@ -13,6 +14,7 @@ from .core.vpn import VlessError, VpnError, VpnManager, load_link
 from .core.vpn import parse as parse_vless
 from .ui import icons
 from .ui.main_window import MainWindow
+from .ui.single_instance import SingleInstance
 from .ui.theme import STYLESHEET, light_palette
 
 
@@ -49,6 +51,12 @@ def main() -> int:
     app.setPalette(light_palette())
     app.setStyleSheet(STYLESHEET)
 
+    # Вторая копия не стартует: окно первой могло уйти в трей, и человек просто
+    # не видит, что программа уже запущена. Первой отправляется просьба показаться.
+    instance = SingleInstance()
+    if not instance.claim(wait_for_previous=updater.RESTART_VARIABLE in os.environ):
+        return 0
+
     settings = AppSettings.load()
     _adopt_profiles(settings)
 
@@ -69,6 +77,7 @@ def main() -> int:
             return 0
 
         window = MainWindow(settings, offline=outcome == Start.OFFLINE, vpn=vpn)
+        instance.activated.connect(window.restore_window)
         window.show()
         return app.exec()
     finally:

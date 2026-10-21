@@ -32,6 +32,7 @@ from .widgets.common import Card, Divider, Hint, MetricTile, SectionTitle, Subti
 from .widgets.file_picker import FilePicker
 from .widgets.highlights_dialog import HighlightsDialog
 from .widgets.inputs import SelectBox
+from .widgets.mail_dialogs import send_files
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 
@@ -136,6 +137,14 @@ class OrderPage(QWidget):
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self.save)
         actions.addWidget(self.save_button)
+
+        self.mail_button = QPushButton("Отправить письмом", card)
+        self.mail_button.setIcon(icons.icon("send"))
+        self.mail_button.setToolTip("Отправить сохранённый бланк поставщику по почте")
+        self.mail_button.setEnabled(False)
+        self.mail_button.clicked.connect(self.send_mail)
+        actions.addWidget(self.mail_button)
+        self._saved_path = ""
 
         self.highlights_button = QPushButton("Новинки и хиты", card)
         self.highlights_button.setIcon(icons.icon("star", Palette.WARNING))
@@ -409,6 +418,7 @@ class OrderPage(QWidget):
         fade_in(self.table)
         stats = order.summarize(lines)
         self.save_button.setEnabled(stats["перенесено"] > 0)
+        self._set_saved("")
         self.status_label.setText(
             f"Перенесено {stats['перенесено']:g} из {stats['позиций']:g} позиций")
         if stats["не найдено"]:
@@ -454,6 +464,7 @@ class OrderPage(QWidget):
         self.refresh_metrics()
         self._refresh_highlights()
         self.save_button.setEnabled(True)
+        self._set_saved("")
         units = sum(quantity for _, quantity in chosen)
         self.notify(f"Добавлено в заказ: {len(chosen)} позиций ({units} шт.)", ToastKind.SUCCESS)
 
@@ -520,6 +531,7 @@ class OrderPage(QWidget):
         self.table.model_.refresh_item(line)
         self.refresh_metrics()
         self.save_button.setEnabled(True)
+        self._set_saved("")
         remembered = self._remember_alias(line, suggestion.row)
         warning = " (это ТЕСТЕР)" if suggestion.tester else ""
         note = " · сохранено в исключения" if remembered else ""
@@ -590,6 +602,18 @@ class OrderPage(QWidget):
     def _on_saved(self, written: int, path: str) -> None:
         self.notify(f"Записано {written} строк. Файл: {os.path.basename(path)}", ToastKind.SUCCESS)
         self.status_label.setText(f"Сохранено: {path}")
+        self._set_saved(path)
+
+    def _set_saved(self, path: str) -> None:
+        """Последний сохранённый бланк. Изменился заказ — прежний файл уже не тот."""
+        self._saved_path = path
+        self.mail_button.setEnabled(bool(path))
+
+    def send_mail(self) -> None:
+        if not self._saved_path:
+            return
+        name = os.path.splitext(os.path.basename(self._saved_path))[0]
+        send_files(self, [self._saved_path], subject=name)
 
     def export_missing(self) -> None:
         missing = [line for line in self.lines if not line.matched]

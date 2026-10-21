@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..core import appdata, changelog, snapshots
+from ..core import appdata, changelog, mail, snapshots
 from ..core.models import DEFAULT_SEARCH_ROLES, DEFAULT_WEIGHTS, FieldRole, Sheet
 from ..core.payments import LEVEL_PRESETS
 from ..core.settings import DEFAULT_FILL_ROLES, AppSettings
@@ -32,6 +32,7 @@ from ..core.vpn import parse as parse_vless
 from . import icons
 from .tasks import run_task
 from .theme import Metrics, Palette
+from .tray import AppTray
 from .widgets.common import Card, Divider, Hint, SectionTitle, Subtitle, Title
 from .widgets.inputs import DecimalInput, NumberInput, SelectBox
 from .widgets.toast import ToastKind
@@ -58,9 +59,11 @@ class SettingsPage(QWidget):
         parent: QWidget | None = None,
         check_updates: Callable[[], None] | None = None,
         vpn: VpnManager | None = None,
+        on_window_changed: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self._on_window_changed = on_window_changed
         self.notify = notify
         self._check_updates = check_updates
         self._vpn = vpn
@@ -97,6 +100,9 @@ class SettingsPage(QWidget):
         self._body.addWidget(self._history_card())
         if vpn_card := self._vpn_card():
             self._body.addWidget(vpn_card)
+        self._body.addWidget(self._mail_card())
+        if AppTray.supported():
+            self._body.addWidget(self._window_card())
         self._body.addWidget(self._updates_card())
         self._body.addWidget(self._changelog_card())
         self._body.addStretch(1)
@@ -604,6 +610,136 @@ class SettingsPage(QWidget):
     def _vpn_address_failed(self, message: str) -> None:
         self.refresh_vpn()
         self.vpn_status.setText(f"Работает, но адрес узнать не удалось. {message}")
+
+    def _window_card(self) -> Card:
+        card = Card(self)
+        body = card.body()
+        body.addWidget(SectionTitle("Окно программы", card))
+        self.tray_checkbox = QCheckBox("Сворачивать в трей при закрытии окна", card)
+        self.tray_checkbox.setChecked(self.settings.tray_on_close)
+        self.tray_checkbox.toggled.connect(self._set_tray_on_close)
+        body.addWidget(self.tray_checkbox)
+        body.addWidget(Hint(
+            "Крестик прячет окно, а программа продолжает работать и сообщает о "
+            "новых заявках Торг-2. Вернуть окно — щелчок по значку у часов, выйти — "
+            "правая кнопка по значку → «Выйти» или Ctrl+Q.", card))
+        return card
+
+    def _set_tray_on_close(self, checked: bool) -> None:
+        self.settings.tray_on_close = checked
+        self._save()
+        if self._on_window_changed is not None:
+            self._on_window_changed()
+
+    def _mail_card(self) -> Card:
+        """Ящик mail.ru: отправка файлов письмом и вложения из входящих.
+
+        Пароль вводится здесь, но в настройки не записывается: он уходит в
+        защищённое хранилище системы. Основной пароль от ящика не подходит —
+        нужен отдельный «пароль для внешнего приложения», который можно
+        отозвать, не меняя основной.
+        """
+        card = Card(self)
+        body = card.body()
+        body.addWidget(SectionTitle("Почта", card))
+        body.addWidget(Hint(
+            "Ящик mail.ru нужен, чтобы отправлять отчёты и заказы письмом прямо из "
+            "программы и брать счета и прайсы из входящих. Подойдут и @inbox.ru, "
+            "@list.ru, @bk.ru, и корпоративный домен на mail.ru.", card))
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(Metrics.GAP)
+        form.setVerticalSpacing(Metrics.GAP)
+        self.mail_address_field = QLineEdit(self.settings.mail_address, card)
+        self.mail_address_field.setPlaceholderText("name@mail.ru")
+        self.mail_name_field = QLineEdit(self.settings.mail_sender_name, card)
+        self.mail_name_field.setPlaceholderText("Имя в письмах, например: Иван Петров")
+        self.mail_password_field = QLineEdit(card)
+        self.mail_password_field.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addWidget(QLabel("Адрес", card), 0, 0)
+        form.addWidget(self.mail_address_field, 0, 1)
+        form.addWidget(QLabel("Подпись", card), 1, 0)
+        form.addWidget(self.mail_name_field, 1, 1)
+        form.addWidget(QLabel("Пароль для внешнего приложения", card), 2, 0)
+        form.addWidget(self.mail_password_field, 2, 1)
+        form.setColumnStretch(1, 1)
+        body.addLayout(form)
+
+        self.mail_status = Hint("", card)
+        body.addWidget(self.mail_status)
+
+        row = QHBoxLayout()
+        self.mail_save_button = QPushButton("Сохранить и проверить", card)
+        self.mail_save_button.setIcon(icons.icon("mail"))
+        self.mail_save_button.clicked.connect(self._mail_save)
+        row.addWidget(self.mail_save_button)
+        self.mail_forget_button = QPushButton("Забыть пароль", card)
+        self.mail_forget_button.clicked.connect(self._mail_forget)
+        row.addWidget(self.mail_forget_button)
+        create = QPushButton("Как создать пароль", card)
+        create.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(mail.APP_PASSWORD_URL)))
+        row.addWidget(create)
+        row.addStretch(1)
+        body.addLayout(row)
+        self._mail_refresh_status()
+        return card
+
+    def _mail_refresh_status(self) -> None:
+        address = self.settings.mail_address
+        has_password = bool(address and mail.secret.load(address))
+        self.mail_password_field.setPlaceholderText(
+            "сохранён — вводить заново не нужно" if has_password
+            else "создаётся в настройках mail.ru → Безопасность")
+        self.mail_forget_button.setEnabled(has_password)
+        if has_password:
+            tail = "" if mail.secret.persistent() else (
+                " Пароль хранится до закрытия программы: на этой системе "
+                "безопасного хранилища нет.")
+            self.mail_status.setText(f"Подключён ящик {address}.{tail}")
+        else:
+            self.mail_status.setText("Почта не подключена.")
+
+    def _mail_save(self) -> None:
+        address = self.mail_address_field.text().strip()
+        if not mail.is_address(address):
+            self.notify("Введите адрес ящика целиком, например name@mail.ru", ToastKind.WARNING)
+            return
+        password = self.mail_password_field.text() or mail.secret.load(address)
+        if not password:
+            self.notify("Введите пароль для внешнего приложения", ToastKind.WARNING)
+            return
+        name = self.mail_name_field.text().strip()
+        box = mail.Mailbox(address, password, name)
+        self.mail_save_button.setEnabled(False)
+        self.mail_status.setText("Проверяю вход в ящик…")
+        run_task(mail.verify, box,
+                 on_result=lambda _=None: self._mail_verified(box),
+                 on_error=self._mail_rejected)
+
+    def _mail_verified(self, box: mail.Mailbox) -> None:
+        previous = self.settings.mail_address
+        if previous and previous.lower() != box.address.lower():
+            mail.secret.forget(previous)
+        self.settings.mail_address = box.address
+        self.settings.mail_sender_name = box.name
+        self.settings.save()
+        mail.secret.save(box.address, box.password)
+        self.mail_password_field.clear()
+        self.mail_save_button.setEnabled(True)
+        self._mail_refresh_status()
+        self.notify("Почта подключена", ToastKind.SUCCESS)
+
+    def _mail_rejected(self, message: str) -> None:
+        self.mail_save_button.setEnabled(True)
+        self._mail_refresh_status()
+        self.notify(message, ToastKind.ERROR)
+
+    def _mail_forget(self) -> None:
+        if address := self.settings.mail_address:
+            mail.secret.forget(address)
+        self.mail_password_field.clear()
+        self._mail_refresh_status()
+        self.notify("Пароль почты удалён с этого компьютера", ToastKind.INFO)
 
     def _updates_card(self) -> Card:
         card = Card(self)
