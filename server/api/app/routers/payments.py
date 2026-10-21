@@ -175,7 +175,7 @@ def list_payments(
         dds_item)
     if mine and not user.is_admin:
         where += " AND p.responsible = ANY(%s)"
-        values.append(list(user.responsible))
+        values.append(list(user.mine))
     rows = db.fetch_all(
         f"SELECT {COLUMNS} FROM payment p WHERE {where}"
         " ORDER BY p.pay_date DESC NULLS LAST, p.id DESC", values)

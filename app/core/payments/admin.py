@@ -60,6 +60,29 @@ class Account:
 
 
 @dataclass(slots=True)
+class Cover:
+    """Замещение: кто правит оплаты отсутствующего, пока тот в отпуске."""
+
+    id: int = 0
+    absent_id: int = 0
+    absent_name: str = ""
+    cover_id: int = 0
+    cover_name: str = ""
+    date_from: date | None = None
+    date_to: date | None = None
+    note: str = ""
+    # planned — ещё не началось, active — идёт сегодня, ended — закончилось.
+    # Считает сервер по московской дате: у компьютера менеджера часы свои.
+    state: str = "planned"
+    created_by: str = ""
+
+    @property
+    def state_title(self) -> str:
+        return {"planned": "впереди", "active": "идёт", "ended": "закончилось"}.get(
+            self.state, self.state)
+
+
+@dataclass(slots=True)
 class Scope:
     """Что стоит в общей базе — и что из этого стирается удалением.
 
@@ -366,6 +389,52 @@ def save(account: Account) -> Account:
 def reset_password(account_id: int) -> str:
     """Назначает новый пароль. Прежний восстановить нельзя — только заменить."""
     return transport.post(f"/api/users/{account_id}/password")["password"]
+
+
+# --- замещение -----------------------------------------------------------------
+
+def _day(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _cover(row: dict) -> Cover:
+    return Cover(
+        id=int(row["id"]), absent_id=int(row["absent_id"]),
+        absent_name=row.get("absent_name") or "",
+        cover_id=int(row["cover_id"]), cover_name=row.get("cover_name") or "",
+        date_from=_day(row.get("date_from")), date_to=_day(row.get("date_to")),
+        note=row.get("note") or "", state=row.get("state") or "planned",
+        created_by=row.get("created_by") or "")
+
+
+def covers() -> list[Cover]:
+    """Замещения. Сервер прежней версии такого адреса не знает — тогда пусто:
+    раздел администрирования из-за этого открываться не перестаёт."""
+    try:
+        return [_cover(row) for row in transport.get("/api/covers")]
+    except transport.ServerError as error:
+        if error.status == 404:
+            return []
+        raise
+
+
+def _cover_body(cover: Cover) -> dict:
+    return {"absent_id": cover.absent_id, "cover_id": cover.cover_id,
+            "date_from": cover.date_from.isoformat(),
+            "date_to": cover.date_to.isoformat(), "note": cover.note.strip()}
+
+
+def save_cover(cover: Cover) -> Cover:
+    if cover.id:
+        return _cover(transport.put(f"/api/covers/{cover.id}", _cover_body(cover)))
+    return _cover(transport.post("/api/covers", _cover_body(cover)))
+
+
+def delete_cover(cover_id: int) -> None:
+    transport.delete(f"/api/covers/{cover_id}")
 
 
 # --- удаление данных -----------------------------------------------------------

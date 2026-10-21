@@ -109,7 +109,7 @@ class TestCurrentUser:
         token = security.create_token(7, "km", 0)
         monkeypatch.setattr(security.db, "fetch_one", lambda q, p=None: {
             "id": 7, "login": "km", "full_name": "КМ", "is_admin": False, "is_active": True,
-            "token_version": 0, "responsible": [], "app_version": None,
+            "token_version": 0, "responsible": [], "covered": [], "app_version": None,
             "app_platform": None, "app_seen_at": None})
         user = security.current_user(token, "3.9.2", "macos")
         assert user.id == 7 and writes.writes == [("3.9.2", "macos", 7)]
@@ -118,7 +118,7 @@ class TestCurrentUser:
         token = security.create_token(7, "km", 0)
         monkeypatch.setattr(security.db, "fetch_one", lambda q, p=None: {
             "id": 7, "login": "km", "full_name": "КМ", "is_admin": False, "is_active": True,
-            "token_version": 0, "responsible": [], "app_version": None,
+            "token_version": 0, "responsible": [], "covered": [], "app_version": None,
             "app_platform": None, "app_seen_at": None})
         assert security.current_user(token, None, None).login == "km"
         assert writes.writes == []
@@ -127,7 +127,7 @@ class TestCurrentUser:
         token = security.create_token(7, "km", 0)
         monkeypatch.setattr(security.db, "fetch_one", lambda q, p=None: {
             "id": 7, "login": "km", "full_name": "КМ", "is_admin": False, "is_active": False,
-            "token_version": 0, "responsible": [], "app_version": None,
+            "token_version": 0, "responsible": [], "covered": [], "app_version": None,
             "app_platform": None, "app_seen_at": None})
         with pytest.raises(Exception):
             security.current_user(token, "3.9.2", "windows")

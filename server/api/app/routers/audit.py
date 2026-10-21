@@ -49,6 +49,7 @@ ENTITIES = {
     "claim_brand": "бренд Торг-2",
     "torg_act": "акт ТОРГ-2",
     "torg_setting": "реквизиты ТОРГ-2",
+    "cover": "замещение",
 }
 
 
@@ -91,7 +92,7 @@ def _subject(row: dict, changes: dict[str, Any]) -> str:
         return row["t_user"] or ""
     if entity == "dds_item":
         return row["t_dds"] or changes.get("title") or ""
-    if entity in ("claim", "claim_brand", "torg_act", "torg_setting"):
+    if entity in ("claim", "claim_brand", "torg_act", "torg_setting", "cover"):
         # Заявка может быть удалена, поэтому название берётся из снимка.
         return (changes.get(auditlog.ABOUT) or {}).get("title", "")
     if entity == "budget" and row["entity_id"]:

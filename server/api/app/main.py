@@ -13,6 +13,7 @@ from .routers import (
     budgets,
     claim_brands,
     claims,
+    covers,
     dds,
     files,
     imports,
@@ -51,6 +52,7 @@ app.include_router(files.router)
 app.include_router(budgets.router)
 app.include_router(claims.router)
 app.include_router(claim_brands.router)
+app.include_router(covers.router)
 app.include_router(dds.router)
 app.include_router(recipients.router)
 app.include_router(imports.router)

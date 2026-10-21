@@ -30,13 +30,14 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core.payments import admin, data, dds, transport
-from ..core.payments.admin import Account, Entry, Scope
+from ..core.payments.admin import Account, Cover, Entry, Scope
 from ..core.suppliers import directory
 from ..core.settings import AppSettings
 from . import icons, pages
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.account_dialogs import AccountDialog, PasswordShown
+from .widgets.cover_dialog import CoverDialog, state_color
 from .widgets.common import Card, Hint, SectionTitle, Subtitle, Title
 from .widgets import marks
 from .widgets.database_dialogs import WipeDialog
@@ -112,6 +113,7 @@ class AdminPage(QWidget):
         self._known: list[str] = []
         self._directions: list[tuple[str, str]] = []
         self._claims: list[directory.Entry] = []
+        self.covers: list[Cover] = []
         self._dds_items: list[dds.DdsItem] = []
         self._scope = Scope()
         self._loaded = False
@@ -154,6 +156,7 @@ class AdminPage(QWidget):
 
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._accounts_tab(), "Учётные записи")
+        self.tabs.addTab(self._covers_tab(), "Замещения")
         self.tabs.addTab(self._claims_tab(), "Закрепление поставщиков")
         self.tabs.addTab(self._dds_tab(), "Статьи ДДС")
         self.tabs.addTab(self._journal_tab(), "Журнал изменений")
@@ -211,6 +214,62 @@ class AdminPage(QWidget):
         self.hint = QLabel("", page)
         self.hint.setObjectName("Hint")
         actions.addWidget(self.hint)
+        layout.addLayout(actions)
+        return page
+
+    def _covers_tab(self) -> QWidget:
+        """Замещение на время отпуска: кто правит чьи оплаты, пока человека нет."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, Metrics.GAP, 0, 0)
+        layout.setSpacing(Metrics.GAP)
+
+        layout.addWidget(Hint(
+            "Уходит человек в отпуск — назначьте заместителя на этот срок. Пока "
+            "замещение идёт, заместитель правит оплаты отсутствующего как свои; "
+            "когда срок кончится, право пропадёт само, ничего возвращать не "
+            "нужно. Сам отсутствующий права не теряет. Продлить отпуск — "
+            "двойной щелчок по строке."))
+
+        self.covers_table = DataTable([
+            Column("Отсутствует", lambda c: c.absent_name, 220, highlight=True),
+            Column("Замещает", lambda c: c.cover_name, 220),
+            Column("С", lambda c: f"{c.date_from:%d.%m.%Y}" if c.date_from else "", 100,
+                   sort_key=lambda c: c.date_from or date.min),
+            Column("По", lambda c: f"{c.date_to:%d.%m.%Y}" if c.date_to else "", 100,
+                   sort_key=lambda c: c.date_to or date.min),
+            Column("Сейчас", lambda c: c.state_title, 110, color=state_color),
+            Column("Примечание", lambda c: c.note, 260),
+            Column("Назначил", lambda c: c.created_by, 160),
+        ], page)
+        self.covers_table.item_activated.connect(self.edit_cover)
+        layout.addWidget(self.covers_table, 1)
+
+        actions = QHBoxLayout()
+        self.cover_new_button = QPushButton("Назначить замещение", page)
+        self.cover_new_button.setObjectName("Primary")
+        self.cover_new_button.setIcon(icons.icon("plus"))
+        self.cover_new_button.clicked.connect(self.create_cover)
+        actions.addWidget(self.cover_new_button)
+
+        self.cover_edit_button = QPushButton("Изменить", page)
+        self.cover_edit_button.setIcon(icons.icon("edit"))
+        self.cover_edit_button.clicked.connect(
+            lambda: self.edit_cover(self._chosen_cover()))
+        actions.addWidget(self.cover_edit_button)
+
+        self.cover_delete_button = QPushButton("Снять замещение", page)
+        self.cover_delete_button.setObjectName("Danger")
+        self.cover_delete_button.setIcon(icons.icon("trash", Palette.DANGER))
+        self.cover_delete_button.setToolTip(
+            "Заместитель сразу перестанет править чужие оплаты")
+        self.cover_delete_button.clicked.connect(self.delete_cover)
+        actions.addWidget(self.cover_delete_button)
+
+        actions.addStretch(1)
+        self.covers_hint = QLabel("", page)
+        self.covers_hint.setObjectName("Hint")
+        actions.addWidget(self.covers_hint)
         layout.addLayout(actions)
         return page
 
@@ -468,7 +527,8 @@ class AdminPage(QWidget):
         self.tabs.setVisible(available)
         for button in (self.new_button, self.refresh_button,
                        self.edit_button, self.reset_button, self.dds_add_button,
-                       self.dds_mark_button,
+                       self.dds_mark_button, self.cover_new_button,
+                       self.cover_edit_button, self.cover_delete_button,
                        self.fix_button, self.reject_button,
                        self.wipe_button):
             button.setEnabled(available)
@@ -482,7 +542,8 @@ class AdminPage(QWidget):
 
     def _apply(self, payload: tuple) -> None:
         (self.accounts, self.entries, self._known,
-         self._directions, self._claims, self._scope, self._dds_items) = payload
+         self._directions, self._claims, self._scope, self._dds_items) = payload[:7]
+        self.covers = list(payload[7]) if len(payload) > 7 else []
         self._loaded = True
         self.accounts_table.set_items(self.accounts)
         self._fill_journal_people()
@@ -490,13 +551,14 @@ class AdminPage(QWidget):
         self.claims_table.set_items(self._claims)
         self.dds_table.set_items(self._dds_items)
         self._filter_dds(self.dds_search.text())
+        self._show_covers()
 
         people = {p.full_name for entry in self._claims
                   for p in entry.assigned if not p.fixed}
         self.claims_hint.setText(
             f"заявок: {len(self._claims)} от {len(people)} менеджеров"
             if self._claims else "заявок на подтверждение нет")
-        self.tabs.setTabText(1, f"Закрепление поставщиков ({len(self._claims)})"
+        self.tabs.setTabText(2, f"Закрепление поставщиков ({len(self._claims)})"
                              if self._claims else "Закрепление поставщиков")
         active = sum(1 for a in self.accounts if a.is_active)
         admins = sum(1 for a in self.accounts if a.is_admin and a.is_active)
@@ -662,6 +724,60 @@ class AdminPage(QWidget):
 
     def _reset_done(self, account: Account, password: str) -> None:
         PasswordShown(account.login, password, self).exec()
+        self.reload()
+
+    # --- замещение ------------------------------------------------------------
+
+    def _show_covers(self) -> None:
+        self.covers_table.set_items(self.covers)
+        running = sum(1 for cover in self.covers if cover.state == "active")
+        self.covers_hint.setText(
+            f"идёт сейчас: {running}" if running else "сейчас никто никого не замещает")
+        self.tabs.setTabText(1, f"Замещения ({running})" if running else "Замещения")
+
+    def _chosen_cover(self) -> Cover | None:
+        rows = self.covers_table.selected_items()
+        return rows[0] if rows else None
+
+    def create_cover(self) -> None:
+        self._edit_cover(Cover())
+
+    def edit_cover(self, cover: Cover | None) -> None:
+        if cover is None:
+            self.notify("Выберите замещение", ToastKind.INFO)
+            return
+        self._edit_cover(cover)
+
+    def _edit_cover(self, cover: Cover) -> None:
+        dialog = CoverDialog(self.accounts, cover, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        changed = dialog.result_cover()
+        run_task(lambda: admin.save_cover(changed),
+                 on_result=self._cover_saved, on_error=self._failed)
+
+    def _cover_saved(self, cover: Cover) -> None:
+        self.notify(f"{cover.cover_name} замещает {cover.absent_name}",
+                    ToastKind.SUCCESS)
+        self.reload()
+
+    def delete_cover(self) -> None:
+        cover = self._chosen_cover()
+        if cover is None:
+            self.notify("Выберите замещение", ToastKind.INFO)
+            return
+        answer = QMessageBox.question(
+            self, "Снять замещение",
+            f"Снять замещение: {cover.cover_name} за {cover.absent_name}?\n\n"
+            "Заместитель сразу перестанет править чужие оплаты.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        run_task(lambda: admin.delete_cover(cover.id),
+                 on_result=lambda _: self._cover_removed(), on_error=self._failed)
+
+    def _cover_removed(self) -> None:
+        self.notify("Замещение снято", ToastKind.SUCCESS)
         self.reload()
 
     # --- статьи ДДС -----------------------------------------------------------
@@ -836,7 +952,7 @@ def _load_all(journal_query: dict) -> tuple:
                   if item.for_people]
     claims = directory.pending_claims().items
     return (admin.accounts(), admin.journal(**journal_query), known, directions, claims,
-            admin.scope(), dds.catalog())
+            admin.scope(), dds.catalog(), admin.covers())
 
 
 def _reject(drafts: list[tuple[str, list[int]]]) -> int:

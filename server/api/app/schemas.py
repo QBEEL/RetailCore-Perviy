@@ -252,6 +252,30 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class CoverIn(BaseModel):
+    absent_id: int
+    cover_id: int
+    date_from: date
+    date_to: date
+    note: str = Field(default="", max_length=300)
+
+
+class CoverOut(BaseModel):
+    id: int
+    absent_id: int
+    absent_name: str
+    cover_id: int
+    cover_name: str
+    date_from: date
+    date_to: date
+    note: str = ""
+    # Считает сервер, по московской дате: planned — ещё не началось, active —
+    # идёт сегодня, ended — закончилось.
+    state: Literal["planned", "active", "ended"]
+    created_by: str = ""
+    created_at: datetime
+
+
 class PasswordChange(BaseModel):
     old_password: str
     new_password: str = Field(min_length=10)

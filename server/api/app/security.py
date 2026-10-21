@@ -98,10 +98,18 @@ class User:
     # Когда человек вошёл по паролю (секунды Unix). Продление токена этот
     # момент не сдвигает.
     auth_time: int = 0
+    # Имена тех, кого человек замещает сегодня (см. миграцию 019). Отдельно от
+    # `responsible`: свои имена — закрепление, а эти кончаются вместе с отпуском.
+    covered: frozenset[str] = frozenset()
+
+    @property
+    def mine(self) -> frozenset[str]:
+        """Чьи оплаты человек сейчас вправе править: свои и замещаемых."""
+        return self.responsible | self.covered
 
     def may_edit(self, responsible: str) -> bool:
-        """Администратор правит всё, остальные — только свои оплаты."""
-        return self.is_admin or responsible in self.responsible
+        """Администратор правит всё, остальные — свои оплаты и замещаемых."""
+        return self.is_admin or responsible in self.mine
 
 
 _VERSION = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$")
@@ -161,7 +169,16 @@ def current_user(token: str = Depends(scheme),
         "SELECT u.id, u.login, u.full_name, u.is_admin, u.is_active,"
         "       u.token_version, u.app_version, u.app_platform, u.app_seen_at,"
         "       COALESCE(array_agg(r.responsible)"
-        "                FILTER (WHERE r.responsible IS NOT NULL), '{}') AS responsible"
+        "                FILTER (WHERE r.responsible IS NOT NULL), '{}') AS responsible,"
+        # Замещения, которые идут сегодня. Подзапросом, а не вторым JOIN:
+        # с ним строки размножились бы и array_agg выше считал бы каждое имя
+        # по числу замещений.
+        "       COALESCE((SELECT array_agg(DISTINCT a.responsible)"
+        "                   FROM user_cover c"
+        "                   JOIN user_responsible a ON a.user_id = c.absent_id"
+        "                  WHERE c.cover_id = u.id"
+        "                    AND (now() AT TIME ZONE 'Europe/Moscow')::date"
+        "                        BETWEEN c.date_from AND c.date_to), '{}') AS covered"
         " FROM app_user u"
         " LEFT JOIN user_responsible r ON r.user_id = u.id"
         " WHERE u.id = %s GROUP BY u.id",
@@ -182,6 +199,7 @@ def current_user(token: str = Depends(scheme),
         is_admin=row["is_admin"],
         responsible=frozenset(row["responsible"]),
         auth_time=auth_time,
+        covered=frozenset(row["covered"]),
     )
 
 
