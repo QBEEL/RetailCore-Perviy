@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -18,8 +19,18 @@ from ..core import updater
 GITHUB_OWNER = "QBEEL"
 GITHUB_REPO = "RetailCore-Releases"
 
+# Версию узнаём без API: `releases/latest` на самом github.com отвечает
+# перенаправлением на тег последнего релиза, а файлы релиза лежат по адресам с
+# этим тегом. У API без токена лимит 60 запросов в час с одного IP, и офис за
+# общим адресом (или общий VPN) упирался в него уже на утреннем запуске: «server
+# replied with status code 403». API остаётся запасным путём.
+_RELEASES_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
+_LATEST_URL = f"{_RELEASES_URL}/latest"
 _API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 _MANIFEST_ASSET = "version.json"
+# Тег попадает в адрес загрузки, поэтому принимается только обычный номер версии.
+_TAG_IN_LOCATION = re.compile(r"/releases/tag/(v?\d+\.\d+\.\d+)$")
+_REDIRECTS = (301, 302, 303, 307, 308)
 _USER_AGENT = b"RetailCore-Updater"
 
 
@@ -42,6 +53,29 @@ class UpdateChecker(QObject):
     # --- проверка версии --------------------------------------------------
 
     def check(self) -> None:
+        """Последний релиз по перенаправлению с `releases/latest`; не вышло — через API."""
+        request = QNetworkRequest(QUrl(_LATEST_URL))
+        request.setRawHeader(b"User-Agent", _USER_AGENT)
+        # Само перенаправление не выполняется: нужен лишь адрес, куда оно ведёт.
+        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                             QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
+        reply = self._net.get(request)
+        reply.finished.connect(lambda: self._on_latest(reply))
+
+    def _on_latest(self, reply: QNetworkReply) -> None:
+        reply.deleteLater()
+        tag = _tag_from_redirect(reply)
+        if tag:
+            exe_url = f"{_RELEASES_URL}/download/{tag}/{updater.release_asset()}"
+            manifest_url = f"{_RELEASES_URL}/download/{tag}/{_MANIFEST_ASSET}"
+            if updater.is_https(exe_url) and updater.is_https(manifest_url):
+                self._fetch_manifest(tag.lstrip("vV"), exe_url, manifest_url)
+                return
+        updater.log_event(
+            f"Latest release not found by redirect ({reply.errorString()}), asking the API")
+        self._check_via_api()
+
+    def _check_via_api(self) -> None:
         request = QNetworkRequest(QUrl(_API_URL))
         request.setRawHeader(b"User-Agent", _USER_AGENT)
         request.setRawHeader(b"Accept", b"application/vnd.github+json")
@@ -156,3 +190,13 @@ class UpdateChecker(QObject):
 
         updater.log_event("Download completed")
         self.ready.emit(path)
+
+
+def _tag_from_redirect(reply: QNetworkReply) -> str:
+    """Тег релиза из перенаправления; пусто — ответ не тот, что ждали."""
+    status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+    if status not in _REDIRECTS:
+        return ""
+    location = reply.rawHeader("Location").data().decode("utf-8", "replace")
+    found = _TAG_IN_LOCATION.search(location.split("?")[0].split("#")[0])
+    return found.group(1) if found else ""
