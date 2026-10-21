@@ -365,12 +365,47 @@ class TestPage:
 
     def test_новое_для_меня_подсвечивается(self, app) -> None:
         sign_in(user_id=7)
-        mine, other, seen = claims(row(manager_id=7), row(manager_id=8),
-                                   row(manager_id=7, manager_seen=True))
+        mine, other, answered = claims(
+            row(manager_id=7), row(manager_id=8),
+            row(manager_id=7, manager_seen=True, status="accepted"))
 
         assert ClaimsPage._tint(mine) is not None
         assert ClaimsPage._tint(other) is None
-        assert ClaimsPage._tint(seen) is None
+        assert ClaimsPage._tint(answered) is None
+
+    def test_открытая_но_не_принятая_заявка_остаётся_подсвеченной(self, app) -> None:
+        """Заглянуть в карточку мало: напоминание висит, пока КМ не принял."""
+        sign_in(user_id=7)
+        opened, returned, own = claims(
+            row(manager_id=7, manager_seen=True, status="new"),
+            # Вернули из архива: она уже принималась, но о возврате КМ не знает.
+            row(manager_id=7, manager_seen=False, status="accepted"),
+            # КМ сам завёл заявку на себя — ему о ней напоминать незачем.
+            row(manager_id=7, applicant_id=7, status="new"))
+
+        assert ClaimsPage._tint(opened) is not None
+        assert ClaimsPage._tint(returned) is not None
+        assert ClaimsPage._tint(own) is None
+
+    def test_полоса_висит_пока_есть_заявки_без_ответа(self, app) -> None:
+        page, _ = make_page(app)
+        assert page.pending_banner.isHidden()
+
+        page.set_pending(3)
+        assert not page.pending_banner.isHidden()
+        assert "Ждут вашего ответа: 3" in page.pending_label.text()
+
+        page.set_pending(0)
+        assert page.pending_banner.isHidden()
+
+    def test_полоса_ведёт_на_вкладку_мои(self, app, monkeypatch) -> None:
+        page, _ = make_page(app)
+        monkeypatch.setattr(page, "restore", lambda: None)
+        page.tabs.setCurrentIndex(claims_page.TAB_OPEN)
+
+        page.show_pending()
+
+        assert page.tabs.currentIndex() == claims_page.TAB_MINE
 
     def test_открытие_снимает_новое_и_сообщает_окну(self, app, monkeypatch) -> None:
         sign_in(user_id=7)
@@ -402,6 +437,93 @@ class TestPage:
         page._open(claim)
 
         assert marked == [] and claim.manager_seen is False
+
+
+class TestBulk:
+    """Принять в работу или закрыть сразу несколько выделенных заявок."""
+
+    def _page(self, app, *rows: dict):
+        page, notices = make_page(app)
+        page._apply((claims_page.TAB_OPEN, claims(*rows), [], []))
+        return page, notices
+
+    def test_кнопки_считают_выделенные(self, app) -> None:
+        page, _ = self._page(app, row(id=1), row(id=2), row(id=3, can_accept=False))
+
+        page.table.selectAll()
+
+        assert page.accept_button.text() == "Принять в работу (2)"
+        assert page.close_button.text() == "Закрыть заявки (3)"
+
+        page.table.selectRow(0)
+        assert page.accept_button.text() == "Принять в работу"
+        assert page.close_button.text() == "Закрыть заявку"
+
+    def test_без_прав_на_выделенное_кнопки_закрыты(self, app) -> None:
+        page, _ = self._page(app, row(id=1, can_accept=False, can_close=False))
+
+        page.table.selectRow(0)
+
+        assert not page.accept_button.isEnabled()
+        assert not page.close_button.isEnabled()
+
+    def test_принимаются_только_те_на_которые_есть_право(self, app, monkeypatch) -> None:
+        page, _ = self._page(app, row(id=1), row(id=2, can_accept=False), row(id=3))
+        accepted: list[int] = []
+        monkeypatch.setattr(claims_page.remote, "accept_claim", accepted.append)
+        monkeypatch.setattr(claims_page, "run_task",
+                            lambda fn, *a, on_result=None, **k: on_result(fn(*a)))
+        monkeypatch.setattr(page, "restore", lambda: None)
+        page.table.selectAll()
+
+        page.accept_selected()
+
+        assert sorted(accepted) == [1, 3]
+
+    def test_отказ_по_одной_не_отменяет_остальные(self, app, monkeypatch) -> None:
+        def accept(claim_id: int) -> None:
+            if claim_id == 2:
+                raise transport.ServerError("Заявка уже принята")
+
+        monkeypatch.setattr(claims_page.remote, "accept_claim", accept)
+
+        done, failures = claims_page._accept_many([1, 2, 3])
+
+        assert done == 2
+        assert len(failures) == 1 and "№2" in failures[0] and "уже принята" in failures[0]
+
+    def test_отказ_по_всем_поднимается_ошибкой(self, app, monkeypatch) -> None:
+        def accept(claim_id: int) -> None:
+            raise transport.ServerError("Нет связи")
+
+        monkeypatch.setattr(claims_page.remote, "accept_claim", accept)
+
+        with pytest.raises(transport.ServerError, match="Нет связи"):
+            claims_page._accept_many([1, 2])
+
+    def test_закрытие_ставит_один_итог_всем(self, app, monkeypatch) -> None:
+        page, notices = self._page(app, row(id=1), row(id=2))
+        closed: list[tuple] = []
+        monkeypatch.setattr(claims_page.remote, "close_claim",
+                            lambda cid, resolution, note="": closed.append((cid, resolution, note)))
+        monkeypatch.setattr(claims_page, "run_task",
+                            lambda fn, *a, on_result=None, **k: on_result(fn(*a)))
+        monkeypatch.setattr(claims_page.CloseDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(claims_page.CloseDialog, "value", lambda self: ("refund", "возврат"))
+        monkeypatch.setattr(page, "restore", lambda: None)
+        page.table.selectAll()
+
+        page.close_selected()
+
+        assert closed == [(1, "refund", "возврат"), (2, "refund", "возврат")]
+        assert any("Закрыто заявок: 2" in text for text, _kind in notices)
+
+    def test_окно_закрытия_называет_число_заявок(self, app) -> None:
+        dialog = CloseDialog(claims(row())[0], None, count=3)
+
+        assert dialog.windowTitle() == "Закрыть заявки"
+        texts = [label.text() for label in dialog.findChildren(claims_page.QLabel)]
+        assert any("Закрыть заявок: 3" in text for text in texts)
 
 
 # --- окна ----------------------------------------------------------------------

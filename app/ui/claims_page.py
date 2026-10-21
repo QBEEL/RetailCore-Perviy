@@ -14,7 +14,9 @@ from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
@@ -99,6 +101,8 @@ class ClaimsPage(QWidget):
         card = Card(self)
         body = card.body()
 
+        body.addWidget(self._build_pending_banner(card))
+
         header = QHBoxLayout()
         header.setSpacing(9)
         header.addWidget(SectionTitle("Заявки", card))
@@ -168,6 +172,47 @@ class ClaimsPage(QWidget):
 
         self._update_actions()
 
+    def _build_pending_banner(self, parent: QWidget) -> QFrame:
+        """Полоса над списком, пока есть заявки, на которые КМ ещё не ответил.
+
+        Всплывашка в углу исчезает через несколько секунд, а цифра в меню
+        теряется среди прочего. Полоса остаётся на месте, пока КМ не нажмёт
+        «Принять в работу» по каждой заявке, — забыть о заявке из-за закрытого
+        уведомления нельзя.
+        """
+        banner = QFrame(parent)
+        banner.setStyleSheet(
+            f"QFrame {{ background: {Palette.WARNING_SOFT};"
+            f" border: 1px solid {Palette.WARNING}; border-radius: 8px; }}"
+            " QLabel { border: none; background: transparent; }")
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(Metrics.GAP)
+        self.pending_label = QLabel("", banner)
+        self.pending_label.setWordWrap(True)
+        row.addWidget(self.pending_label, 1)
+        show = QPushButton("Показать", banner)
+        show.setToolTip("Открыть вкладку «Мои» — там заявки, адресованные вам")
+        show.clicked.connect(lambda _checked=False: self.show_pending())
+        row.addWidget(show)
+        banner.hide()
+        self.pending_banner = banner
+        return banner
+
+    def set_pending(self, count: int) -> None:
+        """Сколько заявок ждут ответа вошедшего КМ (считает сервер)."""
+        self.pending_banner.setVisible(count > 0)
+        if count > 0:
+            self.pending_label.setText(
+                f"Ждут вашего ответа: {count}. Откройте заявку и нажмите «Принять в "
+                "работу» — пока этого не сделано, напоминание остаётся.")
+
+    def show_pending(self) -> None:
+        if self.tabs.currentIndex() != TAB_MINE:
+            self.tabs.setCurrentIndex(TAB_MINE)
+        else:
+            self.restore()
+
     def _action(self, parent: QWidget, title: str, icon: str, handler) -> QPushButton:
         button = QPushButton(title, parent)
         button.setIcon(icons.icon(icon))
@@ -232,11 +277,19 @@ class ClaimsPage(QWidget):
 
     @staticmethod
     def _tint(claim: Claim) -> QColor | None:
-        """Адресованное мне и ещё не открытое — заметно с первого взгляда."""
-        mine = claim.manager_id and claim.manager_id == transport.session.user_id
-        if mine and not claim.manager_seen and not claim.is_closed:
+        """Адресованное мне и ещё без ответа — заметно с первого взгляда."""
+        if ClaimsPage._waits_for_me(claim):
             return QColor(Palette.PRIMARY_SOFT)
         return None
+
+    @staticmethod
+    def _waits_for_me(claim: Claim) -> bool:
+        """Как считает сервер (`/inbox`): не закрыта, адресована мне, я на неё не
+        ответил — или её вернули из архива, а я об этом ещё не знаю."""
+        mine = claim.manager_id and claim.manager_id == transport.session.user_id
+        return bool(mine and not claim.is_closed
+                    and claim.applicant_id != claim.manager_id
+                    and (claim.status == "new" or not claim.manager_seen))
 
     # --- данные ---------------------------------------------------------------
 
@@ -318,9 +371,20 @@ class ClaimsPage(QWidget):
 
     def _update_actions(self, *_args: Any) -> None:
         claim = self._current()
+        selected = self._selected()
+        acceptable = [c for c in selected if c.can_accept]
+        closable = [c for c in selected if c.can_close]
         self.open_button.setEnabled(claim is not None)
-        self.accept_button.setEnabled(bool(claim and claim.can_accept))
-        self.close_button.setEnabled(bool(claim and claim.can_close))
+        # Принять и закрыть можно сразу несколько выделенных: Ctrl или Shift +
+        # щелчок. В подписи — сколько заявок затронет нажатие.
+        self.accept_button.setEnabled(bool(acceptable))
+        self.accept_button.setText(
+            f"Принять в работу ({len(acceptable)})" if len(acceptable) > 1
+            else "Принять в работу")
+        self.close_button.setEnabled(bool(closable))
+        self.close_button.setText(
+            f"Закрыть заявки ({len(closable)})" if len(closable) > 1
+            else "Закрыть заявку")
         self.delete_button.setEnabled(bool(claim and claim.can_delete))
         self.torg_button.setEnabled(bool(self._selected()))
         # «Вернуть из архива» видна только там, где имеет смысл, и только тому,
@@ -380,21 +444,43 @@ class ClaimsPage(QWidget):
                     and not claim.manager_seen and not claim.is_closed)
 
     def accept_selected(self) -> None:
-        if claim := self._current():
-            run_task(remote.accept_claim, claim.id,
-                     on_result=lambda _r: self._done("Принято в работу"),
-                     on_error=self._failed)
+        targets = [c for c in self._selected() if c.can_accept]
+        if not targets:
+            self.notify("Выделите заявки, которые нужно принять в работу", ToastKind.WARNING)
+            return
+        run_task(_accept_many, [c.id for c in targets],
+                 on_result=self._accepted, on_error=self._failed)
+
+    def _accepted(self, result: tuple[int, list[str]]) -> None:
+        done, failures = result
+        if done:
+            self.notify("Принято в работу" if done == 1 else f"Принято в работу заявок: {done}",
+                        ToastKind.SUCCESS)
+        for failure in failures:
+            self.notify(failure, ToastKind.ERROR)
+        self._changed()
 
     def close_selected(self) -> None:
-        if not (claim := self._current()):
+        targets = [c for c in self._selected() if c.can_close]
+        if not targets:
+            self.notify("Выделите заявки, которые нужно закрыть", ToastKind.WARNING)
             return
-        dialog = CloseDialog(claim, self)
+        dialog = CloseDialog(targets[0], self, count=len(targets))
         if not dialog.exec():
             return
         resolution, note = dialog.value()
-        run_task(remote.close_claim, claim.id, resolution, note,
-                 on_result=lambda _r: self._done("Заявка закрыта и ушла в архив"),
-                 on_error=self._failed)
+        run_task(_close_many, [c.id for c in targets], resolution, note,
+                 on_result=self._closed, on_error=self._failed)
+
+    def _closed(self, result: tuple[int, list[str]]) -> None:
+        done, failures = result
+        if done:
+            self.notify("Заявка закрыта и ушла в архив" if done == 1
+                        else f"Закрыто заявок: {done}, они ушли в архив",
+                        ToastKind.SUCCESS)
+        for failure in failures:
+            self.notify(failure, ToastKind.ERROR)
+        self._changed()
 
     def reopen_selected(self) -> None:
         if not (claim := self._current()):
@@ -518,6 +604,40 @@ def _fetch(tab: int, text: str) -> tuple[int, list[Claim], list[Manager], list[B
         # Справочник брендов — подсказка; без него бренд вводится руками.
         brands = []
     return tab, claims, managers, brands
+
+
+def _each(ids: list[int], action, verb: str) -> tuple[int, list[str]]:
+    """Применяет действие к каждой заявке по очереди и собирает отказы.
+
+    Отказ по одной заявке (её за это время закрыли или переназначили) не
+    отменяет остальные: они независимы, а уже принятое откатывать нечем.
+    Если отказали все, ошибка поднимается наверх — иначе человек увидел бы
+    тихое «ничего не сделано».
+    """
+    done = 0
+    failures: list[str] = []
+    for claim_id in ids:
+        try:
+            action(claim_id)
+        except transport.ServerError as failure:
+            failures.append(f"Заявка №{claim_id} не {verb}: {failure}")
+        else:
+            done += 1
+    if not done and failures:
+        if len(failures) == 1:
+            raise transport.ServerError(failures[0])
+        raise transport.ServerError(
+            f"{failures[0]} (и ещё отказов: {len(failures) - 1})")
+    return done, failures
+
+
+def _accept_many(ids: list[int]) -> tuple[int, list[str]]:
+    return _each(ids, remote.accept_claim, "принята")
+
+
+def _close_many(ids: list[int], resolution: str, note: str) -> tuple[int, list[str]]:
+    return _each(ids, lambda claim_id: remote.close_claim(claim_id, resolution, note),
+                 "закрыта")
 
 
 def _add_brands(names: list[str]) -> None:

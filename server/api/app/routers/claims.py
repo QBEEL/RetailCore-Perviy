@@ -252,16 +252,28 @@ def managers(user: User = Depends(security.current_user)) -> list[ManagerOut]:
 
 @router.get("/inbox", response_model=Inbox, summary="Что адресовано мне")
 def inbox(user: User = Depends(security.current_user)) -> Inbox:
-    """Опрашивается приложением раз в минуту — запрос должен быть дешёвым."""
+    """Опрашивается приложением раз в минуту — запрос должен быть дешёвым.
+
+    `unseen` — сколько заявок ждут ответа КМ. Открыть заявку мало: уведомление
+    висит, пока КМ не нажмёт «Принять в работу» (или заявку не закроют). Иначе
+    достаточно было один раз заглянуть в карточку, и заявка забывалась. Вернутая
+    из архива заявка уже принималась, но КМ о возврате не знает — она ждёт, пока
+    её не откроют. Заявки, заведённые КМ на самого себя, не в счёт: он о них
+    знает.
+    """
+    waiting = ("c.manager_id = %s AND c.status <> 'closed'"
+               " AND c.applicant_id <> c.manager_id"
+               " AND (c.status = 'new' OR NOT c.manager_seen)")
     counts = db.fetch_one(
-        "SELECT COUNT(*) FILTER (WHERE NOT manager_seen) AS unseen,"
+        f"SELECT COUNT(*) FILTER (WHERE {waiting}) AS unseen,"
         "       COUNT(*) AS open"
-        " FROM claim WHERE manager_id = %s AND status <> 'closed'", (user.id,))
+        " FROM claim c WHERE c.manager_id = %s AND c.status <> 'closed'",
+        (user.id, user.id))
     fresh = db.fetch_all(
         "SELECT c.id, c.kind, c.brand, c.product,"
         "       COALESCE(NULLIF(a.full_name, ''), a.login) AS applicant"
         " FROM claim c JOIN app_user a ON a.id = c.applicant_id"
-        " WHERE c.manager_id = %s AND c.status <> 'closed' AND NOT c.manager_seen"
+        f" WHERE {waiting}"
         " ORDER BY c.created_at DESC, c.id DESC LIMIT 5", (user.id,))
     return Inbox(unseen=int(counts["unseen"] or 0), open=int(counts["open"] or 0),
                  items=[InboxItem(**row) for row in fresh])

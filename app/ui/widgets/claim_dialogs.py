@@ -559,18 +559,28 @@ class CloseDialog(QDialog):
     потом видно, сколько вернули деньгами, а сколько просто довезли.
     """
 
-    def __init__(self, claim: Claim, parent: QWidget | None = None) -> None:
+    def __init__(self, claim: Claim, parent: QWidget | None = None,
+                 *, count: int = 1) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Закрыть заявку")
+        self.setWindowTitle("Закрыть заявку" if count == 1 else "Закрыть заявки")
         self.setMinimumWidth(460)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
         root.setSpacing(Metrics.GAP)
-        root.addWidget(SectionTitle(claim.title))
-        root.addWidget(Hint(
-            f"{claim.kind_title}, {claim.quantity_text()} шт. После закрытия заявка "
-            "уйдёт в архив и правке не подлежит."))
+        if count == 1:
+            root.addWidget(SectionTitle(claim.title))
+            root.addWidget(Hint(
+                f"{claim.kind_title}, {claim.quantity_text()} шт. После закрытия заявка "
+                "уйдёт в архив и правке не подлежит."))
+        else:
+            # Один итог и одно примечание на все выделенные: заявки одной поставки
+            # обычно кончаются одинаково, а разные закрывают по отдельности.
+            root.addWidget(SectionTitle(f"Закрыть заявок: {count}"))
+            root.addWidget(Hint(
+                "Выбранный итог и примечание получат все выделенные заявки. После "
+                "закрытия они уйдут в архив и правке не подлежат. Если у заявок "
+                "разные итоги, закройте их по отдельности."))
 
         form = QFormLayout()
         form.setSpacing(Metrics.GAP)
@@ -590,7 +600,7 @@ class CloseDialog(QDialog):
         self.error.hide()
         root.addWidget(self.error)
 
-        buttons = _buttons(self, "Закрыть заявку")
+        buttons = _buttons(self, "Закрыть заявку" if count == 1 else f"Закрыть заявки ({count})")
         buttons.accepted.connect(self._accept)
         root.addWidget(buttons)
 

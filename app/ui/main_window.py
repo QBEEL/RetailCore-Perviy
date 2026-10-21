@@ -155,6 +155,7 @@ class MainWindow(QMainWindow):
         self.toasts = ToastManager(self)
         self.claims_watcher = ClaimsWatcher(self)
         self.claims_watcher.unseen_changed.connect(self._claims_badge.set_count)
+        self.claims_watcher.unseen_changed.connect(self.claims_page.set_pending)
         self.claims_watcher.arrived.connect(self._claims_arrived)
         self.claims_page.inbox_changed.connect(self.claims_watcher.poll)
         self._claims_watching = False
