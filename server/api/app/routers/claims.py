@@ -29,7 +29,7 @@ from .files import CHUNK, MAX_SIZE, _SAFE_EXTENSION, clean_name, is_risky
 
 router = APIRouter(prefix="/api/claims", tags=["Торг-2"])
 
-Kind = Literal["shortage", "defect"]
+Kind = Literal["shortage", "defect", "surplus"]
 Resolution = Literal["delivered", "replaced", "refund", "written_off", "rejected"]
 
 # Сколько закрытых заявок отдаётся за раз. Архив растёт каждый месяц, а
@@ -45,6 +45,8 @@ class ClaimIn(BaseModel):
     barcode: str = Field("", max_length=64)
     quantity: float = Field(1, gt=0, le=1_000_000)
     expiry_date: date | None = None
+    # Код маркировки как отсканировали; пусто — товар не маркируемый.
+    mark_code: str = Field("", max_length=300)
     comment: str = Field("", max_length=2000)
     manager_id: int | None = None
 
@@ -63,6 +65,7 @@ class ClaimPatch(BaseModel):
     barcode: str | None = Field(None, max_length=64)
     quantity: float | None = Field(None, gt=0, le=1_000_000)
     expiry_date: date | None = None
+    mark_code: str | None = Field(None, max_length=300)
     comment: str | None = Field(None, max_length=2000)
     manager_id: int | None = None
 
@@ -81,6 +84,7 @@ class ClaimOut(BaseModel):
     barcode: str
     quantity: float
     expiry_date: date | None
+    mark_code: str = ""
     comment: str
     status: Literal["new", "accepted", "closed"]
     applicant_id: int
@@ -143,11 +147,14 @@ class Hint(BaseModel):
     product: str = ""
     spec: str = ""
     manager_id: int | None = None
+    # По этому штрих-коду уже заводили заявку с кодом маркировки — товар
+    # маркируемый, и галочку в окне заявки можно поставить сразу.
+    marked: bool = False
 
 
 _SELECT = (
     "SELECT c.id, c.kind, c.brand, c.product, c.spec, c.barcode, c.quantity,"
-    "       c.expiry_date, c.comment, c.status, c.applicant_id,"
+    "       c.expiry_date, c.mark_code, c.comment, c.status, c.applicant_id,"
     "       COALESCE(NULLIF(a.full_name, ''), a.login) AS applicant,"
     "       c.manager_id,"
     "       COALESCE(NULLIF(m.full_name, ''), m.login, '') AS manager,"
@@ -166,7 +173,7 @@ _SELECT = (
 # Название поля → как оно называется в журнале. В журнал идёт имя менеджера, а
 # не номер: через год по «manager_id 17» уже ничего не понять.
 _FIELDS = ("kind", "brand", "product", "spec", "barcode", "quantity",
-           "expiry_date", "comment")
+           "expiry_date", "mark_code", "comment")
 
 
 def _not_found() -> HTTPException:
@@ -289,8 +296,11 @@ def hint(user: User = Depends(security.current_user),
     barcode, brand = barcode.strip(), brand.strip()
     if barcode:
         row = db.fetch_one(
-            "SELECT brand, product, spec, manager_id FROM claim"
-            " WHERE barcode = %s ORDER BY id DESC LIMIT 1", (barcode,))
+            "SELECT brand, product, spec, manager_id,"
+            "       EXISTS (SELECT 1 FROM claim m WHERE m.barcode = %s"
+            "                AND m.mark_code <> '') AS marked"
+            "  FROM claim WHERE barcode = %s ORDER BY id DESC LIMIT 1",
+            (barcode, barcode))
         if row:
             return Hint(**row)
     if brand:
@@ -338,11 +348,12 @@ def create_claim(form: ClaimIn,
     seen = form.manager_id in (None, user.id)
     created = db.fetch_one(
         "INSERT INTO claim (kind, brand, product, spec, barcode, quantity,"
-        "  expiry_date, comment, applicant_id, manager_id, manager_seen)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "  expiry_date, mark_code, comment, applicant_id, manager_id, manager_seen)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (form.kind, form.brand.strip(), form.product.strip(), form.spec.strip(),
          form.barcode.strip(), form.quantity, form.expiry_date,
-         form.comment.strip(), user.id, form.manager_id, seen))
+         form.mark_code.strip(), form.comment.strip(), user.id, form.manager_id,
+         seen))
     row = _load(created["id"])
     _log(user, created["id"], "create", row, {
         "kind": form.kind, "quantity": form.quantity, "manager": row["manager"]})
@@ -369,7 +380,7 @@ def patch_claim(claim_id: int, form: ClaimPatch,
     # поле передано явно.
     if "expiry_date" in form.model_fields_set:
         values["expiry_date"] = form.expiry_date
-    for name in ("brand", "product", "spec", "barcode", "comment"):
+    for name in ("brand", "product", "spec", "barcode", "mark_code", "comment"):
         if isinstance(values.get(name), str):
             values[name] = values[name].strip()
 

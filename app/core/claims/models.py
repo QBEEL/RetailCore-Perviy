@@ -9,7 +9,10 @@ from datetime import date, datetime
 
 # Названия видов, статусов и итогов — единственное место, где они записаны
 # словами. Коды те же, что в базе на сервере.
-KIND_TITLES = {"shortage": "Недопоставка", "defect": "Брак"}
+KIND_TITLES = {"shortage": "Недопоставка", "defect": "Брак", "surplus": "Излишек"}
+# У каких видов товар физически на складе: у них код маркировки можно и нужно
+# отсканировать. У недопоставки товара нет — сканировать нечего.
+KINDS_WITH_ITEM = ("defect", "surplus")
 STATUS_TITLES = {"new": "Новая", "accepted": "Принято в работу", "closed": "Закрыто"}
 # Итоги закрытия: по ним потом считается, сколько вернули деньгами, а сколько
 # просто довезли. Порядок — как в списке выбора.
@@ -37,6 +40,8 @@ class Claim:
     barcode: str = ""
     quantity: float = 1.0
     expiry_date: date | None = None
+    # Код маркировки (DataMatrix) как отсканировали; пусто — товар не маркируемый.
+    mark_code: str = ""
     comment: str = ""
     status: str = "new"
     applicant_id: int = 0
@@ -147,6 +152,8 @@ class ClaimHint:
     product: str = ""
     spec: str = ""
     manager_id: int | None = None
+    # Этот штрих-код уже заводили с кодом маркировки: товар маркируемый.
+    marked: bool = False
 
 
 def expiry_label(expiry: date | None, today: date | None = None) -> str:

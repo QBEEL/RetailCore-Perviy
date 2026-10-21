@@ -5,7 +5,9 @@ import os
 from typing import Any
 
 from PySide6.QtCore import QStringListModel, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QCompleter,
     QDialog,
     QDialogButtonBox,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from ...core.claims import (
     KIND_TITLES,
+    KINDS_WITH_ITEM,
     RESOLUTION_TITLES,
     Brand,
     Claim,
@@ -34,6 +37,7 @@ from ...core.claims import (
     has_brand,
     remote,
 )
+from ...core.claims import mark as mark_module
 from ...core.payments.safe_files import is_risky
 from ...core.payments.transport import ServerError
 from ..tasks import run_task
@@ -45,6 +49,14 @@ from .payment_dialogs import DateInput
 # Менеджер не выбран. Заявка без КМ допустима: склад не всегда знает, чей это
 # бренд, и назначить менеджера потом должен мочь любой.
 NO_MANAGER = "— не назначен —"
+
+
+def _ask_gis(code: str) -> Any:
+    """Спрашивает «Честный ЗНАК» о коде. Свежий ответ: срок читается из самого
+    ответа, а в кэше проверки его нет."""
+    from ...core.marking import service
+
+    return service.check([code], use_cache=False)[0]
 
 
 def _buttons(dialog: QDialog, ok_text: str, *, ok_enabled: bool = True) -> QDialogButtonBox:
@@ -73,11 +85,23 @@ class ClaimDialog(QDialog):
 
     def __init__(self, claim: Claim | None, managers: list[Manager],
                  brands: list[Brand] | None = None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, *, settings: Any = None) -> None:
         super().__init__(parent)
         self.claim = claim
         self._managers = managers
         self._brands = brands or []
+        # Правила расчёта срока по дате производства (вкладка «Срок годности»
+        # в маркировке): у парфюмерии срока в системе нет, он считается.
+        self._shelf_years = getattr(settings, "marking_shelf_years", 3) or 3
+        self._shelf_brands = dict(getattr(settings, "marking_shelf_brands", {}) or {})
+        # Какой срок подставлен из кода: свой, введённый руками, не затирается.
+        self._auto_expiry = ""
+        # Последний обработанный код: Enter от сканера и уход фокуса из поля
+        # приходят оба, а спрашивать «Честный ЗНАК» дважды незачем.
+        self._scanned = ""
+        # Номер ответа ГИС МТ: медленный ответ по прежнему коду не должен лечь
+        # поверх следующего.
+        self._lookup_id = 0
         # Какие из набранных брендов человек попросил добавить в справочник.
         # Решает окно, а добавляет страница: окно ничего не пишет на сервер само.
         self.new_brands: list[str] = []
@@ -113,6 +137,24 @@ class ClaimDialog(QDialog):
         self.barcode.setPlaceholderText("отсканируйте или введите — остальное подставится")
         self.barcode.editingFinished.connect(self._lookup)
         form.addRow("Штрих-код", self.barcode)
+
+        # Маркируемый товар: у брака и излишка код с упаковки обязателен, у
+        # недопоставки его можно только приложить — товара на складе нет.
+        self.marked = QCheckBox("Маркируемый товар", self)
+        self.marked.toggled.connect(self._marked_toggled)
+        self.kind.currentIndexChanged.connect(lambda _i: self._refresh_mark_hint())
+        form.addRow("", self.marked)
+        self.mark_code = QLineEdit(self)
+        self.mark_code.setPlaceholderText("наведите сканер на код маркировки (DataMatrix)")
+        self.mark_code.returnPressed.connect(self._code_scanned)
+        self.mark_code.editingFinished.connect(self._code_scanned)
+        form.addRow("Код маркировки", self.mark_code)
+        self.mark_note = Hint("", self)
+        form.addRow("", self.mark_note)
+        self._mark_rows = (self.mark_code, self.mark_note)
+        for widget in self._mark_rows:
+            form.setRowVisible(widget, False)
+        self._form = form
 
         self.brand = QLineEdit(self)
         self.brand.setPlaceholderText("начните печатать — программа подскажет из списка")
@@ -208,10 +250,17 @@ class ClaimDialog(QDialog):
                            ok_enabled=not self._readonly)
         buttons.accepted.connect(self._accept)
         root.addWidget(buttons)
+        # Сканер заканчивает каждый код нажатием Enter. Для окна это «кнопка по
+        # умолчанию»: заявка закрывалась на середине ввода. Теперь ни одна кнопка
+        # от Enter не срабатывает (см. keyPressEvent) — нажимают их мышью.
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
 
         if self._readonly:
-            for field in (self.kind, self.barcode, self.brand, self.product,
-                          self.spec, self.quantity, self.expiry, self.manager):
+            for field in (self.kind, self.barcode, self.marked, self.mark_code,
+                          self.brand, self.product, self.spec, self.quantity,
+                          self.expiry, self.manager):
                 field.setEnabled(False)
             self.comment.setReadOnly(True)
             self.add_button.setEnabled(False)
@@ -253,6 +302,8 @@ class ClaimDialog(QDialog):
         self.spec.setText(claim.spec)
         self.quantity.setValue(claim.quantity)
         self.expiry.set_value(claim.expiry_date)
+        self.mark_code.setText(claim.mark_code)
+        self.marked.setChecked(bool(claim.mark_code))
         index = self.manager.findData(claim.manager_id)
         if index < 0 and claim.manager_id:
             # КМ, у которого направление сняли: в списке его уже нет, но
@@ -319,6 +370,143 @@ class ClaimDialog(QDialog):
         if hint.manager_id is not None and self.manager.currentData() is None:
             if (index := self.manager.findData(hint.manager_id)) >= 0:
                 self.manager.setCurrentIndex(index)
+        # Этот штрих-код уже заводили с кодом маркировки — товар маркируемый.
+        # Галочку только ставим, снимать за человека нечего.
+        if getattr(hint, "marked", False) and not self.marked.isChecked():
+            self.marked.setChecked(True)
+
+    # --- маркировка -----------------------------------------------------------
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 — имя Qt
+        """Enter не закрывает окно и не нажимает кнопки.
+
+        Сканер завершает скан нажатием Enter, и обычное поведение окна — нажать
+        кнопку по умолчанию — завершало заявку посреди ввода. Enter остаётся
+        рабочим там, где он нужен: в многострочном комментарии и на кнопке,
+        на которой стоит фокус.
+        """
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            focus = self.focusWidget()
+            if isinstance(focus, (QPushButton, QPlainTextEdit)):
+                super().keyPressEvent(event)
+            else:
+                event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _code_value(self) -> str:
+        """Код для сохранения: пусто, если товар не отмечен маркируемым."""
+        if not self.marked.isChecked():
+            return ""
+        return mark_module.read(self.mark_code.text()).code
+
+    def _kind(self) -> str:
+        return str(self.kind.currentData() or "")
+
+    def _marked_toggled(self, checked: bool) -> None:
+        for widget in self._mark_rows:
+            self._form.setRowVisible(widget, checked)
+        if checked and self.isVisible() and not self._readonly:
+            self.mark_code.setFocus()
+        self._refresh_mark_hint()
+        self.adjustSize()
+
+    def _refresh_mark_hint(self) -> None:
+        """Что нужно от человека: код обязателен только у брака и излишка."""
+        if not self.marked.isChecked() or self.mark_code.text().strip():
+            return
+        if mark_module.needs_code(self._kind(), True):
+            self.mark_note.setText(
+                "Код обязателен: отсканируйте его с упаковки. Из кода подставятся "
+                "штрих-код и срок годности.")
+        else:
+            self.mark_note.setText(
+                "У недопоставки товара нет на складе — код можно не сканировать.")
+
+    def _mark_problem(self) -> str:
+        """Почему маркировку сохранить нельзя; пусто — всё в порядке."""
+        if not self.marked.isChecked():
+            return ""
+        read = mark_module.read(self.mark_code.text())
+        if not read.code:
+            if mark_module.needs_code(self._kind(), True):
+                return ("Товар маркируемый — отсканируйте код маркировки. Если товар "
+                        "не маркируемый, снимите галочку")
+            return ""
+        if not read.valid:
+            return f"Код маркировки не разобран: {read.problem}"
+        return ""
+
+    def _code_scanned(self) -> None:
+        """Код отсканирован (или введён): штрих-код и срок годности — из него."""
+        text = self.mark_code.text().strip()
+        if not text or self._readonly:
+            return
+        read = mark_module.read(text, self._shelf_years, self._shelf_brands)
+        if not read.valid:
+            self.mark_note.setText(f"Не похоже на код маркировки: {read.problem}")
+            return
+        if read.code == self._scanned:
+            return
+        self._scanned = read.code
+        # Сканер мог набрать код русскими буквами или с хвостом пробелов:
+        # в поле остаётся нормальный вид, как он и будет сохранён.
+        if self.mark_code.text() != read.code:
+            self.mark_code.setText(read.code)
+        if not self.barcode.text().strip() and read.barcode:
+            self.barcode.setText(read.barcode)
+            self._lookup()
+        self.error.hide()
+        self._apply_read(read)
+        if read.needs_lookup:
+            self._lookup_expiry(read)
+
+    def _apply_read(self, read: mark_module.MarkRead) -> None:
+        """Переносит прочитанное в поля. Своё, набранное руками, не затирается."""
+        for field, value in ((self.brand, read.brand), (self.product, read.name)):
+            if value and not field.text().strip():
+                field.setText(value)
+        if read.expires is None:
+            self.mark_note.setText(
+                "Срока годности в коде нет." if not read.needs_lookup
+                else "Срока в самом коде нет — спрашиваю «Честный ЗНАК»…")
+            return
+        shown = self.expiry.text().strip()
+        if not shown or shown == self._auto_expiry:
+            self.expiry.set_value(read.expires)
+            self._auto_expiry = self.expiry.text()
+        source = (f"рассчитан от даты производства (+{read.shelf_years} л.)"
+                  if read.estimated else "взят из кода")
+        self.mark_note.setText(f"Срок годности {read.expires:%d.%m.%Y} {source}.")
+
+    def _lookup_expiry(self, read: mark_module.MarkRead) -> None:
+        """Срока в самом коде нет — спрашиваем «Честный ЗНАК», если есть вход."""
+        from ...core.marking import service  # тяжёлый импорт — только когда нужен
+
+        if not service.signed_in():
+            self.mark_note.setText(
+                "Срока в коде нет. Чтобы он подставлялся сам, войдите по сертификату "
+                "на вкладке «Проверка кодов»; пока укажите срок вручную.")
+            return
+        self._lookup_id += 1
+        lookup_id = self._lookup_id
+        run_task(_ask_gis, read.code,
+                 on_result=lambda info: self._gis_answered(lookup_id, read, info),
+                 on_error=lambda message: self._gis_failed(lookup_id, message))
+
+    def _gis_answered(self, lookup_id: int, read: mark_module.MarkRead, info: Any) -> None:
+        if lookup_id != self._lookup_id or self.mark_code.text() != read.code:
+            return
+        done = mark_module.complete(read, info, self._shelf_years, self._shelf_brands)
+        self._apply_read(done)
+        if done.expires is None:
+            self.mark_note.setText(
+                "«Честный ЗНАК» не назвал срок годности по этому коду — укажите вручную.")
+
+    def _gis_failed(self, lookup_id: int, message: str) -> None:
+        if lookup_id == self._lookup_id:
+            self.mark_note.setText(
+                f"Срок спросить не удалось ({message.strip()}) — укажите его вручную.")
 
     # --- файлы ----------------------------------------------------------------
 
@@ -407,7 +595,8 @@ class ClaimDialog(QDialog):
         нажатие «Завести» превращало бы его в ещё одну пустую позицию.
         """
         return bool(self.product.text().strip() or self.barcode.text().strip()
-                    or self.spec.text().strip() or self.expiry.text().strip())
+                    or self.spec.text().strip() or self.expiry.text().strip()
+                    or self.mark_code.text().strip())
 
     def _position_fields(self) -> dict[str, Any]:
         """То, что относится к одной позиции."""
@@ -419,6 +608,7 @@ class ClaimDialog(QDialog):
             "spec": self.spec.text().strip(),
             "quantity": float(self.quantity.value()),
             "expiry_date": self.expiry.value(),
+            "mark_code": self._code_value(),
         }
 
     @staticmethod
@@ -438,6 +628,9 @@ class ClaimDialog(QDialog):
         if self.expiry.value() is None and self.expiry.text().strip():
             self._fail("Срок годности: дата в виде дд.мм.гггг или пустое поле")
             return False
+        if problem := self._mark_problem():
+            self._fail(problem)
+            return False
         position = self._position_fields()
         self._positions.append(position)
         self.positions.addItem(self._describe_position(position))
@@ -450,8 +643,13 @@ class ClaimDialog(QDialog):
         """Поля очищаются для следующей позиции. Вид и бренд остаются: в одной
         поставке позиции чаще всего одного рода и одного бренда, а другой бренд
         печатается поверх."""
-        for field in (self.barcode, self.product, self.spec, self.expiry):
+        for field in (self.barcode, self.product, self.spec, self.expiry, self.mark_code):
             field.clear()
+        # Следующая позиция может быть немаркируемой: галочку она поставит сама,
+        # когда отсканируют код или штрих-код, по которому он уже был.
+        self.marked.setChecked(False)
+        self._auto_expiry = ""
+        self._scanned = ""
         self.quantity.setValue(1)
         self.barcode.setFocus()
 
@@ -489,8 +687,8 @@ class ClaimDialog(QDialog):
         before = {
             "kind": claim.kind, "barcode": claim.barcode, "brand": claim.brand,
             "product": claim.product, "spec": claim.spec, "quantity": claim.quantity,
-            "expiry_date": claim.expiry_date, "comment": claim.comment,
-            "manager_id": claim.manager_id,
+            "expiry_date": claim.expiry_date, "mark_code": claim.mark_code,
+            "comment": claim.comment, "manager_id": claim.manager_id,
         }
         return {name: value for name, value in self.fields().items()
                 if before[name] != value}
@@ -545,6 +743,9 @@ class ClaimDialog(QDialog):
                 return
             if data["expiry_date"] is None and self.expiry.text().strip():
                 self._fail("Срок годности: дата в виде дд.мм.гггг или пустое поле")
+                return
+            if problem := self._mark_problem():
+                self._fail(problem)
                 return
             brands = [data["brand"]]
         if not self._confirm_new_brands(brands):

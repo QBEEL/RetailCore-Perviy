@@ -32,10 +32,11 @@ from .common import Hint, SectionTitle
 from .inputs import NumberInput, SelectBox
 from .payment_dialogs import DateInput
 
-# Колонки таблицы товаров. Редактируются цена и три количества; остальное
+# Колонки таблицы товаров. Редактируются цена и четыре количества; остальное
 # считается и менять его руками нельзя — иначе акт разошёлся бы сам с собой.
-COL_NAME, COL_BARCODE, COL_PRICE, COL_DOC, COL_SHORT, COL_DEFECT, COL_FACT, COL_SUM = range(8)
-_EDITABLE = (COL_PRICE, COL_DOC, COL_SHORT, COL_DEFECT)
+(COL_NAME, COL_BARCODE, COL_PRICE, COL_DOC, COL_SHORT, COL_DEFECT, COL_SURPLUS,
+ COL_FACT, COL_SUM) = range(9)
+_EDITABLE = (COL_PRICE, COL_DOC, COL_SHORT, COL_DEFECT, COL_SURPLUS)
 
 
 ROW_HEIGHT = 38
@@ -387,21 +388,22 @@ class TorgDialog(QDialog):
 
         root.addWidget(SectionTitle("Товары"))
         root.addWidget(Hint(
-            "Цену и количество по документам возьмите из счёта-фактуры. Недостача и "
-            "брак пришли из заявок — при необходимости поправьте. Брак входит в "
-            "«Поступило»: он на складе, просто негодный."))
-        self.table = QTableWidget(0, 8, self)
+            "Цену и количество по документам возьмите из счёта-фактуры. Недостача, "
+            "брак и излишек пришли из заявок — при необходимости поправьте. Брак "
+            "входит в «Поступило»: он на складе, просто негодный; излишек поступил "
+            "сверх документов и тоже входит."))
+        self.table = QTableWidget(0, 9, self)
         self.table.setHorizontalHeaderLabels(
             ["Товар", "Штрих-код", "Цена, ₽", "По документам", "Недостача", "Брак",
-             "Поступило", "Претензия, ₽"])
+             "Излишек", "Поступило", "Претензия, ₽"])
         header = self.table.horizontalHeader()
         # Название тянется на всё свободное место, остальные колонки — узкие и
         # одной ширины: по содержимому они «прыгали» бы при каждом вводе цифры.
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setMinimumSectionSize(60)
         for col, width in ((COL_BARCODE, 130), (COL_PRICE, 80), (COL_DOC, 115),
-                           (COL_SHORT, 90), (COL_DEFECT, 70), (COL_FACT, 95),
-                           (COL_SUM, 115)):
+                           (COL_SHORT, 90), (COL_DEFECT, 70), (COL_SURPLUS, 80),
+                           (COL_FACT, 95), (COL_SUM, 115)):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             header.resizeSection(col, width)
         self.table.verticalHeader().setVisible(False)
@@ -461,6 +463,7 @@ class TorgDialog(QDialog):
             self._set_cell(row, COL_DOC, _text(item.qty_doc), editable=True)
             self._set_cell(row, COL_SHORT, _text(item.qty_short), editable=True)
             self._set_cell(row, COL_DEFECT, _text(item.qty_defect), editable=True)
+            self._set_cell(row, COL_SURPLUS, _text(item.qty_surplus), editable=True)
             self._set_cell(row, COL_FACT, "", editable=False)
             self._set_cell(row, COL_SUM, "", editable=False)
             self._recalc_row(row)
@@ -508,6 +511,8 @@ class TorgDialog(QDialog):
             item.qty_short = value
         elif col == COL_DEFECT:
             item.qty_defect = value
+        elif col == COL_SURPLUS:
+            item.qty_surplus = value
 
     def _recalc_row(self, row: int) -> None:
         item = self._items[row]
@@ -515,7 +520,7 @@ class TorgDialog(QDialog):
         claim = self.table.item(row, COL_SUM)
         # Пока количество по документам не введено, «поступило» посчитать нечем:
         # вместо «-5» (недостача минус ноль) ячейка остаётся пустой.
-        fact.setText((_text(item.qty_fact) or "0") if item.qty_doc else "")
+        fact.setText((_text(item.qty_fact) or "0") if item.qty_doc or item.qty_surplus else "")
         claim.setText(_money(item.sum_short + item.sum_defect))
 
     def _refresh_totals(self) -> None:
@@ -523,7 +528,9 @@ class TorgDialog(QDialog):
         self.totals.setText(
             f"По документам: {_text(totals['qty_doc']) or 0} шт на {_money(totals['sum_doc'])} ₽ · "
             f"недостача: {_text(totals['qty_short']) or 0} шт на {_money(totals['sum_short'])} ₽ · "
-            f"брак: {_text(totals['qty_defect']) or 0} шт на {_money(totals['sum_defect'])} ₽")
+            f"брак: {_text(totals['qty_defect']) or 0} шт на {_money(totals['sum_defect'])} ₽"
+            + (f" · излишек: {_text(totals['qty_surplus'])} шт на {_money(totals['sum_surplus'])} ₽"
+               if totals["qty_surplus"] else ""))
 
     # --- поставщик ------------------------------------------------------------
 

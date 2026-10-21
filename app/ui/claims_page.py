@@ -232,6 +232,7 @@ class ClaimsPage(QWidget):
             Column("Номенклатура", lambda c: c.product, 280, highlight=True),
             Column("Хар-ка", lambda c: c.spec, 110),
             Column("Штрих-код", lambda c: c.barcode, 130, highlight=True),
+            Column("Маркировка", lambda c: "код есть" if c.mark_code else "", 100),
             Column("Кол-во", lambda c: c.quantity_text(), 80,
                    sort_key=lambda c: c.quantity, align=_RIGHT),
             Column("Срок годности",
@@ -395,7 +396,7 @@ class ClaimsPage(QWidget):
     # --- действия -------------------------------------------------------------
 
     def create(self) -> None:
-        dialog = ClaimDialog(None, self._managers, self._brands, self)
+        dialog = ClaimDialog(None, self._managers, self._brands, self, settings=self.settings)
         if not dialog.exec():
             return
         run_task(_create_many, dialog.claims_fields(), list(dialog.staged),
@@ -430,7 +431,7 @@ class ClaimsPage(QWidget):
             self.table.model_.refresh_item(claim)
             run_task(remote.mark_seen, claim.id, on_result=lambda _r: self.inbox_changed.emit(),
                      on_error=lambda _m: None)
-        dialog = ClaimDialog(claim, self._managers, self._brands, self)
+        dialog = ClaimDialog(claim, self._managers, self._brands, self, settings=self.settings)
         if not dialog.exec() or not claim.can_edit:
             return
         if changes := dialog.changes():

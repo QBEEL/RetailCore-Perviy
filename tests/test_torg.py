@@ -134,7 +134,7 @@ class TestProblems:
         (item(price=0), "цену"),
         (item(qty_short=40, qty_defect=0), "недостача больше"),
         (item(qty_defect=50), "брака больше"),
-        (item(qty_defect=0, qty_short=0), "недостачу или брак"),
+        (item(qty_defect=0, qty_short=0), "недостачу, брак или излишек"),
         (item(qty_defect=-1), "отрицательным"),
     ])
     def test_строки(self, row, text) -> None:

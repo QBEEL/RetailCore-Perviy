@@ -61,6 +61,8 @@ def _claim(row: dict) -> Claim:
         id=int(row["id"]), kind=row["kind"], brand=row["brand"],
         product=row["product"], spec=row["spec"], barcode=row["barcode"],
         quantity=float(row["quantity"]), expiry_date=_date(row.get("expiry_date")),
+        # Сервер до кодов маркировки этого поля не присылает.
+        mark_code=row.get("mark_code") or "",
         comment=row["comment"], status=row["status"],
         applicant_id=int(row["applicant_id"]), applicant=row["applicant"],
         manager_id=row.get("manager_id"), manager=row.get("manager") or "",
@@ -142,7 +144,8 @@ def inbox() -> Inbox:
 def hint(barcode: str = "", brand: str = "") -> ClaimHint:
     data = transport.get(f"{BASE}/hint", {"barcode": barcode, "brand": brand}) or {}
     return ClaimHint(brand=data.get("brand") or "", product=data.get("product") or "",
-                     spec=data.get("spec") or "", manager_id=data.get("manager_id"))
+                     spec=data.get("spec") or "", manager_id=data.get("manager_id"),
+                     marked=bool(data.get("marked")))
 
 
 # --- вложения ------------------------------------------------------------------

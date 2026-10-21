@@ -65,3 +65,57 @@ def test_уведомление_висит_до_принятия_в_работу
         assert "c.applicant_id <> c.manager_id" in query
         assert params[0] == 7
 
+
+
+def test_заявка_принимает_излишек_и_код_маркировки(monkeypatch):
+    security, claims = _server()
+    sent: dict = {}
+
+    def fetch_one(query, params=None):
+        if query.startswith("INSERT INTO claim"):
+            sent["query"], sent["params"] = query, params
+            return {"id": 5}
+        return None
+
+    monkeypatch.setattr(claims.db, "fetch_one", fetch_one)
+    monkeypatch.setattr(claims, "_check_manager", lambda manager_id: None)
+    monkeypatch.setattr(claims, "_load", lambda claim_id: {"id": claim_id, "manager": ""})
+    monkeypatch.setattr(claims, "_log", lambda *a, **k: None)
+    monkeypatch.setattr(claims, "_out", lambda row, user: row)
+    user = security.User(id=7, login="s", full_name="С", is_admin=False,
+                         responsible=frozenset())
+    form = claims.ClaimIn(kind="surplus", brand="Rink", barcode="123",
+                          mark_code="  0106296546351315215ABC  ")
+
+    claims.create_claim(form, user)
+
+    assert "mark_code" in sent["query"]
+    assert sent["params"][0] == "surplus"
+    assert "0106296546351315215ABC" in sent["params"]  # без пробелов по краям
+
+
+def test_неизвестный_вид_заявки_отклоняется():
+    _, claims = _server()
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        claims.ClaimIn(kind="lost", brand="Rink")
+
+
+def test_подсказка_говорит_что_товар_уже_заводили_с_кодом(monkeypatch):
+    security, claims = _server()
+    seen: dict = {}
+
+    def fetch_one(query, params=None):
+        seen["query"] = query
+        return {"brand": "Rink", "product": "Крем", "spec": "", "manager_id": 3,
+                "marked": True}
+
+    monkeypatch.setattr(claims.db, "fetch_one", fetch_one)
+    user = security.User(id=7, login="s", full_name="С", is_admin=False,
+                         responsible=frozenset())
+
+    answer = claims.hint(user, barcode="123", brand="")
+
+    assert answer.marked is True and answer.brand == "Rink"
+    assert "mark_code <> ''" in seen["query"]

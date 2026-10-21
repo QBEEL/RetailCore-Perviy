@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from ..payments.safe_files import safe_name
@@ -105,16 +106,22 @@ class TorgItem:
     # Цена за единицу по документам поставщика.
     price: float = 0.0
     qty_doc: float = 0.0
-    # Недостача — сколько не довезли. Брак — сколько привезли негодным.
+    # Недостача — сколько не довезли. Брак — сколько привезли негодным. Излишек —
+    # сколько привезли сверх документов.
     qty_short: float = 0.0
     qty_defect: float = 0.0
+    qty_surplus: float = 0.0
+    # Код маркировки экземпляра (DataMatrix), если товар маркируемый: уходит на
+    # четвёртую страницу акта.
+    mark_code: str = ""
 
     @property
     def qty_fact(self) -> float:
         """Фактически поступило. Бракованное тоже поступило — оно лежит на складе,
         поэтому из фактического количества не вычитается: так в образце,
-        36 по документам, 36 фактически, 11 из них брак."""
-        return self.qty_doc - self.qty_short
+        36 по документам, 36 фактически, 11 из них брак. Излишек поступил сверх
+        документов и к фактическому количеству прибавляется."""
+        return self.qty_doc - self.qty_short + self.qty_surplus
 
     @property
     def sum_doc(self) -> float:
@@ -132,11 +139,16 @@ class TorgItem:
     def sum_defect(self) -> float:
         return money(self.qty_defect * self.price)
 
+    @property
+    def sum_surplus(self) -> float:
+        return money(self.qty_surplus * self.price)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "claim_id": self.claim_id, "name": self.name, "barcode": self.barcode,
             "unit": self.unit, "price": self.price, "qty_doc": self.qty_doc,
             "qty_short": self.qty_short, "qty_defect": self.qty_defect,
+            "qty_surplus": self.qty_surplus, "mark_code": self.mark_code,
         }
 
     @classmethod
@@ -146,7 +158,9 @@ class TorgItem:
             barcode=str(data.get("barcode") or ""), unit=str(data.get("unit") or "шт"),
             price=float(data.get("price") or 0), qty_doc=float(data.get("qty_doc") or 0),
             qty_short=float(data.get("qty_short") or 0),
-            qty_defect=float(data.get("qty_defect") or 0))
+            qty_defect=float(data.get("qty_defect") or 0),
+            qty_surplus=float(data.get("qty_surplus") or 0),
+            mark_code=str(data.get("mark_code") or ""))
 
 
 @dataclass(slots=True)
@@ -215,6 +229,8 @@ class TorgAct:
             "sum_defect": money(sum(i.sum_defect for i in items)),
             "qty_short": sum(i.qty_short for i in items),
             "sum_short": money(sum(i.sum_short for i in items)),
+            "qty_surplus": sum(i.qty_surplus for i in items),
+            "sum_surplus": money(sum(i.sum_surplus for i in items)),
         }
 
     def problems(self) -> list[str]:
@@ -230,18 +246,20 @@ class TorgAct:
             found.append("В акте нет товаров")
         for number, item in enumerate(self.items, 1):
             where = f"Строка {number}"
-            if item.qty_doc <= 0:
+            # Излишек — товар, которого в документах могло не быть вовсе: тогда
+            # количество по документам ноль, и требовать его нельзя.
+            if item.qty_doc <= 0 and item.qty_surplus <= 0:
                 found.append(f"{where}: укажите количество по документам")
             if item.price <= 0:
                 found.append(f"{where}: укажите цену")
-            if item.qty_short < 0 or item.qty_defect < 0:
+            if item.qty_short < 0 or item.qty_defect < 0 or item.qty_surplus < 0:
                 found.append(f"{where}: количество не может быть отрицательным")
             if item.qty_short > item.qty_doc:
                 found.append(f"{where}: недостача больше количества по документам")
             if item.qty_defect > item.qty_fact:
                 found.append(f"{where}: брака больше, чем поступило")
-            if item.qty_short <= 0 and item.qty_defect <= 0:
-                found.append(f"{where}: укажите недостачу или брак")
+            if item.qty_short <= 0 and item.qty_defect <= 0 and item.qty_surplus <= 0:
+                found.append(f"{where}: укажите недостачу, брак или излишек")
         if overflow(self.description, DESCRIPTION_LINES):
             found.append("Описание не помещается в бланк — сократите его")
         if overflow(self.conclusion, CONCLUSION_LINES):
@@ -256,6 +274,23 @@ class TorgAct:
         """
         shortage = any(i.qty_short > 0 for i in self.items)
         defect = any(i.qty_defect > 0 for i in self.items)
+        surplus = any(i.qty_surplus > 0 for i in self.items)
+        if surplus and (shortage or defect):
+            found = [name for name, present in (
+                ("недостача по количеству", shortage), ("брак товара", defect),
+                ("излишек по количеству", surplus)) if present]
+            return (f"Выявлено при приёмке: {', '.join(found)}.",
+                    "выставить УКД на недопоставленную и бракованную продукцию, "
+                    "уточнить у поставщика излишне поставленную"
+                    if shortage and defect else
+                    ("выставить УКД на недопоставленную продукцию, уточнить у "
+                     "поставщика излишне поставленную" if shortage else
+                     "выставить УКД на бракованную продукцию, уточнить у "
+                     "поставщика излишне поставленную"))
+        if surplus:
+            return ("Фактическое количество больше указанного в сопроводительных "
+                    "документах.",
+                    "уточнить у поставщика излишне поставленную продукцию")
         if defect and shortage:
             return ("Недостача по количеству и брак товара, выявленные при приёмке.",
                     "выставить УКД на недопоставленную и бракованную продукцию")
@@ -269,8 +304,8 @@ class TorgAct:
 def act_from_claims(claims: list[Any], number: int, today: date | None = None) -> TorgAct:
     """Новый акт по выбранным заявкам: каждая заявка — строка товара.
 
-    Из заявки берутся название, штрих-код и то, что случилось: недопоставка идёт
-    в недостачу, брак — в брак. Цену и количество по документам заявка не знает —
+    Из заявки берутся название, штрих-код, код маркировки и то, что случилось:
+    недопоставка идёт в недостачу, брак — в брак, излишек — в излишки. Цену и количество по документам заявка не знает —
     их вносит склад по счёту-фактуре.
     """
     today = today or date.today()
@@ -281,7 +316,9 @@ def act_from_claims(claims: list[Any], number: int, today: date | None = None) -
             claim_id=claim.id, name=name or claim.brand or claim.barcode,
             barcode=claim.barcode,
             qty_short=claim.quantity if claim.kind == "shortage" else 0.0,
-            qty_defect=claim.quantity if claim.kind == "defect" else 0.0))
+            qty_defect=claim.quantity if claim.kind == "defect" else 0.0,
+            qty_surplus=claim.quantity if claim.kind == "surplus" else 0.0,
+            mark_code=getattr(claim, "mark_code", "") or ""))
     return TorgAct(number=number, act_date=today, receipt_date=today, items=items)
 
 
@@ -373,6 +410,7 @@ def build_workbook(act: TorgAct, settings: TorgSettings,
     _fill_first_page(first, act, settings)
     _fill_items(second, act)
     _fill_third_page(third, act, settings)
+    _fill_codes_page(book, act)
     _clear_yellow(book)
     # Свойства файла: автор и «кем изменён» остались бы от образца склада, а
     # акт уходит поставщику.
@@ -451,6 +489,7 @@ _ITEM_CELLS = {
     "sum_doc": "CQ", "barcode_fact": "DR", "qty_fact": "DV", "price_fact": "DY",
     "sum_fact": "EF", "qty_defect": "EM", "sum_defect": "ET",
     "qty_short": "FO", "sum_short": "FW",
+    "qty_surplus": "GE", "sum_surplus": "GM",
 }
 
 
@@ -483,6 +522,9 @@ def _fill_items(ws, act: TorgAct) -> None:
         if item.qty_short:
             values["qty_short"] = _qty(item.qty_short)
             values["sum_short"] = item.sum_short
+        if item.qty_surplus:
+            values["qty_surplus"] = _qty(item.qty_surplus)
+            values["sum_surplus"] = item.sum_surplus
         for key, value in values.items():
             ws[f"{_ITEM_CELLS[key]}{row}"] = value
         # Штрих-код — текстом: иначе Excel покажет 8.01733E+12.
@@ -502,6 +544,9 @@ def _fill_items(ws, act: TorgAct) -> None:
     if totals["qty_short"]:
         ws[f"FO{total_row}"] = _qty(totals["qty_short"])
         ws[f"FW{total_row}"] = totals["sum_short"]
+    if totals["qty_surplus"]:
+        ws[f"GE{total_row}"] = _qty(totals["qty_surplus"])
+        ws[f"GM{total_row}"] = totals["sum_surplus"]
 
 
 def _resize_items(ws, count: int) -> None:
@@ -578,6 +623,51 @@ def _fill_third_page(ws, act: TorgAct, s: TorgSettings) -> None:
         title, name = s.members[index] if index < len(s.members) else ("", "")
         ws[f"AC{row}"] = title
         ws[f"CA{row}"] = name
+
+
+CODES_SHEET = "стр4"
+_CODES_HEADER = ("Номер строки", "Код номенклатуры", "Штрих-код", "Код маркировки",
+                 "Брак", "Недостача", "Излишек")
+_CODES_WIDTHS = (13.7, 18.3, 19.1, 97.3, 9.1, 12.9, 9.1)
+# Управляющие символы в ячейку Excel не пишутся: разделитель групп (GS), который
+# сканер ставит внутри кода, openpyxl отвергает целиком.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sheet_code(code: str) -> str:
+    """Код маркировки в виде для ячейки: без управляющих символов и пробелов по краям."""
+    return _CONTROL.sub("", code or "").strip()
+
+
+def _fill_codes_page(book: openpyxl.Workbook, act: TorgAct) -> None:
+    """Четвёртая страница — коды маркировки позиций акта.
+
+    Склад прикладывает её к акту: по каждому коду видно, какой экземпляр
+    бракованный или лишний. Строка — одна заявка с кодом; в колонке «Номер
+    строки» стоит номер позиции в таблице второй страницы, а количество — 1:
+    код означает один экземпляр. У акта без кодов страницы нет вовсе — пустой
+    лист поставщику ни к чему.
+    """
+    rows = [(number, item) for number, item in enumerate(act.items, 1)
+            if sheet_code(item.mark_code)]
+    if not rows:
+        return
+    ws = book.create_sheet(CODES_SHEET)
+    ws.append(list(_CODES_HEADER))
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for number, item in rows:
+        # Номер и штрих-код — текстом: иначе Excel съест ведущие нули и покажет
+        # 8.01733E+12. Количество стоит в колонке того, что случилось.
+        ws.append([str(number), "", item.barcode, sheet_code(item.mark_code),
+                   1 if item.qty_defect else None, 1 if item.qty_short else None,
+                   1 if item.qty_surplus else None])
+        row = ws.max_row
+        for column in "ABCD":
+            ws[f"{column}{row}"].number_format = "@"
+        ws[f"A{row}"].alignment = Alignment(horizontal="center")
+    for column, width in zip("ABCDEFG", _CODES_WIDTHS):
+        ws.column_dimensions[column].width = width
 
 
 def _clear_yellow(book: openpyxl.Workbook) -> None:
