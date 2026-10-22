@@ -211,6 +211,6 @@ def test_вкладка_есть_в_отчётности(application):
 
     page = ReportsPage(AppSettings(), lambda *_: None)
     titles = [page.tabs.tabText(i) for i in range(page.tabs.count())]
-    assert titles[-1] == "Аналитика по чекам"
+    assert titles[2] == "Аналитика по чекам"
     page.tabs.setCurrentIndex(2)
     assert "Аналитика по чекам" in page.subtitle.text()

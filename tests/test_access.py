@@ -202,7 +202,8 @@ def test_закрытый_отчёт_затемнён_а_не_спрятан(app
 
     assert _reports(window) == {"Отчёт поставщику": True,
                                 "Ведомость по складам": True,
-                                "Аналитика по чекам": False}
+                                "Аналитика по чекам": False,
+                                "Запас и заказ": True}
     lock = page.locks[2]
     assert page.tabs.isTabVisible(2)
     assert not lock.content.isEnabled(), "кнопки под затемнением недоступны"
@@ -212,9 +213,10 @@ def test_закрытый_отчёт_затемнён_а_не_спрятан(app
 
 
 @pytest.mark.parametrize(
-    "closed", [("reports.supplier", "reports.ledger", "reports.receipts")], indirect=True)
+    "closed", [("reports.supplier", "reports.ledger", "reports.receipts",
+                "reports.restock")], indirect=True)
 def test_раздел_с_закрытыми_отчётами_остаётся_в_меню(application, closed):
-    """Закрыть «Отчётность» из меню — это снять весь раздел, а не все три отчёта."""
+    """Закрыть «Отчётность» из меню — это снять весь раздел, а не все четыре отчёта."""
     window = _window(application)
 
     assert not window._nav_group.button(index_of("reports")).isHidden()
@@ -250,7 +252,8 @@ def test_карточка_учётки_закрывает_отдельный_о�
     dialog = AccountDialog(Account(login="k.valeva", full_name="Валева Карина"),
                            known_responsible=[])
     boxes = dict(dialog.pages)
-    assert {"reports.supplier", "reports.ledger", "reports.receipts"} <= set(boxes)
+    assert {"reports.supplier", "reports.ledger", "reports.receipts",
+            "reports.restock"} <= set(boxes)
 
     boxes["reports.receipts"].setChecked(False)
     assert dialog.result_account().denied_pages == ["reports.receipts"]

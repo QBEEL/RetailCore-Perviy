@@ -44,6 +44,7 @@ from .widgets.ledger_tab import LedgerTab
 from .widgets.locked import Lockable
 from .widgets.mail_dialogs import send_files
 from .widgets.receipts_tab import ReceiptsTab
+from .widgets.restock_tab import RestockTab
 from .widgets.report_dialogs import ProfileDialog, StoreRulesDialog
 from .widgets.toast import ToastKind
 
@@ -100,9 +101,10 @@ class ReportsPage(QWidget):
             Lockable(self._supplier_tab(), self),
             Lockable(LedgerTab(self.settings, self.notify, self), self),
             Lockable(ReceiptsTab(self.settings, self.notify, self), self),
+            Lockable(RestockTab(self.settings, self.notify, self), self),
         ]
         for lock, title in zip(self.locks, ("Отчёт поставщику", "Ведомость по складам",
-                                            "Аналитика по чекам")):
+                                            "Аналитика по чекам", "Запас и заказ")):
             self.tabs.addTab(lock, title)
         # Вкладки и права на них описаны в одном порядке: по номеру вкладки
         # находится её код. Разойдись они — закрытая вкладка осталась бы на
@@ -149,6 +151,8 @@ class ReportsPage(QWidget):
             "хватило, что расходится, как дела по каждому магазину.",
             "Аналитика по чекам из 1С за период выгрузки: выручка, прибыль, "
             "средний чек и срезы по магазинам, брендам, товарам и продавцам.",
+            "Отчёт 1С по брендам и период выгрузки: на сколько хватит каждого "
+            "товара и сколько заказать, с количеством, которое можно поправить.",
         )
         self.subtitle.setText(texts[index] if 0 <= index < len(texts) else texts[0])
 

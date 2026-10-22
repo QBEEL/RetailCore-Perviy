@@ -91,6 +91,7 @@ PARTS = (
     Part("reports.supplier", "Отчёт поставщику", "reports"),
     Part("reports.ledger", "Ведомость по складам", "reports"),
     Part("reports.receipts", "Аналитика по чекам", "reports"),
+    Part("reports.restock", "Запас и заказ", "reports"),
 )
 
 

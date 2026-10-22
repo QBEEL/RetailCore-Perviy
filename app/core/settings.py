@@ -142,6 +142,12 @@ class AppSettings:
     # Крестик окна прячет программу в трей, а не закрывает: она продолжает
     # следить за заявками Торг-2. Выйти можно из меню значка или по Ctrl+Q.
     tray_on_close: bool = True
+    # Сроки в «Запасе и заказе», в месяцах: на сколько заказывать и когда запаса
+    # мало или много. Период выгрузки сюда не входит намеренно: прошлый период
+    # на новом файле молча дал бы чужие продажи в месяц.
+    restock_target: float = 2.0
+    restock_low: float = 1.0
+    restock_high: float = 6.0
     # Пароль здесь не хранится намеренно: он спрашивается при каждом запуске.
     _path: str = field(default_factory=settings_path, repr=False)
 
@@ -363,6 +369,13 @@ class AppSettings:
         self.vpn_server = str(data.get("vpn_server", ""))
         self.ai_consent = bool(data.get("ai_consent", False))
         self.tray_on_close = bool(data.get("tray_on_close", self.tray_on_close))
+        for name in ("restock_target", "restock_low", "restock_high"):
+            try:
+                value = float(data.get(name, getattr(self, name)))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                setattr(self, name, value)
         self.mail_address = str(data.get("mail_address", "")).strip()
         self.mail_sender_name = str(data.get("mail_sender_name", "")).strip()
         self.mail_recent_to = [p for p in data.get("mail_recent_to", []) if isinstance(p, str)]
@@ -453,6 +466,9 @@ class AppSettings:
             "vpn_server": self.vpn_server,
             "ai_consent": self.ai_consent,
             "tray_on_close": self.tray_on_close,
+            "restock_target": self.restock_target,
+            "restock_low": self.restock_low,
+            "restock_high": self.restock_high,
             "mail_address": self.mail_address,
             "mail_sender_name": self.mail_sender_name,
             "mail_recent_to": self.mail_recent_to,
