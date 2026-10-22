@@ -112,6 +112,8 @@ from .widgets.withdrawal_tab import WithdrawalTab
 # Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
 # занимает то, что осталось от окна, и на тысяче кодов это пять строк.
 RESULT_EXPANDED_HEIGHT = 640
+# Колонки таблицы «Что знает система», ширину которых задаёт содержимое.
+_RESULT_FIT_COLUMNS = (1, 2, 3, 4)
 
 _RESULT_INTRO = ("Проверка спрашивает «Честный ЗНАК» о каждом коде: чей он, в "
                  "обороте ли, не выведен ли уже и есть ли у него разрешительный "
@@ -786,7 +788,7 @@ class MarkingPage(QWidget):
         # Замечание бывает длинным, поэтому ему отведена своя ширина — иначе
         # одна многословная строка сжимает название товара до многоточия.
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3, 4):
+        for column in _RESULT_FIT_COLUMNS:
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         head.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         self.result.setColumnWidth(5, 240)
@@ -2439,7 +2441,15 @@ class MarkingPage(QWidget):
         self._shown = shown
         self.result_export.setEnabled(bool(shown))
         # Тысячи строк с перерисовкой на каждую ячейку заметно подвешивают окно.
+        # Хуже перерисовки — автоподбор ширины: в режиме ResizeToContents Qt
+        # заново замеряет всю колонку на каждую ячейку, и окно зависает на
+        # минуты. Поэтому на время заполнения колонки закрепляются, а по
+        # содержимому подбираются один раз в конце.
+        head = self.result.horizontalHeader()
         self.result.setUpdatesEnabled(False)
+        for column in _RESULT_FIT_COLUMNS:
+            head.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        self.result.clearContents()
         self.result.setRowCount(len(shown))
         for row, item in enumerate(shown):
             owner = item.owner_name or item.owner_inn or "—"
@@ -2464,6 +2474,9 @@ class MarkingPage(QWidget):
                     if colour := _permit_color(item):
                         cell.setForeground(QColor(colour))
                 self.result.setItem(row, column, cell)
+        for column in _RESULT_FIT_COLUMNS:
+            self.result.resizeColumnToContents(column)
+            head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.result.setUpdatesEnabled(True)
         if not self._result:
             self.result_hint.setText(_RESULT_INTRO)

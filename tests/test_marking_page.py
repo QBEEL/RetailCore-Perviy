@@ -725,6 +725,22 @@ def test_отбор_без_РД_оставляет_только_их_даже_с
     assert page.result_export.isEnabled()
 
 
+def test_отбор_замечаний_возвращает_автоширину_колонок(application, tmp_path, stub):
+    """Пока таблица заполняется, ширина закреплена (иначе окно виснет на сотнях
+    кодов), а после — снова по содержимому."""
+    from PySide6.QtWidgets import QHeaderView
+
+    page = _page(application, tmp_path)
+    page._show_result([_info("code-a"), _info("code-b")])
+
+    page.problems_box.setChecked(True)
+    page.problems_box.setChecked(False)
+
+    head = page.result.horizontalHeader()
+    for column in (1, 2, 3, 4):
+        assert head.sectionResizeMode(column) is QHeaderView.ResizeMode.ResizeToContents
+
+
 def test_выгрузка_берёт_видимые_коды(application, tmp_path, stub, monkeypatch):
     from openpyxl import load_workbook
 
