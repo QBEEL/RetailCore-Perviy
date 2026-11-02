@@ -245,3 +245,24 @@ def test_русский_текст_не_код_не_перекладываетс
     assert codes.from_keyboard("совсем не код") == "совсем не код"
     # Признак символики в русской раскладке — тоже узнаётся.
     assert codes.from_keyboard("ъв2" + _russian(PERFUME)) == "]d2" + PERFUME
+
+
+@pytest.mark.parametrize("serial", ["5qm92Qf:ho5(Q", "5LP'i=92GJsx2", "5emA>.91pMoKA"])
+def test_серийный_номер_с_91_и_92_внутри_не_режется(serial):
+    """В УПД код приходит без хвоста и разделителей. «92» внутри серийного
+    номера — не начало подписи: раньше номер обрезался и код «не находился»."""
+    ki = f"010460372045916321{serial}"
+
+    assert parse(ki).serial == serial
+    assert parse(ki).ki == ki
+
+
+def test_серийный_номер_с_92_внутри_не_режется_и_с_хвостом():
+    serial = "5qm92Qf:ho5(Q"
+    ki = f"010460372045916321{serial}"
+    tail = f"91EE11{'A' * 44}"
+    signed = f"{ki}91EE1192{'A' * 44}"
+
+    assert parse(f"{ki}{GS}{tail[:6]}{GS}92{'A' * 44}").serial == serial
+    assert parse(signed).serial == serial
+    assert parse(signed).fields["91"] == "EE11"

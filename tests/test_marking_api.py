@@ -660,6 +660,28 @@ def test_status_groups_follow_the_true_api_reference(group, expected):
     assert PermitDoc(status_group=group).state is expected
 
 
+@pytest.mark.parametrize("group, words", [
+    (2, "приостановлен"),
+    (7, "не найден в реестре"),
+    (11, "истёк"),
+])
+def test_yellow_group_names_its_reason(group, words):
+    """«Истёк» про документ, который действует, но вписан в код с чужой датой,
+    отправляет поставщика не туда: группа 7 — это несовпадение с реестром."""
+    item = service._parse_check(_answer(certDoc=[_doc(group)]), ["к-1"])[0]
+
+    assert words in item.remarks[-1]
+    assert words in item.permits[0].title
+
+
+def test_unknown_yellow_group_is_shown_with_its_number():
+    item = service._parse_check(_answer(certDoc=[_doc(99)]), ["к-1"])[0]
+
+    assert item.permit_state is PermitState.LAPSED
+    assert "группа 99" in item.permits[0].title
+    assert item.remarks[-1] == PermitState.LAPSED.remark
+
+
 def test_status_group_may_come_as_a_colour_or_a_string():
     assert PermitDoc(color="green").state is PermitState.VALID
     assert PermitDoc(color="Red").state is PermitState.INVALID

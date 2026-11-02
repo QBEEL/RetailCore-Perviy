@@ -294,6 +294,14 @@ _COLOR_STATES: dict[str, PermitState] = {
     "red": PermitState.INVALID,
 }
 
+# Почему документ в жёлтой группе. «Истёк / приостановлен» одной строкой путает:
+# у группы 7 документ может действовать, а в коде вписаны не те номер или дата.
+_LAPSED_REASONS: dict[int, str] = {
+    2: "приостановлен",
+    7: "не найден в реестре: номер или дата в коде не совпали с реестром",
+    11: "истёк срок действия",
+}
+
 PERMIT_KIND_TITLES: dict[str, str] = {
     "CONFORMITY_DECLARATION": "Декларация о соответствии",
     "CONFORMITY_CERTIFICATE": "Сертификат соответствия",
@@ -331,10 +339,20 @@ class PermitDoc:
         return _COLOR_STATES.get(self.color.strip().lower(), PermitState.UNCONFIRMED)
 
     @property
+    def reason(self) -> str:
+        """Почему документ не зелёный, если это известно по номеру группы."""
+        return _LAPSED_REASONS.get(self.status_group or 0, "")
+
+    @property
     def title(self) -> str:
         kind = PERMIT_KIND_TITLES.get(self.kind, self.kind or "Документ")
         date = f" от {self.date[:10]}" if self.date else ""
-        return f"{kind} {self.number}{date} · {self.state.title.lower()}"
+        state = self.state
+        if state is PermitState.LAPSED:
+            detail = self.reason or f"{state.title.lower()} (группа {self.status_group})"
+        else:
+            detail = state.title.lower()
+        return f"{kind} {self.number}{date} · {detail}"
 
 
 @dataclass(slots=True)
@@ -385,7 +403,17 @@ class CodeInfo:
         же замечание.
         """
         notes = list(self.problems)
-        if remark := self.permit_state.remark:
+        state = self.permit_state
+        if state is PermitState.LAPSED:
+            # Причина из самого документа: «не найден в реестре» требует от
+            # поставщика совсем другого, чем «истёк».
+            reasons = list(dict.fromkeys(
+                doc.reason for doc in self.permits or []
+                if doc.state is PermitState.LAPSED and doc.reason))
+            if reasons:
+                notes.append("разрешительный документ " + "; ".join(reasons))
+                return notes
+        if remark := state.remark:
             notes.append(remark)
         return notes
 

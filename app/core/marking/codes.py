@@ -67,6 +67,7 @@ LONG_CODES = ("8005", "8006", "3103", "3202")
 TAIL_FIELDS: dict[str, int] = {"91": 4, "92": 0, "93": 4, "8005": 6}
 
 
+
 class CodeProblem(Exception):
     """Код не разбирается. Текст пригоден для показа пользователю."""
 
@@ -276,43 +277,60 @@ def _content(value: str, position: int, identifier: str) -> tuple[str, int]:
     # Разделителя нет — ищем начало криптохвоста. Значение проверки (92) при
     # этом не трогаем: оно и есть последнее поле, а искать хвост внутри хвоста
     # значит разрезать подпись пополам на первом же похожем сочетании знаков.
-    if identifier != "92" and (tail := _tail_start(value, position)) > position:
+    # Уже внутри хвоста (после ключа 91) значение проверки идёт без ключа
+    # перед собой; в серийном номере с него хвост начаться не может.
+    in_tail = identifier in TAIL_FIELDS
+    if identifier != "92" and (
+            tail := _tail_start(value, position, in_tail)) > position:
         return value[position:tail], tail
     return value[position:], len(value)
 
 
-def _tail_start(value: str, position: int) -> int:
+def _tail_start(value: str, position: int, in_tail: bool = False) -> int:
     """С какого места начинается криптохвост. -1, если его не видно."""
     for index in range(position, len(value)):
-        if _is_tail(value, index):
+        if _is_tail(value, index, in_tail):
             return index
     return -1
 
 
-def _is_tail(value: str, index: int) -> bool:
+def _is_tail(value: str, index: int, in_tail: bool = False) -> bool:
     """Разбирается ли остаток строки как криптохвост целиком.
 
-    Проверяется весь остаток, а не одно совпадение: сочетание «91» встречается
-    и внутри серийного номера, но за ним там не окажется полей нужной длины,
-    доходящих ровно до конца строки.
+    Проверяется весь остаток, а не одно совпадение: сочетания «91» и «92»
+    встречаются и внутри серийного номера (в тринадцати знаках из почти
+    сотни символов это случается у каждого сотого кода), и принять такое за
+    начало хвоста значит обрезать серийный номер и получить «код не найден».
+    Поэтому хвост должен выглядеть как настоящий:
+      * начинается с ключа, а не со значения проверки — подпись без ключа
+        не бывает (`in_tail`: когда ключ уже разобран, подпись и есть то, что
+        следует за ним);
+      * поля не повторяются;
+      * кончается значением проверки (92) или проверочным кодом 93: один
+        ключ без подписи не бывает, а «91» и четыре знака в самом конце
+        серийного номера — бывают.
+    Код без хвоста вовсе — тот, что в УПД, — хвоста не имеет, и ничто внутри
+    его серийного номера им не считается.
     """
     position = index
-    found = 0
+    seen: set[str] = set()
     while position < len(value):
         identifier = ("8005" if value.startswith("8005", position)
                       else value[position:position + 2])
-        if identifier not in TAIL_FIELDS:
+        if identifier not in TAIL_FIELDS or identifier in seen:
             return False
+        if not seen and identifier == "92" and not in_tail:
+            return False
+        seen.add(identifier)
         position += len(identifier)
         length = TAIL_FIELDS[identifier]
         if not length:
-            # Значение проверки идёт до конца строки и пустым не бывает.
+            # Значение проверки идёт до конца строки.
             return position < len(value)
         if len(value) - position < length:
             return False
         position += length
-        found += 1
-    return found > 0
+    return "93" in seen
 
 
 # --- пачка кодов ----------------------------------------------------------------
