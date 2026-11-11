@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from . import codes as codes_module
-from . import crypto, issue, orders as orders_module, session, store, suz, transport
+from . import crypto, introduce, issue, orders as orders_module, session, store, suz, transport
 from .models import (
     BATCH_SIZE,
     CodeInfo,
@@ -578,11 +578,14 @@ def record_check(
     return store.update(operation, db_path)
 
 
-# Опрос статуса документов пока не подключён: метод и состав ответа
-# различаются по товарным группам, а подставить сюда догадку — значит однажды
-# объявить выполненной операцию, которую ГИС МТ отвергла. Признак вынесен
-# наружу, чтобы интерфейс говорил об этом прямо, а не изображал работу.
-STATUS_POLLING_READY = False
+STATUS_POLLING_READY = True
+
+
+def can_refresh(operation: Operation) -> bool:
+    """Документы ГИС МТ с сохранённым номером; УПД опрашивает вкладка продажи."""
+    return (operation.status.pending
+            and operation.kind in (OperationKind.WITHDRAWAL, OperationKind.REMARK)
+            and bool(operation.document_id.strip() and operation.product_group.strip()))
 
 
 def pending(db_path: str | None = None) -> list[Operation]:
@@ -594,21 +597,39 @@ def refresh_pending(db_path: str | None = None,
                     progress: Progress | None = None) -> list[Operation]:
     """Опрашивает операции, ждущие ответа ГИС МТ.
 
-    Вызывается при открытии вкладки и закрывает разрыв между «отправили» и
-    «узнали результат»: приложение могли закрыть сразу после отправки, и без
-    опроса операция висела бы в неизвестности вечно.
-
-    Отправки здесь нет и быть не может — только чтение состояния. Пока опрос
-    не подключён, функция честно ничего не делает: оставить операцию ждущей
-    безопаснее, чем угадать её судьбу.
+    Только текущий контур и документы с известным номером. Обрыв связи не
+    превращает отправленный документ в неотправленный. Незнакомые статусы
+    сохраняются как текст, операция остаётся ожидающей.
     """
-    waiting = store.pending(db_path)
-    if progress:
-        progress(len(waiting), len(waiting))
     if not STATUS_POLLING_READY:
         return []
-    raise NotImplementedError(
-        "Опрос статуса включён, но не реализован — см. STATUS_POLLING_READY")
+    if not signed_in():
+        return []
+    contour = current().contour
+    waiting = [item for item in store.pending(db_path)
+               if can_refresh(item) and item.contour is contour]
+    updated: list[Operation] = []
+    for index, operation in enumerate(waiting, start=1):
+        state = operation.status
+        try:
+            answer = introduce.status(operation.document_id, operation.product_group, contour)
+            if answer.done:
+                state, error = OperationStatus.DONE, ""
+            elif answer.failed:
+                state, error = OperationStatus.REJECTED, answer.text
+            else:
+                error = answer.text
+        except transport.AuthRequired:
+            raise
+        except transport.MarkingError as failure:
+            error = f"Статус не получен: {failure}"
+        fresh = store.update_document_status(
+            operation.id, operation.document_id, state, error, datetime.now(), db_path)
+        if fresh is not None:
+            updated.append(fresh)
+        if progress:
+            progress(index, len(waiting))
+    return updated
 
 
 def forget_checks(db_path: str | None = None) -> int:

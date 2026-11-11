@@ -586,7 +586,7 @@ def test_не_найден_список_документов_пробуется_
     result = introduce.status("doc-1", "lp")
 
     assert result.done
-    assert "/api/v3/true-api/doc/doc-1/info" in calls[1].full_url
+    assert "/api/v4/true-api/doc/doc-1/info" in calls[1].full_url
 
 
 def test_иная_ошибка_запасной_способ_не_запускает(online):
@@ -602,6 +602,7 @@ def test_иная_ошибка_запасной_способ_не_запуска
 def test_если_не_найдено_везде_ошибка_последнего_способа(online):
     _, answers, _ = online
     answers.extend([transport.MarkingError("Метод с указанным URL не найден", 404),
+                    transport.MarkingError("Метод с указанным URL не найден", 404),
                     transport.MarkingError("Документ не найден", 404)])
 
     with pytest.raises(transport.MarkingError, match="Документ не найден"):
@@ -617,7 +618,7 @@ def test_parse_error_это_отказ_а_не_ожидание():
     assert "формата" in status.title
 
 
-@pytest.mark.parametrize("code", ["PARSING_ERROR", "PROCESSING_ERROR", "SOME_NEW_ERROR",
+@pytest.mark.parametrize("code", ["PARSING_ERROR", "PROCESSING_ERROR",
                                   "CHECKED_NOT_OK", "REJECTED"])
 def test_ошибочные_статусы_считаются_отказом(code):
     assert introduce.DocStatus(code).failed
@@ -635,6 +636,75 @@ def test_незнакомый_статус_не_отказ_и_не_успех():
     status = introduce.DocStatus("НЕЧТО_НОВОЕ")
 
     assert not (status.failed or status.done or status.pending)
+
+
+@pytest.mark.parametrize("code", ["SOME_NEW_ERROR", "ACCEPTED", "UNDEFINED"])
+def test_неподходящий_или_новый_статус_не_закрывает_ввод_в_оборот(code):
+    assert not introduce.DocStatus(code).done
+    assert not introduce.DocStatus(code).failed
+
+
+@pytest.mark.parametrize("answer", [
+    {"results": [{"number": "other", "status": "CHECKED_OK"}]},
+    {"results": [{"status": "CHECKED_OK"}]},
+    {"results": []},
+    {"results": "unexpected", "status": "CHECKED_OK"},
+    {"number": "other", "status": "CHECKED_OK"},
+    {"status": "CHECKED_OK"},
+])
+def test_успех_чужого_документа_или_неполного_ответа_не_присваивается_нашему(answer):
+    result = introduce._parse_status(answer, "doc-1")
+    assert not result.done and not result.code
+
+
+def test_номер_проверяется_и_когда_он_не_в_первой_строке():
+    answer = {"results": [{"number": "other", "status": "CHECKED_OK"},
+                          {"number": "doc-1", "status": "CHECKED_NOT_OK"}]}
+    assert introduce._parse_status(answer, "doc-1").failed
+
+
+def test_нет_нужного_номера_в_списке_проверяется_карточка(online):
+    calls, answers, _ = online
+    answers.extend([_list("CHECKED_OK", number="other"),
+                    {"status": "IN_PROGRESS"}])
+    result = introduce.status("doc-1", "cosmetics")
+    assert not result.done and result.pending
+    assert "/api/v4/true-api/doc/doc-1/info" in calls[1].full_url
+
+
+def test_если_v4_карточка_недоступна_проверяется_прежний_v3(online):
+    calls, answers, _ = online
+    answers.extend([transport.MarkingError("not found", 404),
+                    transport.MarkingError("not found", 404),
+                    {"number": "doc-1", "status": "CHECKED_OK"}])
+    assert introduce.status("doc-1", "cosmetics").done
+    assert "/api/v3/true-api/doc/doc-1/info" in calls[2].full_url
+
+
+def test_пустые_ответы_не_подменяются_успехом(online):
+    _, answers, _ = online
+    answers.extend([{"results": []}, {}, {}])
+    result = introduce.status("doc-1", "cosmetics")
+    assert not result.code and not result.done and not result.failed
+    assert "не найден" in result.text
+
+
+def test_ошибки_карточки_v4_читаются_из_массива_и_common_errors(online):
+    _, answers, _ = online
+    answers.extend([_list("PARSE_ERROR"), [{
+        "number": "doc-1", "status": "PARSE_ERROR", "errors": [],
+        "commonErrors": [{"errorCode": "INTRO_ERROR", "errorMessage": "Неверный формат"}],
+    }]])
+    result = introduce.status("doc-1", "cosmetics")
+    assert result.failed and "Неверный формат" in result.text
+
+
+def test_пояснение_отказа_из_download_desc_не_теряется(online):
+    calls, answers, _ = online
+    answers.append({"results": [{"number": "doc-1", "status": "CHECKED_NOT_OK",
+                                 "downloadDesc": "Код не принадлежит участнику"}]})
+    assert "Код не принадлежит участнику" in introduce.status("doc-1", "cosmetics").text
+    assert len(calls) == 1
 
 
 def test_отправка_не_ждёт_после_parse_error(online):

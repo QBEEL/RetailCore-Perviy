@@ -16,9 +16,9 @@
 (`/auth/simpleSignIn`). Строка для подписи у каждой системы своя, поэтому
 выяснение состава и вход — два разных обращения к ключу.
 
-Срок годности токена сервер не сообщает, поэтому он не зашит и здесь: токен
-обновляется по собственному запасу и по ответу 401 — один прозрачный повтор
-входа. При таком устройстве точное значение перестаёт что-либо значить.
+True API запрашивается с unitedToken=true: ответ содержит uuidToken и expireDate.
+JWT поддерживается ЦРПТ только до конца 2026 года. Срок UUID берётся из ответа;
+обновление выполняется заранее и по ответу 401 — один прозрачный повтор входа.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from uuid import UUID
 
 from . import crypto, transport
 from .models import Contour
@@ -33,6 +34,7 @@ from .models import Contour
 # Сколько считать токен годным, если сервер не сказал иного. Лишний вход стоит
 # одного обращения к ключу, а протухший посреди приёмки — прерванной работы.
 DEFAULT_LIFETIME = timedelta(minutes=30)
+MAX_LIFETIME = timedelta(hours=10)
 
 # За сколько до конца срока обновлять, не дожидаясь отказа.
 RENEW_MARGIN = timedelta(minutes=2)
@@ -157,14 +159,19 @@ def sign_in(thumbprint: str, inn: str = "",
     uuid_value, data = parse_challenge(challenge)
     signature = crypto.sign(data, thumbprint)
 
-    body: dict[str, Any] = {"uuid": uuid_value, "data": signature}
+    # True API, раздел 1.5.2: без этого признака выдаётся JWT, поддержка
+    # которого заканчивается 31.12.2026. Подпись остаётся присоединённой.
+    body: dict[str, Any] = {"uuid": uuid_value, "data": signature, "unitedToken": True}
     if inn.strip():
         body["inn"] = inn.strip()
     granted = transport.post("trueapi", "/auth/simpleSignIn", contour=contour,
                              body=body)
 
+    # Не смешиваем старую сессию с новым контуром, если ответ неполный.
+    granted_token = _token(granted)
+    expires_at = _expiry(granted)
     session.contour = contour
-    session.token = _token(granted)
+    session.token = granted_token
     session.thumbprint = certificate.thumbprint
     session.owner = certificate.owner
     session.inn = inn.strip() or certificate.inn
@@ -172,7 +179,7 @@ def sign_in(thumbprint: str, inn: str = "",
     # обновлении токена оно не передаётся — и тогда сохраняется прежнее, а не
     # затирается пустотой.
     session.organisation = organisation.strip() or session.organisation
-    session.expires_at = _expiry(granted)
+    session.expires_at = expires_at
     return session
 
 
@@ -199,9 +206,22 @@ def _token(answer: Any) -> str:
     if not isinstance(answer, dict):
         raise transport.MarkingError(
             "Система маркировки вернула неожиданный ответ на запрос токена.")
-    token = str(answer.get("token") or "")
-    if token:
-        return token
+    # При unitedToken=true сервер может вернуть оба поля. Старый token
+    # содержит JWT, поэтому uuidToken выбирается первым.
+    raw_token = answer.get("uuidToken") or answer.get("token")
+    if raw_token:
+        if isinstance(raw_token, str):
+            value = raw_token.strip()
+            try:
+                valid = str(UUID(value)) == value.lower()
+            except ValueError:
+                valid = False
+            if valid:
+                return value
+        # Не включаем ответ в ошибку: в нём находятся действующие токены.
+        raise transport.MarkingError(
+            "True API не вернул корректный токен UUID. Вход не завершён. "
+            "Требуется новый формат токена системы маркировки.")
     if answer.get("organisations"):
         # Подпись принята, но не сказано, за кого входим. Список организаций
         # уже здесь — интерфейсу остаётся дать выбрать.
@@ -219,23 +239,35 @@ def _token(answer: Any) -> str:
 def _expiry(answer: Any) -> datetime:
     """Срок годности токена — из ответа, если он там есть.
 
-    Имя поля у разных методов разное, а чаще его нет вовсе; тогда берётся свой
-    запас. `expireDate` приходит меткой времени в миллисекундах.
+    UUID: expireDate — ISO 8601 с часовым поясом. Прежние числовые поля
+    поддерживаются для совместимости. Все даты сессии локальные без tzinfo,
+    как datetime.now(), с которым их сравнивает Session.expiring.
     """
     now = datetime.now()
     if isinstance(answer, dict):
+        stamp = answer.get("expireDate")
+        if stamp not in (None, ""):
+            try:
+                if isinstance(stamp, str):
+                    moment = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+                    if moment.tzinfo is None:
+                        raise ValueError("не указан часовой пояс")
+                    moment = moment.astimezone().replace(tzinfo=None)
+                elif isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                    moment = datetime.fromtimestamp(float(stamp) / 1000)
+                else:
+                    raise ValueError("неизвестный формат")
+            except (OverflowError, OSError, TypeError, ValueError):
+                raise transport.MarkingError(
+                    "True API вернул некорректный срок действия токена UUID. "
+                    "Вход не завершён.") from None
+            if moment <= now:
+                raise transport.AuthRequired("Срок действия полученного токена UUID уже истёк.", 401)
+            return min(moment, now + MAX_LIFETIME)
         for name in ("expires_in", "expiresIn", "ttl", "lifetime"):
             value = answer.get(name)
-            if isinstance(value, (int, float)) and value > 0:
-                return now + timedelta(seconds=float(value))
-        stamp = answer.get("expireDate")
-        if isinstance(stamp, (int, float)) and stamp > 0:
-            try:
-                moment = datetime.fromtimestamp(float(stamp) / 1000)
-            except (OverflowError, OSError, ValueError):
-                return now + DEFAULT_LIFETIME
-            if moment > now:
-                return moment
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                return now + timedelta(seconds=min(float(value), MAX_LIFETIME.total_seconds()))
     return now + DEFAULT_LIFETIME
 
 

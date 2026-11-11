@@ -1,0 +1,4 @@
+# Серверные библиотеки обязательны: без них часть тестов пропускается.
+-r requirements.txt
+-r server/api/requirements.txt
+pytest>=8,<10

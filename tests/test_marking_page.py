@@ -1114,7 +1114,7 @@ def test_повтор_инн_не_задваивает_список(application)
 # --- журнал --------------------------------------------------------------------------
 
 def test_ждущая_операция_названа_ждущей(application, tmp_path, stub):
-    """Опрос состояния выключен — молчать об этом нельзя."""
+    """Отправленному без номера документу нужна проверка в кабинете."""
     _, state = stub
     state["history"] = [Operation(id=1, kind=OperationKind.WITHDRAWAL,
                                   codes=[PERFUME], status=OperationStatus.SENT)]
@@ -1122,10 +1122,75 @@ def test_ждущая_операция_названа_ждущей(application, 
 
     assert page.journal.rowCount() == 1
     assert page.journal.item(0, 1).text() == "Вывод из оборота"
-    assert "Опрос состояния пока не подключён" in page.journal_hint.text()
+    assert "Ждут ответа ГИС МТ: 1" in page.journal_hint.text()
+    assert "не хватает номера документа" in page.journal_hint.text()
 
 
 # --- СУЗ -----------------------------------------------------------------------------
+
+
+def test_кнопка_опроса_журнала_обновляет_состояние_и_не_дублирует_запрос(
+        application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+
+    _, state = stub
+    page = _page(application, tmp_path)
+    assert not page.journal_status_button.isEnabled()
+    notices = []
+    page.notify = lambda *args: notices.append(args)
+    state["signed"] = True
+    page._sync_state()
+    calls = []
+
+    def refresh():
+        calls.append(True)
+        state["history"] = [Operation(id=1, kind=OperationKind.WITHDRAWAL,
+                                      codes=[PERFUME], status=OperationStatus.DONE)]
+        return state["history"]
+
+    monkeypatch.setattr(marking_page.service, "refresh_pending", refresh)
+    page.journal_status_button.click()
+    page.refresh_journal_statuses()
+    _settle(application)
+
+    assert calls == [True]
+    assert page.journal.item(0, 4).text() == OperationStatus.DONE.title
+    assert page.journal_status_button.isEnabled()
+    assert any("Статусы проверены: 1" in text for text, _ in notices)
+
+
+def test_журнал_опрашивается_при_повторном_открытии_со_входом(
+        application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+
+    _, state = stub
+    state["signed"] = True
+    calls = []
+    monkeypatch.setattr(marking_page.service, "refresh_pending",
+                        lambda: calls.append(True) or [])
+    page = _page(application, tmp_path)
+    assert calls == [True]
+    assert not page._polling_journal
+
+
+def test_сбой_опроса_освобождает_кнопку_и_показывает_ошибку(
+        application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+
+    _, state = stub
+    page = _page(application, tmp_path)
+    state["signed"] = True
+    notices = []
+    page.notify = lambda *args: notices.append(args)
+
+    def refresh():
+        raise MarkingError("не удалось войти")
+
+    monkeypatch.setattr(marking_page.service, "refresh_pending", refresh)
+    page.refresh_journal_statuses()
+    _settle(application)
+    assert page.journal_status_button.isEnabled()
+    assert any("не удалось войти" in text for text, _ in notices)
 
 SUZ = Credentials(oms_id="oms-песочница", connection_id="соединение",
                   token="токен-устройства-длинный")
@@ -1813,7 +1878,7 @@ def test_отправленный_документ_запоминается_и_�
     saved = issue.load("blk-9")
     assert saved.doc_id == "doc-1" and saved.introduced_count == 5
     assert saved.doc_status == "CHECKED_OK"
-    assert "Проверен" in page.batches.item(0, 4).text()
+    assert "Обработан" in page.batches.item(0, 4).text()
     assert "5 из 5" in page.batches.item(0, 4).text()
 
 
@@ -1953,6 +2018,26 @@ def test_у_блока_без_документа_статус_не_спраши�
     _settle(application)
 
     assert asked == []
+
+
+def test_статус_документа_другого_контура_не_спрашивается(
+        application, tmp_path, stub, monkeypatch):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    page, _ = _intro_page(application, tmp_path, stub, monkeypatch)
+    batch = issue.load("blk-9")
+    issue.mark_sent(batch, "doc-1", 5, "IN_PROGRESS")
+    batch.contour = Contour.PRODUCTION.value
+    issue.save(batch)
+    page.reload_batches(select=batch.id)
+    asked = []
+    monkeypatch.setattr(marking_page.introduce_module, "status", lambda *args: asked.append(args))
+
+    page.refresh_document_status()
+    _settle(application)
+    assert asked == []
+    assert issue.load(batch.id).doc_status == "IN_PROGRESS"
 
 
 def test_статус_не_получен_это_не_отказ_и_повторять_не_нужно(application, tmp_path, stub,

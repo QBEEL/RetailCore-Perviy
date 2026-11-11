@@ -17,10 +17,9 @@ True API — оттуда сведения о кодах. В СУЗ, котор�
 отвечает на свой вопрос: проверка говорит, чей код и в обороте ли он, а сверка
 — то ли приехало, что написано в документе.
 
-Из операций доступна одна проверка: она ничего не меняет в ГИС МТ. Приёмки,
-отгрузки и вывода из оборота здесь нет намеренно — ядро их не отправляет (см.
-`STATUS_POLLING_READY` в `core/marking/service.py`), а кнопка, которой нечего
-сделать, хуже её отсутствия.
+Журнал сохраняет операции до отправки. После входа и при открытии страницы
+ожидающие документы с известным номером опрашиваются без повторной отправки.
+Вывод из оборота использует ГИС МТ, а продажа организации — отдельный обмен ЭДО.
 
 Обращения к закрытому ключу уходят в фоновую задачу: подпись делает КриптоПро,
 до окна ввода пароля проходят секунды, и всё это время окно не должно казаться
@@ -68,6 +67,7 @@ from ..core.marking import (
     GROUPS,
     Operation,
     OperationKind,
+    OperationStatus,
     Organisation,
     PermitState,
     codes as codes_module,
@@ -251,6 +251,7 @@ class MarkingPage(QWidget):
         self._catalog: Catalog | None = None
         self._matches: list[LineMatch] = []
         self._busy = False
+        self._polling_journal = False
         self._parse_timer = QTimer(self)
         self._parse_timer.setSingleShot(True)
         self._parse_timer.setInterval(PARSE_DELAY)
@@ -806,7 +807,12 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Журнал операций", card))
         header.addStretch(1)
-        header.addWidget(self._action(card, "Обновить", "refresh", self.reload_journal))
+        header.addWidget(self._action(card, "Обновить журнал", "refresh", self.reload_journal))
+        self.journal_status_button = self._action(
+            card, "Обновить статусы", "refresh", self.refresh_journal_statuses)
+        self.journal_status_button.setToolTip(
+            "Узнать результат отправленных документов в текущем контуре")
+        header.addWidget(self.journal_status_button)
         body.addLayout(header)
 
         self.journal = QTableWidget(0, 5, card)
@@ -1200,6 +1206,7 @@ class MarkingPage(QWidget):
         # Вошли за другую организацию — СУЗ должна работать за неё же, а не за
         # ту, чьи реквизиты остались от прошлого раза.
         self._follow_organisation()
+        self.refresh_journal_statuses(silent=True)
 
     def _on_sign_in_error(self, message: str) -> None:
         self._set_busy(False)
@@ -2175,6 +2182,11 @@ class MarkingPage(QWidget):
             self.notify("Войдите по сертификату на вкладке «Проверка кодов»",
                         ToastKind.WARNING)
             return
+        if (batch.contour and batch.contour != self.contour.value) \
+                or service.current().contour is not self.contour:
+            self.notify("Выберите контур отправленного документа и войдите в него заново",
+                        ToastKind.WARNING)
+            return
         self._set_busy(True)
         run_task(
             introduce_module.status, batch.doc_id, batch.product_group, self.contour,
@@ -2512,6 +2524,37 @@ class MarkingPage(QWidget):
 
     # --- журнал --------------------------------------------------------------------
 
+    def refresh_journal_statuses(self, *, silent: bool = False) -> None:
+        if self._polling_journal:
+            return
+        if not service.signed_in() or service.current().contour is not self.contour:
+            if not silent:
+                self.notify("Войдите по сертификату в выбранный контур", ToastKind.WARNING)
+            return
+        self._polling_journal = True
+        self._sync_state()
+        run_task(
+            service.refresh_pending,
+            on_result=lambda items: self._on_journal_statuses(items, silent=silent),
+            on_error=self._on_journal_status_error,
+        )
+
+    def _on_journal_statuses(self, items: list[Operation], *, silent: bool) -> None:
+        self._polling_journal = False
+        self._sync_state()
+        self.reload_journal()
+        if not silent:
+            self.notify(f"Статусы проверены: {len(items)}. Выполнено: "
+                        f"{sum(item.status is OperationStatus.DONE for item in items)}; "
+                        f"отклонено: {sum(item.status is OperationStatus.REJECTED for item in items)}.",
+                        ToastKind.INFO)
+
+    def _on_journal_status_error(self, message: str) -> None:
+        self._polling_journal = False
+        self._sync_state()
+        self.reload_journal()
+        self.notify(f"Не удалось обновить статусы документов: {message}", ToastKind.ERROR)
+
     def reload_journal(self) -> None:
         run_task(
             service.history,
@@ -2541,12 +2584,16 @@ class MarkingPage(QWidget):
         # УПД продажи сюда не входят: их статус спрашивается на вкладке «Продажа».
         waiting = sum(1 for operation in self._journal if operation.status.pending
                       and operation.kind is not OperationKind.SHIP)
-        if waiting and not service.STATUS_POLLING_READY:
-            # Молчать об этом нельзя: операция висит не потому, что ГИС МТ
-            # думает, а потому, что спросить её приложение пока не умеет.
+        if waiting:
+            unresolved = sum(1 for operation in self._journal if operation.status.pending
+                             and operation.kind is not OperationKind.SHIP
+                             and not service.can_refresh(operation))
             self.journal_hint.setText(
-                f"Ждут ответа ГИС МТ: {waiting}. Опрос состояния пока не "
-                "подключён — состояние таких операций смотрите в личном кабинете.")
+                f"Ждут ответа ГИС МТ: {waiting}. Войдите по сертификату и нажмите "
+                "«Обновить статусы» для документов выбранного контура."
+                + (f" Для {unresolved} операций не хватает номера документа или "
+                   "данных для опроса — проверьте их в личном кабинете."
+                   if unresolved else ""))
             self.journal_hint.setStyleSheet(f"color: {Palette.WARNING};")
             return
         self.journal_hint.setStyleSheet("")
@@ -3061,6 +3108,7 @@ class MarkingPage(QWidget):
         self._restore_catalog()
         self._rematch()
         self._sync_state()
+        self.refresh_journal_statuses(silent=True)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -3069,13 +3117,16 @@ class MarkingPage(QWidget):
     def _sync_state(self) -> None:
         """Приводит кнопки и подпись входа в соответствие с тем, что происходит."""
         signed = service.signed_in()
-        self.login_button.setEnabled(bool(self.thumbprint) and not self._busy
+        busy = self._busy or self._polling_journal
+        self.journal_status_button.setEnabled(
+            signed and not busy and service.current().contour is self.contour)
+        self.login_button.setEnabled(bool(self.thumbprint) and not busy
                                      and not signed)
-        self.logout_button.setEnabled(signed and not self._busy)
-        self.certificates_button.setEnabled(not self._busy)
-        self.organisation_button.setEnabled(bool(self.thumbprint) and not self._busy)
-        self.certificate_box.setEnabled(not self._busy and not signed)
-        self.contour_box.setEnabled(not self._busy)
+        self.logout_button.setEnabled(signed and not busy)
+        self.certificates_button.setEnabled(not busy)
+        self.organisation_button.setEnabled(bool(self.thumbprint) and not busy)
+        self.certificate_box.setEnabled(not busy and not signed)
+        self.contour_box.setEnabled(not busy)
         self.check_button.setEnabled(
             signed and bool(self._batch.valid) and not self._busy)
         # Проверка связи с СУЗ входа по сертификату не требует: это другая

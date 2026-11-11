@@ -1,0 +1,2 @@
+# Shell-скрипты исполняются в Linux, в том числе после checkout в Windows.
+server/tools/*.sh text eol=lf

@@ -3,7 +3,8 @@
 Сервер — отдельный пакет со своими зависимостями (FastAPI, PyJWT, PostgreSQL).
 Здесь он загружается под другим именем, чтобы не столкнуться с клиентским
 `app`, а база подменяется заглушкой, помнящей одну учётку. Без FastAPI и PyJWT
-тесты пропускаются.
+тесты пропускаются. При прямом вызове current_user передаём отсутствие заголовков
+явно: значения Header разрешает FastAPI только при обработке HTTP-запроса.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ class FakeDb:
     def __init__(self, password_hash: str) -> None:
         self.user = {
             "id": 5, "login": "ivanov", "full_name": "Иванов", "is_admin": False,
-            "is_active": True, "token_version": 0, "responsible": [],
+            "is_active": True, "token_version": 0, "responsible": [], "covered": [],
             "must_change_password": False, "password_hash": password_hash,
         }
         self.executed: list[tuple[str, object]] = []
@@ -90,32 +91,32 @@ def _token(server, **claims) -> str:
 
 
 def test_токен_текущей_версии_принимается(server):
-    assert server.security.current_user(_token(server)).login == "ivanov"
+    assert server.security.current_user(_token(server), None, None).login == "ivanov"
 
 
 def test_токен_без_версии_читается_как_нулевая(server):
     """Выданный до обновления сервера: сразу после него никого не выбрасывает."""
     legacy = _token(server, ver=None, auth=None)
-    assert server.security.current_user(legacy).id == 5
+    assert server.security.current_user(legacy, None, None).id == 5
 
 
 def test_вход_прежней_версии_заканчивается(server):
     old = _token(server)
     server.db.user["token_version"] = 1
     with pytest.raises(HTTPException) as denied:
-        server.security.current_user(old)
+        server.security.current_user(old, None, None)
     assert denied.value.status_code == 401
 
 
 def test_отключённая_учётка_не_входит(server):
     server.db.user["is_active"] = False
     with pytest.raises(HTTPException):
-        server.security.current_user(_token(server))
+        server.security.current_user(_token(server), None, None)
 
 
 def test_смена_пароля_заканчивает_прежние_входы_и_выдаёт_новый(server):
     old = _token(server)
-    user = server.security.current_user(old)
+    user = server.security.current_user(old, None, None)
     form = server.schemas.PasswordChange(old_password="старый-пароль",
                                          new_password="новый-пароль-1")
 
@@ -123,12 +124,12 @@ def test_смена_пароля_заканчивает_прежние_вход�
 
     assert server.db.user["token_version"] == 1
     with pytest.raises(HTTPException):
-        server.security.current_user(old)
-    assert server.security.current_user(answer.access_token).login == "ivanov"
+        server.security.current_user(old, None, None)
+    assert server.security.current_user(answer.access_token, None, None).login == "ivanov"
 
 
 def test_неверный_старый_пароль_входы_не_меняет(server):
-    user = server.security.current_user(_token(server))
+    user = server.security.current_user(_token(server), None, None)
     form = server.schemas.PasswordChange(old_password="не тот", new_password="новый-пароль-1")
     with pytest.raises(HTTPException) as denied:
         server.auth.change_password(form, user)
@@ -138,7 +139,7 @@ def test_неверный_старый_пароль_входы_не_меняет
 
 def test_продление_сохраняет_момент_входа(server):
     entered = int(time.time()) - 3 * 86400
-    user = server.security.current_user(_token(server, auth=entered))
+    user = server.security.current_user(_token(server, auth=entered), None, None)
 
     renewed = server.auth.refresh(user)
 
@@ -147,7 +148,8 @@ def test_продление_сохраняет_момент_входа(server):
 
 
 def test_продлевать_после_предела_сессии_нельзя(server):
-    user = server.security.current_user(_token(server, auth=int(time.time()) - 8 * 86400))
+    user = server.security.current_user(
+        _token(server, auth=int(time.time()) - 8 * 86400), None, None)
     with pytest.raises(HTTPException) as denied:
         server.auth.refresh(user)
     assert denied.value.status_code == 401

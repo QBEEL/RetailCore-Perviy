@@ -15,7 +15,7 @@ echo.
 python -m venv "%~dp0.venv"
 if errorlevel 1 goto nopython
 "%PYDIR%\python.exe" -m pip install --upgrade pip --quiet
-"%PYDIR%\python.exe" -m pip install -r "%~dp0requirements.txt"
+"%PYDIR%\python.exe" -m pip install --require-hashes --only-binary=:all: -r "%~dp0requirements.txt"
 if errorlevel 1 goto nodeps
 echo.
 echo  Готово. Запускаю приложение.
@@ -32,7 +32,7 @@ goto end
 :nopython
 echo.
 echo  Не удалось создать окружение.
-echo  Установите Python 3.11 или новее с сайта python.org
+echo  Установите Python 3.12 или новее с сайта python.org
 echo  и обязательно отметьте пункт "Add Python to PATH".
 echo.
 pause

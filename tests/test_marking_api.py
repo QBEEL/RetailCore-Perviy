@@ -191,7 +191,7 @@ def test_sign_in_signs_the_string_and_names_the_organisation(monkeypatch):
 
     def post(system, path, **kwargs):
         posted.update(path=path, body=kwargs.get("body"))
-        return {"token": "т-42"}
+        return {"token": "legacy.jwt.token", "uuidToken": "123e4567-e89b-12d3-a456-426655440000"}
 
     monkeypatch.setattr(session.transport, "post", post)
 
@@ -200,7 +200,8 @@ def test_sign_in_signs_the_string_and_names_the_organisation(monkeypatch):
     assert signed["data"] == "случайная-строка"
     assert posted["path"] == "/auth/simpleSignIn"
     assert posted["body"]["inn"] == "250101802801"
-    assert result.token == "т-42"
+    assert posted["body"]["unitedToken"] is True
+    assert result.token == "123e4567-e89b-12d3-a456-426655440000"
     assert result.organisation == "ИП Саух"
     session.sign_out()
 
@@ -391,8 +392,9 @@ def test_pending_operations_are_listed_for_polling(tmp_path):
     assert [item.id for item in store.pending(path)] == [waiting.id]
 
 
-def test_polling_does_nothing_until_it_is_configured(tmp_path):
-    """Пока опрос не подключён, судьба операции не угадывается."""
+def test_polling_does_nothing_when_disabled(tmp_path, monkeypatch):
+    """Если опрос отключили, судьба операции не угадывается."""
+    monkeypatch.setattr(service, "STATUS_POLLING_READY", False)
     path = str(tmp_path / "marking.db")
     saved = store.create(_operation(), path)
     saved.status = OperationStatus.SENT

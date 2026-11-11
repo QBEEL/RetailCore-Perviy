@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import db
+from . import db, migrations
 from .routers import (
     ai,
     audit,
@@ -32,9 +32,13 @@ from .routers import (
 async def lifespan(app: FastAPI):
     # Пул открывается при старте, а не при первом запросе: так неверный пароль
     # к базе виден сразу в журнале контейнера, а не через час работы.
-    db.pool.open(wait=True, timeout=30)
-    yield
-    db.pool.close()
+    try:
+        db.pool.open(wait=True, timeout=30)
+        with db.cursor() as cursor:
+            migrations.check_current(cursor)
+        yield
+    finally:
+        db.pool.close()
 
 
 app = FastAPI(

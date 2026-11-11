@@ -829,7 +829,7 @@ class WithdrawalTab(QWidget):
             self._tell(f"Вывод не выполнен. {text}", ToastKind.ERROR)
         else:
             text = (f"Документ {sent.doc_id} создан, итога пока нет: {status.text}. "
-                    "Состояние смотрите в личном кабинете «Честного ЗНАКа».")
+                    "Нажмите «Обновить статусы» в журнале на вкладке «Проверка кодов».")
             self.hint.setStyleSheet(f"color: {Palette.WARNING};")
             self._tell(text, ToastKind.WARNING)
         self.hint.setText(text)

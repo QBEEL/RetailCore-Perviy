@@ -27,7 +27,7 @@ XML «Ввод в оборот. Маркировка остатков» (`<vvod_
 - повторов у запроса нет: оборванный ответ не означает «не дошло», и второй
   такой запрос — второй документ на те же коды;
 - номер документа сохраняется сразу после создания, до опроса статуса;
-- успехом считаются только `CHECKED_OK` и `ACCEPTED`; всё незнакомое
+- успехом считается `CHECKED_OK`; всё незнакомое
   показывается как есть и успехом не объявляется.
 """
 from __future__ import annotations
@@ -329,19 +329,19 @@ STATUS_TITLES: dict[str, str] = {
     "WAIT_ACCEPTANCE": "Прошёл проверку, ожидает приёмку",
     "WAIT_PARTICIPANT_REGISTRATION": "Ожидает регистрации участника в ГИС МТ",
     "ACCEPTED": "Принят",
-    "CHECKED_OK": "Проверен, коды введены в оборот",
+    "CHECKED_OK": "Обработан",
     "CHECKED_NOT_OK": "Отклонён: проверка не пройдена",
     "PROCESSING_ERROR": "Ошибка обработки",
     "PARSE_ERROR": "Отклонён: файл не прошёл проверку формата",
     "PARSING_ERROR": "Отклонён: файл не прошёл проверку формата",
 }
-SUCCESS = frozenset({"CHECKED_OK", "ACCEPTED"})
-# Ожидание — единственное, что не итог. Всё остальное, кроме успеха, итог: либо
-# отказ, либо статус, которого мы не знаем.
+SUCCESS = frozenset({"CHECKED_OK"})
+# Известные состояния ожидания можно опрашивать при отправке. Незнакомое
+# значение возвращается пользователю без вывода об успехе или отказе.
 PENDING = frozenset({"IN_PROGRESS", "WAIT_FOR_CONTINUATION", "WAIT_ACCEPTANCE",
                      "WAIT_PARTICIPANT_REGISTRATION"})
 FAILURE = frozenset({"CHECKED_NOT_OK", "PROCESSING_ERROR", "PARSE_ERROR",
-                     "PARSING_ERROR"})
+                     "PARSING_ERROR", "REJECTED", "CANCELLED", "ERROR"})
 
 
 class IntroduceUnknown(transport.MarkingError):
@@ -371,10 +371,8 @@ class DocStatus:
 
     @property
     def failed(self) -> bool:
-        """Отказ. Узнаётся и по имени: `*_ERROR`, `*_NOT_OK`, `REJECTED` — не успех."""
-        code = self.code.upper()
-        return code in FAILURE or code.endswith("_ERROR") or code.endswith("_NOT_OK") \
-            or code in ("REJECTED", "CANCELLED", "ERROR")
+        """Только известный отказ: незнакомое имя не освобождает коды для повтора."""
+        return self.code.upper() in FAILURE
 
     @property
     def pending(self) -> bool:
@@ -463,17 +461,25 @@ def status(doc_id: str, product_group: str,
 
     Спрашивается способами по очереди. Первый — тот, которым пользуется
     ПРИНТМАРКИ: список документов с отбором по номеру, а он живёт только в
-    четвёртой версии True API (в третьей ответ «Метод с указанным URL не
-    найден» — на нём первая версия этой функции и споткнулась). Второй — карточка
-    документа третьей версии. «Не найден» у одного способа — повод попробовать
-    следующий, любая другая ошибка — нет.
+    четвёртой версии True API. Карточка документа тоже описана в v4
+    (https://docs.crpt.ru/gismt/True_API/, разделы 6.1 и 6.3).
+    В последнюю очередь пробуется прежний v3. «Не найден» у одного способа —
+    повод попробовать следующий, любая другая ошибка — нет.
     """
+    doc_id = doc_id.strip()
     group = product_group.strip().lower()
+    if not doc_id or not group:
+        raise IntroduceProblem("Для опроса нужны номер документа и товарная группа")
+    params = {"number": doc_id, "pg": group}
+    if session.session.inn:
+        params["senderInn"] = session.session.inn
     attempts: list[tuple[str, str, dict[str, Any]]] = [
-        ("trueapi4", LIST_PATH, {"number": doc_id, "pg": group}),
+        ("trueapi4", LIST_PATH, params),
+        ("trueapi4", INFO_PATH.format(doc_id=doc_id), {"pg": group}),
         ("trueapi", INFO_PATH.format(doc_id=doc_id), {"pg": group}),
     ]
     last: transport.MarkingError | None = None
+    unknown = DocStatus(errors=(f"Документ {doc_id} пока не найден в ответе ГИС МТ",))
     for system, path, params in attempts:
         try:
             answer = session.authorized(lambda token: transport.get(
@@ -483,7 +489,9 @@ def status(doc_id: str, product_group: str,
                 raise
             last = error
             continue
-        result = _parse_status(answer, doc_id)
+        result = _parse_status(answer, doc_id, allow_missing_id=path != LIST_PATH)
+        if not result.code:
+            continue
         if result.code and not (result.done or result.pending):
             # Отказ или незнакомый статус: ответ записывается целиком — по нему
             # разбирается, что не так, — и, если причины в нём нет, она
@@ -493,23 +501,30 @@ def status(doc_id: str, product_group: str,
                 if extra := _details(doc_id, group, contour):
                     result = DocStatus(result.code, extra)
         return result
-    raise last or transport.MarkingError("Статус документа получить не удалось.")
+    if last is not None:
+        raise last
+    return unknown
 
 
 def _details(doc_id: str, group: str, contour: Contour) -> tuple[str, ...]:
     """Причина отказа из карточки документа. Не нашлась — пустой ответ, не ошибка."""
-    try:
-        answer = session.authorized(lambda token: transport.get(
-            "trueapi", INFO_PATH.format(doc_id=doc_id), contour=contour,
-            params={"pg": group}, token=token))
-    except transport.MarkingError:
-        return ()
-    if not isinstance(answer, dict):
+    answer = None
+    for system in ("trueapi4", "trueapi"):
+        try:
+            answer = session.authorized(lambda token: transport.get(
+                system, INFO_PATH.format(doc_id=doc_id), contour=contour,
+                params={"pg": group}, token=token))
+            break
+        except transport.MarkingError as error:
+            if not _path_missing(error):
+                return ()
+    answer = _document_row(answer, doc_id, allow_missing_id=True)
+    if answer is None:
         return ()
     _remember(doc_id, {key: value for key, value in answer.items()
                        if key != "body" and not isinstance(value, (bytes, bytearray))})
     found: list[str] = []
-    for key in ("errors", "errorMessages", "error", "errorMessage", "message",
+    for key in ("errors", "commonErrors", "errorMessages", "error", "errorMessage", "message",
                 "description", "downloadDesc"):
         value = answer.get(key)
         if isinstance(value, str) and value.strip():
@@ -535,23 +550,38 @@ def _path_missing(error: transport.MarkingError) -> bool:
         or "url не найден" in text
 
 
-def _parse_status(answer: Any, doc_id: str) -> DocStatus:
+def _parse_status(answer: Any, doc_id: str, *, allow_missing_id: bool = False) -> DocStatus:
     """Статус из ответа — и из списка документов, и из карточки одного."""
+    chosen = _document_row(answer, doc_id, allow_missing_id=allow_missing_id)
+    if chosen is None:
+        return DocStatus()
+    errors = (_errors(chosen.get("errors")) or _errors(chosen.get("commonErrors"))
+              or _errors(chosen.get("downloadDesc")))
+    return DocStatus(code=str(chosen.get("status") or "").strip(), errors=errors)
+
+
+def _document_row(answer: Any, doc_id: str, *, allow_missing_id: bool = False) -> dict | None:
     rows: list[dict] = []
+    direct = isinstance(answer, dict) and "results" not in answer
     if isinstance(answer, dict):
         listed = answer.get("results")
         rows = [row for row in listed if isinstance(row, dict)] \
-            if isinstance(listed, list) else [answer]
+            if isinstance(listed, list) else ([answer] if direct else [])
     elif isinstance(answer, list):
         rows = [row for row in answer if isinstance(row, dict)]
     if not rows:
-        return DocStatus()
-    chosen = next((row for row in rows
-                   if doc_id in {str(row.get(key) or "")
-                                 for key in ("number", "docId", "id", "doc_id")}),
-                  rows[0])
-    return DocStatus(code=str(chosen.get("status") or "").strip(),
-                     errors=_errors(chosen.get("errors")))
+        return None
+    return next((row for row in rows if _matches_document(
+        row, doc_id, allow_missing=direct and allow_missing_id)), None)
+
+
+def _matches_document(row: dict, doc_id: str, *, allow_missing: bool = False) -> bool:
+    identifiers = {str(row.get(key) or "").strip()
+                   for key in ("number", "docId", "id", "doc_id", "documentId")}
+    identifiers.discard("")
+    # У карточки номер уже задан URL. В списке отсутствие номера не позволяет
+    # угадать, к какому документу относится строка.
+    return doc_id in identifiers or (allow_missing and not identifiers)
 
 
 def _errors(raw: Any) -> tuple[str, ...]:

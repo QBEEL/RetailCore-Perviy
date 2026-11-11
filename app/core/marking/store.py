@@ -120,6 +120,24 @@ def update(operation: Operation, path: str | None = None) -> Operation:
     return operation
 
 
+def update_document_status(operation_id: int, document_id: str, status: OperationStatus,
+                           error: str, checked_at: datetime,
+                           path: str | None = None) -> Operation | None:
+    """Записывает результат опроса, если документ всё ещё ждёт ответа.
+
+    Не перезаписывает финал, который мог сохранить параллельный опрос, и
+    не трогает комментарии и реквизиты операции из старого снимка.
+    """
+    with connect(path) as connection:
+        connection.execute(
+            "UPDATE operation SET status = ?, error = ?, checked_at = ? "
+            "WHERE id = ? AND document_id = ? AND status IN ('sending', 'sent')",
+            (status.value, error, checked_at.isoformat(timespec="seconds"),
+             operation_id, document_id))
+        connection.commit()
+    return get(operation_id, path)
+
+
 def _operation(row: sqlite3.Row) -> Operation:
     return Operation(
         id=int(row["id"]),

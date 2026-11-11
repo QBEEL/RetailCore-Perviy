@@ -6,10 +6,11 @@ WORKDIR /srv
 
 # Зависимости отдельным слоем: правка кода не тянет за собой переустановку
 # пакетов, а сборка на одноядерной машине идёт заметно быстрее.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY api/requirements.txt .
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
-COPY app ./app
+COPY api/app ./app
+COPY db ./db
 
 # От root в контейнере работать незачем: наружу торчит только HTTP.
 RUN useradd --system --uid 1001 retailcore

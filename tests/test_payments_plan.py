@@ -195,7 +195,9 @@ def test_план_становится_оплатами_в_календаре(db
     report = service.analyze_plan(filled, db_path=db)
     assert len(report.created) == 2 and report.changes == 2
 
-    service.apply_plan(report, db_path=db)
+    # Проверяем загрузку будущего плана; реальная дата запуска не должна
+    # превращать октябрьские оплаты в просроченные.
+    service.apply_plan(report, db_path=db, today=OCTOBER)
     rows = sorted(store.list_payments(path=db), key=lambda p: p.pay_date)
 
     assert [p.pay_date for p in rows] == [date(2026, 10, 5), date(2026, 10, 12)]

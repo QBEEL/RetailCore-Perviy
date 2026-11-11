@@ -1,5 +1,9 @@
 # Серверная часть RetailCore
 
+Python-пакеты контейнера закреплены в `api/requirements.txt` вместе с SHA-256.
+Исходные ограничения и порядок обновления — в
+[DEPENDENCIES.md](../DEPENDENCIES.md).
+
 Общая база оплат: раньше `payments.db` лежал в профиле одного человека, и
 остальные категорийные менеджеры оплат не видели. Здесь то же самое, но на
 сервере и с учётными записями.
@@ -8,8 +12,8 @@
 
 | Путь | Что это |
 |---|---|
-| `docker-compose.yml` | Три контейнера: база, API, Caddy |
-| `db/schema.sql` | Схема. Применяется автоматически при первом запуске на пустом томе |
+| `docker-compose.yml` | База, мигратор, API и Caddy; API ждёт успешных миграций |
+| `db/schema.sql` | Базовая схема для пустой базы; применяется мигратором |
 | `api/` | FastAPI: вход по логину, токены, права, оплаты, бюджеты, вложения |
 | `Caddyfile` | HTTPS для `retail.qbeely.ru`, сертификат продлевается сам |
 | `tools/export_from_sqlite.py` | Выгрузка локальной `payments.db` в файл для загрузки |
@@ -58,15 +62,20 @@
 
 ## Миграции схемы
 
-`db/schema.sql` применяется только к пустому тому. Всё, что меняется потом, —
-файлами в `db/migrations`, по порядку имён:
+Сервис `migrate` применяет базовую схему в пустой базе, затем `db/migrations`
+по порядку имён. API запускается после успешного завершения мигратора.
+Ручной запуск из каталога сервера:
 
 ```sh
-tools/migrate.sh
+sh tools/migrate.sh
+sh tools/migrate.sh --check
 ```
 
 Применённые запоминаются в `schema_migration`, повторный запуск ничего не
-переделывает. Каждая миграция и отметка о ней — в одной транзакции.
+переделывает. Каждая миграция и отметка о ней — в одной транзакции. Файлы
+проверяются по SHA-256, одновременные запуски разделяет блокировка PostgreSQL.
+Порядок обновления, переход со старого журнала и возврат версии описаны в
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Импорт выгрузки 1С
 
@@ -178,7 +187,11 @@ cp .env.example .env
 # пароль сгенерировать, а не придумать:
 sed -i "s/замените-меня/$(openssl rand -base64 24 | tr -d '/+=' | head -c 28)/" .env
 chmod 600 .env
-docker compose up -d
+sed -i "s/^API_SECRET=$/API_SECRET=$(openssl rand -hex 32)/" .env
+mkdir -p files
+chown 1001:1001 files
+docker compose up -d --build --wait --wait-timeout 180
+docker compose exec -T api python -m app.migrations --check
 ```
 
 ### ИИ-правка заметок (необязательно)
@@ -224,9 +237,9 @@ SELECT md5(string_agg(line, E'\n' ORDER BY id) || E'\n') FROM (
 ## Восстановление из копии
 
 ```sh
-gunzip -c backups/retailcore-2026-07-31.sql.gz \
+gunzip -c backups/retailcore-2026-07-31-030000.sql.gz \
   | docker compose exec -T db psql -U retailcore -d retailcore -v ON_ERROR_STOP=1
-tar -xzf backups/files-2026-07-31.tar.gz -C /opt/retailcore
+tar -xzf backups/files-2026-07-31-030000.tar.gz -C /opt/retailcore
 ```
 
 Дамп сделан с `--clean --if-exists`, поэтому разворачивается поверх непустой

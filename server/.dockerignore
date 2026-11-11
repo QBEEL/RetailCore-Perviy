@@ -1,0 +1,13 @@
+# В контекст сборки попадают только код API, закреплённые пакеты и схема.
+**
+!api/
+!api/Dockerfile
+!api/requirements.txt
+!api/app/
+!api/app/**
+!db/
+!db/schema.sql
+!db/migrations/
+!db/migrations/*.sql
+**/__pycache__/
+**/*.pyc
