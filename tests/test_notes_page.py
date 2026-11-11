@@ -227,7 +227,7 @@ class TestInWindow:
         from app.ui.main_window import MainWindow
 
         transport.session.clear()
-        window = MainWindow(AppSettings(), offline=True)
+        window = MainWindow(AppSettings(update_check_auto=False), offline=True)
         yield window
         transport.session.clear()
 

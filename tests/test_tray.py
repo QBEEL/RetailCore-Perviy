@@ -49,7 +49,9 @@ def tray_available(monkeypatch: pytest.MonkeyPatch) -> None:
 def _window(settings: AppSettings | None = None):
     from app.ui.main_window import MainWindow
 
-    window = MainWindow(settings or AppSettings(_path="unused.json"), offline=True)
+    settings = settings or AppSettings(_path="unused.json")
+    settings.update_check_auto = False
+    window = MainWindow(settings, offline=True)
     window.show()
     return window
 

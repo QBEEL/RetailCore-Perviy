@@ -57,7 +57,7 @@ def closed(request):
 def _window(application) -> object:
     from app.ui.main_window import MainWindow
 
-    return MainWindow(AppSettings(), offline=True)
+    return MainWindow(AppSettings(update_check_auto=False), offline=True)
 
 
 # --- меню ---------------------------------------------------------------------------
