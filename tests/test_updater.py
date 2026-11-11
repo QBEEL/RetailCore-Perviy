@@ -77,6 +77,7 @@ def test_apply_update_renames_and_replaces(tmp_path: Path, monkeypatch: pytest.M
         captured["env"] = kwargs.get("env")
 
     monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(updater, "is_macos", lambda: False)
 
     updater.apply_update(str(new_exe), current_path=str(current))
 

@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +34,9 @@ def application():
 
 
 @pytest.fixture(autouse=True)
-def clean_mail_state(tmp_path: Path):
+def clean_mail_state(tmp_path: Path, monkeypatch):
+    # UI tests use process memory; OS credential stores have separate tests.
+    monkeypatch.setattr(secret, "sys", SimpleNamespace(platform="test"))
     secret._memory.clear()
     settings = AppSettings(_path=str(tmp_path / "settings.json"))
     mail.config.bind(settings)

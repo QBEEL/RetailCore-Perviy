@@ -235,6 +235,7 @@ def test_включение_по_подписке_поднимает_выбра�
         vpn.stop()
 
 
+@windows_only
 def test_выбор_сервера_запоминается_по_названию(application, scratch_registry, servers):
     page = _page(application, VpnManager(scratch_registry))
     page.vpn_link.setText(SUB_URL)
