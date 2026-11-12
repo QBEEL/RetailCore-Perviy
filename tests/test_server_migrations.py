@@ -66,7 +66,7 @@ def test_empty_database_reaches_current_schema_and_seeds(database):
     _, connection = database
     applied = migrate(connection)
     assert applied == [item.name for item in migrations.load(DB)]
-    assert len(applied) == 20
+    assert len(applied) == 21
     with connection.cursor() as cursor:
         migrations.check_current(cursor)
     assert connection.execute("SELECT count(*) AS n FROM claim_brand").fetchone()["n"] > 600
@@ -140,15 +140,15 @@ def test_old_shell_history_is_adopted_without_replaying_sql(database):
 
 def test_failed_file_rolls_back_sql_and_history_then_can_resume(database, db_files):
     _, connection = database
-    failed = db_files / "migrations" / "021_failure.sql"
+    failed = db_files / "migrations" / "022_failure.sql"
     failed.write_text("CREATE TABLE migration_probe(id INT); SELECT 1/0;", encoding="utf-8")
     with pytest.raises(psycopg.errors.DivisionByZero):
         migrate(connection, db_files)
-    assert len(history(connection)) == 20
+    assert len(history(connection)) == 21
     assert connection.execute("SELECT to_regclass('migration_probe') AS t").fetchone()["t"] is None
     failed.write_text("CREATE TABLE migration_probe(id INT);", encoding="utf-8")
     assert migrate(connection, db_files) == [failed.name]
-    assert len(history(connection)) == 21
+    assert len(history(connection)) == 22
 
 
 def test_changed_applied_file_is_rejected_before_pending_sql(database, db_files):
@@ -156,7 +156,7 @@ def test_changed_applied_file_is_rejected_before_pending_sql(database, db_files)
     migrate(connection, db_files)
     changed = db_files / "migrations" / "020_claim_marking.sql"
     changed.write_text(changed.read_text(encoding="utf-8") + "\n-- changed\n", encoding="utf-8")
-    (db_files / "migrations" / "021_pending.sql").write_text("CREATE TABLE should_not_exist(id INT);", encoding="utf-8")
+    (db_files / "migrations" / "022_pending.sql").write_text("CREATE TABLE should_not_exist(id INT);", encoding="utf-8")
     with pytest.raises(migrations.MigrationError, match="020"):
         migrate(connection, db_files)
     assert connection.execute("SELECT to_regclass('should_not_exist') AS t").fetchone()["t"] is None
@@ -219,9 +219,9 @@ def test_parallel_runs_are_serialized(database):
             assert waiting, "второй мигратор должен ждать блокировку первого"
         finally:
             release.set()
-        assert len(initial.result(timeout=20)) == 20
+        assert len(initial.result(timeout=20)) == 21
         assert concurrent.result(timeout=20) == []
-    assert len(history(connection)) == 20
+    assert len(history(connection)) == 21
 
 
 @pytest.fixture

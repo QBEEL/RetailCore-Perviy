@@ -58,7 +58,7 @@ def page(application, monkeypatch, tmp_path):
     widget.rows = store.list_payments()
     # Перезагрузка уходит в поток и тянет за собой общую базу: для переноса
     # важно, что легло в базу, а не как страница себя перерисовала.
-    monkeypatch.setattr(widget, "reload", lambda: None)
+    monkeypatch.setattr(widget, "reload", lambda **kwargs: None)
     return widget
 
 

@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import calendar
 import os
+import random
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
-from typing import Callable
+from time import monotonic
+from typing import Any, Callable
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -68,6 +72,7 @@ from ..core.payments.directions import (
 # иначе своя локальная. Имя `store` оставлено прежним — вызовов по нему
 # полтора десятка, и переименование ничего бы не дало.
 from ..core.payments import data as store
+from ..core.payments.live import Changes, Cursor
 from ..core.settings import AppSettings
 from ..core.suppliers import directory
 from ..core.workbook import write_sheet
@@ -103,6 +108,54 @@ from .widgets.table import ROLE_PAYLOAD, Column, DataTable
 from .widgets.toast import ToastKind
 
 Notify = Callable[[str, ToastKind], None]
+METADATA_TTL = 30.0
+
+
+@dataclass(frozen=True)
+class PaymentMetadata:
+    known: dict[str, list[str]]
+    budgets: list[Budget]
+    total: int
+    unlinked: int
+    loaded_at: float
+    day: date
+    direction_data: tuple[list, dict] | None = None
+
+
+@dataclass(frozen=True)
+class PaymentData:
+    rows: list[Payment]
+    metadata: PaymentMetadata
+    overdue: int = 0
+    cursor: Cursor | None = None
+
+
+@dataclass(frozen=True)
+class PaymentDelta:
+    changes: Changes
+    metadata: PaymentMetadata | None = None
+
+
+def _source_key() -> tuple:
+    """Кэш и ответы принадлежат одной базе и одной сессии входа."""
+    account = transport.session
+    return (store.backend(), account.base_url, account.token, account.login,
+            account.user_id, account.is_admin, account.responsible,
+            account.denied_pages, account.directions)
+
+
+def _source_error_is_current(source: tuple) -> bool:
+    current = _source_key()
+    # При 401 transport очищает сессию ещё до доставки ошибки в интерфейс.
+    return source == current or (
+        source[1] == current[1] and bool(source[2]) and not current[2])
+
+
+def _expected_versions(backend: Any, rows: list[Payment]) -> dict:
+    if (getattr(backend, "version_for", None) is not None
+            and all(row.sync_revision is not None for row in rows)):
+        return {"expected_revisions": {row.id: row.sync_revision for row in rows}}
+    return {}
 
 
 class PaymentsPage(QWidget):
@@ -133,6 +186,18 @@ class PaymentsPage(QWidget):
         today = date.today()
         self.year, self.month = today.year, today.month
         self._loaded = False
+        self._reload_seq = 0
+        self._loading = False
+        self._move_pending = False
+        self._reload_pending: bool | None = None
+        self._metadata: PaymentMetadata | None = None
+        self._metadata_source: tuple | None = None
+        self._sync_cursor: Cursor | None = None
+        self._poll_inflight = False
+        self._poll_delay = 2000
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setSingleShot(True)
+        self._poll_timer.timeout.connect(self._poll_changes)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(Metrics.PAD + 8, Metrics.PAD + 4, Metrics.PAD + 8, Metrics.PAD)
@@ -371,7 +436,7 @@ class PaymentsPage(QWidget):
         # Подписка на перезагрузку — после наполнения списков, иначе
         # `addItem` на пустом списке дёрнул бы её на этапе сборки окна.
         for box in self._filter_boxes():
-            box.currentIndexChanged.connect(self.reload)
+            box.currentIndexChanged.connect(lambda _index: self.reload(force=False))
         self.filters_body.setVisible(self.settings.payment_filters_open)
         self._refresh_filters_summary()
         return panel
@@ -538,6 +603,9 @@ class PaymentsPage(QWidget):
             parts.append(f"просрочено: {overdue}")
         self.month_summary.setText(" · ".join(parts))
         self._refresh_budget_line()
+        if self.selected_day is not None:
+            self.show_day(Day(day=self.selected_day, payments=[
+                payment for payment in self.rows if payment.pay_date == self.selected_day]))
 
     def _refresh_budget_line(self) -> None:
         use = self._budget_use(self.year, self.month)
@@ -557,6 +625,7 @@ class PaymentsPage(QWidget):
         self.budget_line.setStyleSheet(f"color: {colour}; font-size: 12px;")
 
     def show_day(self, day: Day) -> None:
+        selected = set(self.day_list.selected_ids()) if self.selected_day == day.day else set()
         self.selected_day = day.day
         self.day_add.setEnabled(True)
         self.day_delete.setEnabled(False)
@@ -595,6 +664,8 @@ class PaymentsPage(QWidget):
                 # крупнее точек в клетке календаря.
                 item.setBackground(marks.tint(color))
             self.day_list.addItem(self.day_list.mark(item, payment))
+            if payment.id in selected:
+                item.setSelected(True)
 
     def _day_selection_changed(self) -> None:
         count = len(self.day_list.selected_ids(movable_only=False))
@@ -628,7 +699,13 @@ class PaymentsPage(QWidget):
         статус каждой, а останавливать перенос всей пачки из-за одной такой
         строки — заставлять его разбирать выделение вручную.
         """
-        chosen = {payment.id: payment for payment in self.rows if payment.id in set(ids)}
+        if not self._source_ready():
+            return
+        if self._move_pending:
+            self.notify("Предыдущий перенос ещё сохраняется", ToastKind.INFO)
+            return
+        selected_ids = set(ids)
+        chosen = {payment.id: payment for payment in self.rows if payment.id in selected_ids}
         movable = [p for p in chosen.values() if p.status.open and p.pay_date != day]
         # Чужие отсеиваются здесь, до отправки, а не сервером после неё. Право
         # считает всё равно он и присылает готовым с каждой записью — но зная
@@ -647,22 +724,68 @@ class PaymentsPage(QWidget):
             return
         if whole_day and len(movable) > 1 and not self._confirm_day_move(movable, day):
             return
-        try:
-            # Пачкой, а не по одной: десять сохранений подряд — это десять
-            # запросов к общей базе и десять шансов остановиться на середине.
-            # Перенос фиксируется статусом, иначе сдвинутое в прошлое тут же
-            # стало бы просрочкой.
-            changed = store.update_many(
-                [p.id for p in mine], status=PaymentStatus.MOVED, pay_date=day)
-        except ValueError as failure:
-            self.notify(str(failure), ToastKind.ERROR)
-            return
+        source = _source_key()
+        self._reload_seq += 1  # Старое чтение не должно вернуть карточку назад.
+        self._poll_timer.stop()
+        self._poll_inflight = False
+        self._reload_pending = False if self._loading else None
+        self._loading = False
+        self._move_pending = True
+
+        def completed(changed: int) -> None:
+            pending = self._end_move()
+            if source != _source_key():
+                self.reload()
+                return
+            self._finish_move(changed, mine, day, len(movable) - len(mine))
+            if pending is not None and (changed == len(mine) or not changed):
+                self.reload(force=pending)
+            else:
+                self._schedule_poll(0)
+
+        def failed(message: str) -> None:
+            pending = self._end_move()
+            if _source_error_is_current(source):
+                self.notify(message, ToastKind.ERROR)
+            if pending is not None or source != _source_key():
+                self.reload()
+            else:
+                self._schedule_poll(0)
+
+        backend = source[0]
+        if store.online():
+            self.progress.setVisible(True)
+            self.grid.setEnabled(False)
+            self.day_list.setEnabled(False)
+            run_task(
+                backend.update_many, [p.id for p in mine],
+                status=PaymentStatus.MOVED, pay_date=day,
+                on_result=completed, on_error=failed, **_expected_versions(backend, mine))
+        else:
+            # SQLite на этом компьютере не требует ожидания сети.
+            try:
+                changed = backend.update_many(
+                    [p.id for p in mine], status=PaymentStatus.MOVED, pay_date=day)
+            except (ValueError, transport.ServerError) as failure:
+                failed(str(failure))
+            else:
+                completed(changed)
+
+    def _end_move(self) -> bool | None:
+        self._move_pending = False
+        self.progress.setVisible(False)
+        self.grid.setEnabled(True)
+        self.day_list.setEnabled(True)
+        pending = self._reload_pending
+        self._reload_pending = None
+        return pending
+
+    def _finish_move(self, changed: int, mine: list[Payment], day: date, skipped: int) -> None:
         if not changed:
             self.notify("Перенести не удалось: оплаты не изменились", ToastKind.WARNING)
             return
         moved = (mine[0].title if changed == 1 and len(mine) == 1
                  else payments_count(changed))
-        skipped = len(movable) - len(mine)
         text = f"{moved}: перенесено на {day:%d.%m.%Y}"
         if skipped > 0:
             # Чужие пропускаются молча — иначе разница между «перенесли пять» и
@@ -687,6 +810,9 @@ class PaymentsPage(QWidget):
         for payment in moved:
             payment.pay_date = day
             payment.status = PaymentStatus.MOVED
+            version_for = getattr(store.backend(), "version_for", None)
+            if version_for is not None:
+                payment.sync_revision = version_for(payment.id)
         # Перенос может вывести строку из отбора — за границу периода или мимо
         # выбранного статуса. Тогда её убираем: сервер при чтении не вернул бы
         # её тоже, и оставить значило бы показывать выборку, которой нет.
@@ -875,7 +1001,7 @@ class PaymentsPage(QWidget):
             self.period_filter.blockSignals(False)
         self.period_filter.setEnabled(not custom)
         self._refresh_filters_summary()
-        self.reload()
+        self.reload(force=False)
 
     def reset_filters(self) -> None:
         # Сигналы списков заглушены на время сброса: каждый из них подписан на
@@ -891,20 +1017,32 @@ class PaymentsPage(QWidget):
         self.amount_to.setValue(0)
         self.date_from.set_value(None)
         self.date_to.set_value(None)
-        self.reload()
+        self.reload(force=False)
 
     def bulk_edit(self) -> None:
+        if not self._source_ready():
+            return
+        source = _source_key()
         selected = [p for p in self.table.selected_items() if p is not None]
         if not selected:
             return
         dialog = BulkEditDialog(len(selected), self._known.get("responsible", []), self)
         if not dialog.exec():
             return
+        if source != _source_key():
+            self.notify("Сеанс изменился. Откройте оплату заново.", ToastKind.WARNING)
+            return
         changes = dialog.changes()
         if not changes:
             self.notify("Ничего не изменилось: все поля оставлены пустыми", ToastKind.INFO)
             return
-        count = store.update_many([p.id for p in selected], **changes)
+        try:
+            count = store.update_many([p.id for p in selected], **changes,
+                                      **_expected_versions(store.backend(), selected))
+        except transport.ServerError as failure:
+            self.notify(str(failure), ToastKind.ERROR)
+            self.reload()
+            return
         self.notify(f"Изменено оплат: {count}", ToastKind.SUCCESS)
         self.reload()
 
@@ -918,6 +1056,9 @@ class PaymentsPage(QWidget):
         можно удалить» не должно зависеть от того, на какой вкладке человек
         это делает.
         """
+        if not self._source_ready():
+            return
+        source = _source_key()
         if not payments:
             return
         total = money(sum(payment.amount for payment in payments))
@@ -929,7 +1070,19 @@ class PaymentsPage(QWidget):
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        removed = sum(1 for payment in payments if store.delete_payment(payment.id))
+        if source != _source_key():
+            self.notify("Сеанс изменился. Выберите оплаты заново.", ToastKind.WARNING)
+            return
+        try:
+            removed = 0
+            for payment in payments:
+                kwargs = ({"expected_revision": payment.sync_revision}
+                          if getattr(store.backend(), "version_for", None) is not None else {})
+                removed += bool(store.delete_payment(payment.id, **kwargs))
+        except transport.ServerError as failure:
+            self.notify(str(failure), ToastKind.ERROR)
+            self.reload()
+            return
         self.notify(f"Удалено оплат: {removed}", ToastKind.SUCCESS)
         self.reload()
 
@@ -1499,13 +1652,10 @@ class PaymentsPage(QWidget):
             store.save_budget(budget)
             self.notify(
                 f"Бюджет {budget.title.lower()}: {money(budget.amount)} ₽", ToastKind.SUCCESS)
-        self._load_budgets()
-        self.refresh_budget()
-        self.refresh_calendar()
-        self.refresh_dashboard()
+        self.reload()
 
-    def _load_budgets(self) -> None:
-        self._budgets = {b.period: b for b in store.budgets()}
+    def _apply_budgets(self, budgets: list[Budget]) -> None:
+        self._budgets = {b.period: b for b in budgets}
         years = sorted({b.year for b in self._budgets.values()} | {date.today().year})
         current = self.budget_year.currentData()
         self.budget_year.blockSignals(True)
@@ -1566,20 +1716,53 @@ class PaymentsPage(QWidget):
             selection.dds_item = title
         return selection
 
-    def reload(self) -> None:
-        """Перечитывает выборку. Все четыре вкладки обновляются из неё."""
+    def reload(self, *, force: bool = True) -> None:
+        """Читает в фоне; смена фильтра может использовать свежие справочники."""
+        self._reload_seq += 1
+        self._poll_timer.stop()
+        self._poll_inflight = False
+        if self._move_pending:
+            self._reload_pending = bool(self._reload_pending) or force
+            return
+        seq = self._reload_seq
+        source = _source_key()
+        metadata = self._metadata
+        if (force or self._metadata_source != source or metadata is None
+                or monotonic() - metadata.loaded_at >= METADATA_TTL
+                or metadata.day != date.today()):
+            metadata = None
+            self._metadata = None
+        self._loading = True
         self.progress.setVisible(True)
         run_task(
-            _load_all, self.current_filter(),
-            on_result=self._apply_data,
-            on_error=lambda message: self._failed(message))
+            _load_all, self.current_filter(), metadata, source[0],
+            on_result=lambda payload: self._loaded_result(seq, source, payload),
+            on_error=lambda message: self._load_failed(seq, source, message))
+
+    def _loaded_result(self, seq: int, source: tuple, payload: PaymentData) -> None:
+        if seq != self._reload_seq or source != _source_key():
+            return
+        self._metadata_source = source
+        self._loading = False
+        self._apply_data(payload)
+
+    def _load_failed(self, seq: int, source: tuple, message: str) -> None:
+        if seq != self._reload_seq:
+            return
+        self._loading = False
+        self.progress.setVisible(False)
+        if _source_error_is_current(source):
+            self._failed(message)
 
     def _failed(self, message: str) -> None:
         self.progress.setVisible(False)
         self.notify(message, ToastKind.ERROR)
 
-    def _apply_data(self, payload: tuple[list[Payment], dict[str, list[str]], int]) -> None:
-        rows, known, overdue = payload
+    def _apply_data(self, payload: PaymentData, *, check_conflicts: bool = True) -> None:
+        rows, metadata, overdue = payload.rows, payload.metadata, payload.overdue
+        known = metadata.known
+        self._metadata = metadata
+        self._sync_cursor = payload.cursor
         self.progress.setVisible(False)
         self.rows = rows
         self._known = known
@@ -1588,22 +1771,104 @@ class PaymentsPage(QWidget):
 
         self._fill_filter_lists(known)
         self._refresh_filters_summary()
-        self._load_budgets()
+        self._apply_budgets(metadata.budgets)
         self._refresh_views()
 
-        self._total = store.count_payments()
+        self._total = metadata.total
         self.empty.setVisible(self._total == 0)
         self.tabs.setVisible(self._total > 0)
         self.filters.setVisible(self._total > 0)
         self._update_subtitle()
-        unlinked = len(store.unlinked_recipients())
+        unlinked = metadata.unlinked
         self.link_button.setText(
             f"Привязать получателей ({unlinked})" if unlinked else "Привязать получателей")
         self.link_button.setEnabled(unlinked > 0)
         self.duplicates_button.setVisible(self._may_check_duplicates())
         if overdue:
             self.notify(f"Просроченными стали {overdue} оплат", ToastKind.WARNING)
-        self._check_conflicts()
+        if check_conflicts:
+            self._check_conflicts()
+        self._poll_delay = 2000
+        self._schedule_poll()
+
+    def _schedule_poll(self, delay: int | None = None) -> None:
+        if self._sync_cursor is not None and store.online() and self.isVisible():
+            self._poll_timer.start(
+                delay if delay is not None else self._poll_delay + random.randint(0, 250))
+
+    def _poll_changes(self) -> None:
+        if not store.online() or self._sync_cursor is None:
+            return
+        if not self.isVisible() or self._loading or self._move_pending:
+            self._schedule_poll()
+            return
+        source = _source_key()
+        if source != self._metadata_source:
+            self.reload()
+            return
+        if self._poll_inflight:
+            return
+        self._poll_inflight = True
+        seq = self._reload_seq
+        run_task(
+            _load_changes, self._sync_cursor, self.current_filter(), self._metadata, source[0],
+            on_result=lambda delta: self._apply_delta(seq, source, delta),
+            on_error=lambda message: self._poll_failed(seq, source, message))
+
+    def _apply_delta(self, seq: int, source: tuple, delta: PaymentDelta) -> None:
+        if seq != self._reload_seq:
+            return
+        self._poll_inflight = False
+        if source != _source_key():
+            self._schedule_poll(0)
+            return
+        changes = delta.changes
+        if changes.reset:
+            self._sync_cursor = None
+            # Direction/permission changes can move previously unloaded rows
+            # into this filter. Refresh its options before taking a new snapshot.
+            self._load_directions(after=self.reload)
+            return
+        self._sync_cursor = changes.cursor
+        self._poll_delay = 2000
+        if changes.upserted or changes.removed_ids or delta.metadata is not None:
+            rows = {row.id: row for row in self.rows}
+            for ident in changes.removed_ids:
+                rows.pop(ident, None)
+            rows.update({row.id: row for row in changes.upserted})
+            ordered = sorted(rows.values(), key=lambda row: (row.pay_date or date.min, row.id),
+                             reverse=True)
+            self._apply_data(PaymentData(ordered, delta.metadata or self._metadata,
+                                         cursor=changes.cursor), check_conflicts=False)
+        self._schedule_poll(50 if changes.more else None)
+
+    def _poll_failed(self, seq: int, source: tuple, message: str) -> None:
+        if seq != self._reload_seq:
+            return
+        self._poll_inflight = False
+        if not transport.session.active:
+            self._sync_cursor = None
+            if _source_error_is_current(source):
+                self.notify(message, ToastKind.WARNING)
+            # Authentication expiry switches data.backend() to SQLite. Never
+            # leave remote IDs editable against the local database or its dialogs.
+            for dialog in self.findChildren(QDialog):
+                dialog.reject()
+            self.rows = []
+            self._refresh_views()
+            self.reload()
+            return
+        # Preserve the cursor and last good rows; reconnect replays missed changes.
+        self._poll_delay = min(self._poll_delay * 2, 30000)
+        self._schedule_poll()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_poll(0)
+
+    def hideEvent(self, event) -> None:
+        self._poll_timer.stop()
+        super().hideEvent(event)
 
     def _refresh_views(self) -> None:
         """Пересобирает показанное из уже прочитанных строк.
@@ -1635,8 +1900,27 @@ class PaymentsPage(QWidget):
             builders[index]()
 
     def _refresh_table(self) -> None:
+        selected = {row.id for row in self.table.selected_items() if row is not None}
+        scroll = self.table.verticalScrollBar().value()
         self.table.set_items(self.rows)
+        if selected:
+            selection = QItemSelection()
+            for row in range(self.table.proxy.rowCount()):
+                index = self.table.proxy.index(row, 0)
+                payment = index.data(ROLE_PAYLOAD)
+                if payment is not None and payment.id in selected:
+                    selection.select(index, self.table.proxy.index(
+                        row, self.table.proxy.columnCount() - 1))
+            self.table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.Select)
+        self.table.verticalScrollBar().setValue(scroll)
         self._update_table_summary()
+
+    def _source_ready(self) -> bool:
+        if self._metadata_source is None or self._metadata_source == _source_key():
+            return True
+        self.notify("Сеанс или база изменились. Дождитесь обновления оплат.", ToastKind.WARNING)
+        self.reload()
+        return False
 
     def _update_subtitle(self) -> None:
         self.subtitle.setText(
@@ -1665,7 +1949,7 @@ class PaymentsPage(QWidget):
         run_task(directory.conflicts, on_result=show,
                  on_error=lambda _: self.conflicts_hint.hide())
 
-    def _load_directions(self) -> None:
+    def _load_directions(self, after: Callable[[], None] | None = None) -> None:
         """Наполняет список направлений с сервера.
 
         Отдельной задачей: список нужен один раз на вход, а не на каждое
@@ -1673,7 +1957,13 @@ class PaymentsPage(QWidget):
         возвращается к «Все направления»: отбор, который нечем посчитать,
         показывал бы неполный календарь под видом отфильтрованного.
         """
+        source = _source_key()
+
         def fill(items: list) -> None:
+            if source != _source_key():
+                if after is not None:
+                    after()
+                return
             current = self.direction_filter.currentData()
             self.direction_filter.blockSignals(True)
             self.direction_filter.clear()
@@ -1689,6 +1979,8 @@ class PaymentsPage(QWidget):
             self.direction_filter.setToolTip(
                 _direction_hint(items) if items
                 else "Направления доступны после входа в общую базу")
+            if after is not None:
+                after()
 
         run_task(directory.directions, on_result=fill, on_error=lambda _: fill([]))
 
@@ -1740,6 +2032,14 @@ class PaymentsPage(QWidget):
         закрыт, а показывать результат некому.
         """
         self._loaded = False
+        self._reload_seq += 1
+        self._metadata = None
+        self._sync_cursor = None
+        self._poll_timer.stop()
+        self._poll_inflight = False
+        self._loading = False
+        if not self._move_pending:
+            self.progress.setVisible(False)
 
     def _connect(self) -> None:
         """Вход в общую базу, если он настроен и ещё не выполнен.
@@ -1973,8 +2273,9 @@ class PaymentsPage(QWidget):
             comment=note.strip())
 
     def open_payment(self, payment: Payment) -> None:
-        if payment is None:
+        if payment is None or not self._source_ready():
             return
+        source = _source_key()
         known = self._known
         dialog = PaymentDialog(
             payment,
@@ -1985,12 +2286,17 @@ class PaymentsPage(QWidget):
             parent=self)
         if not dialog.exec():
             return
+        if source != _source_key():
+            self.notify("Сеанс изменился. Откройте оплату заново.", ToastKind.WARNING)
+            return
         result = dialog.result_payment()
         replaced = dialog.replacement_choice()
         try:
             store.save_payment(result)
-        except ValueError as failure:
+        except (ValueError, transport.ServerError) as failure:
             self.notify(str(failure), ToastKind.ERROR)
+            if isinstance(failure, transport.ServerError):
+                self.reload()
             return
         if replaced is not None and not self._settle_replaced(result, *replaced):
             self.reload()
@@ -2050,23 +2356,70 @@ def _ink(payment: Payment):
 
 def _load_all(
     selection: Filter,
-) -> tuple[list[Payment], dict[str, list[str]], int]:
-    """Читает выборку, справочные списки и пересчитывает просрочку."""
-    overdue = store.refresh_overdue()
-    rows = store.list_payments(selection, order="pay_date DESC, id DESC")
+    metadata: PaymentMetadata | None = None,
+    backend: Any = None,
+) -> PaymentData:
+    """Весь ввод-вывод выполняется до передачи результата интерфейсу."""
+    backend = backend or store.backend()
+    get_head = getattr(backend, "changes_head", None)
+    cursor = get_head() if get_head is not None else None
+    overdue = backend.refresh_overdue() if metadata is None else 0
+    rows = backend.list_payments(selection, order="pay_date DESC, id DESC")
+    direction_data = metadata.direction_data if metadata is not None else None
     if selection.direction:
         # Направления поставщиков — только на сервере, поэтому отбор идёт по
         # прочитанным строкам и одинаково для общей и для локальной базы.
-        known = directory.directions()
+        if direction_data is None:
+            known = directory.directions()
+            direction_data = (known, directory.direction_keys(known))
+        known, keys = direction_data
         rows = by_direction(
-            rows, selection.direction, directory.direction_keys(known),
+            rows, selection.direction, keys,
             {item.code for item in known if not item.for_people})
-    known = store.known_values()
+    if metadata is not None:
+        return PaymentData(rows, replace(metadata, direction_data=direction_data), overdue, cursor)
+    return PaymentData(rows, _load_metadata(backend, direction_data), overdue, cursor)
+
+
+def _load_metadata(backend: Any, direction_data=None) -> PaymentMetadata:
+    known = backend.known_values()
     # Справочник статей ДДС едет вместе с остальными списками карточки: сеть
     # здесь уже занята фоновой задачей, и отдельный поход при открытии
     # карточки заставил бы её ждать.
     known["dds_items"] = [item.title for item in dds.catalog()]
-    return rows, known, overdue
+    return PaymentMetadata(
+        known=known, budgets=backend.budgets(), total=backend.count_payments(),
+        unlinked=len(backend.unlinked_recipients()), loaded_at=monotonic(), day=date.today(),
+        direction_data=direction_data)
+
+
+def _load_changes(cursor: Cursor, selection: Filter, metadata: PaymentMetadata,
+                  backend: Any) -> PaymentDelta:
+    day_changed = metadata.day != date.today()
+    if day_changed:
+        backend.refresh_overdue()
+    changes = backend.changes_since(cursor, selection)
+    if changes.reset:
+        return PaymentDelta(changes)
+    # A large import may span several pages. Refresh shared dictionaries once,
+    # after replaying the last page, rather than on every intermediate page.
+    need_metadata = changes.metadata or cursor.metadata_dirty or day_changed
+    fresh = _load_metadata(backend) if need_metadata and not changes.more else None
+    current = fresh or metadata
+    if selection.direction:
+        direction_data = current.direction_data
+        if direction_data is None:
+            known = directory.directions()
+            direction_data = known, directory.direction_keys(known)
+            current = replace(current, direction_data=direction_data)
+            fresh = current
+        known, keys = direction_data
+        picked = by_direction(changes.upserted, selection.direction, keys,
+                              {item.code for item in known if not item.for_people})
+        excluded = {row.id for row in changes.upserted} - {row.id for row in picked}
+        changes = replace(changes, upserted=picked,
+                          removed_ids=sorted(set(changes.removed_ids) | excluded))
+    return PaymentDelta(changes, fresh)
 
 
 def _direction_hint(items: list) -> str:

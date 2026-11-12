@@ -36,6 +36,7 @@ jobs:
       POSTGRES_USER: retailcore_ci
       POSTGRES_PASSWORD: migration-test-password
       API_SECRET: ci-test-only-secret-xxxxxxxxxxxxxxxxxxxxxxxx
+      QT_QPA_PLATFORM: offscreen
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,8 +52,13 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r requirements-test.txt
 
+      - name: Install headless Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libopengl0
+
       - name: Check migrations and backup failures
-        run: python -m pytest tests/test_server_migrations.py tests/test_server_backup.py -q -ra --junitxml=server-test-results.xml
+        run: python -m pytest tests/test_server_migrations.py tests/test_server_backup.py tests/test_payment_changes_server.py -q -ra --junitxml=server-test-results.xml
 
       - name: Check compose and start a fresh server
         working-directory: server

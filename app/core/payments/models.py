@@ -144,6 +144,8 @@ class Payment:
     amount_before: float | None = None
     amount_changed_by: str = ""
     amount_changed_at: datetime | None = None
+    # None for SQLite and older servers. Zero is a valid initial server revision.
+    sync_revision: int | None = None
 
     @property
     def amount_changed(self) -> bool:

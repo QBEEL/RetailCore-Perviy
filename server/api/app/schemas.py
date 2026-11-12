@@ -69,6 +69,7 @@ class PaymentIn(BaseModel):
 
 
 class PaymentOut(BaseModel):
+    sync_revision: int = 0
     id: int
     doc_number: str
     request_date: date | None
@@ -123,6 +124,7 @@ class PaymentPatch(BaseModel):
     instead_of: str | None = None
     # Отдельный признак: иначе нельзя отличить «убрать дату» от «не трогать».
     clear_pay_date: bool = False
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class DdsItemIn(BaseModel):
@@ -148,11 +150,13 @@ class DdsMarkIn(BaseModel):
 class BulkPatch(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=5000)
     patch: PaymentPatch
+    expected_revisions: dict[int, int] | None = None
 
 
 class BulkResult(BaseModel):
     changed: int
     denied: list[int] = []
+    updated: list[PaymentOut] = []
 
 
 class BudgetIn(BaseModel):

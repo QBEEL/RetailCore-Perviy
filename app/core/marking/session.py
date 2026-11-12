@@ -170,15 +170,21 @@ def sign_in(thumbprint: str, inn: str = "",
     # Не смешиваем старую сессию с новым контуром, если ответ неполный.
     granted_token = _token(granted)
     expires_at = _expiry(granted)
+    granted_inn = inn.strip() or certificate.inn
+    same_identity = (session.thumbprint == certificate.thumbprint
+                     and session.inn == granted_inn
+                     and session.contour is contour)
+    granted_organisation = organisation.strip() or (
+        session.organisation if same_identity else "")
     session.contour = contour
     session.token = granted_token
     session.thumbprint = certificate.thumbprint
     session.owner = certificate.owner
-    session.inn = inn.strip() or certificate.inn
+    session.inn = granted_inn
     # Название организации приходит из списка, в котором её выбрали. При
-    # обновлении токена оно не передаётся — и тогда сохраняется прежнее, а не
-    # затирается пустотой.
-    session.organisation = organisation.strip() or session.organisation
+    # обновлении того же входа оно не передаётся — сохраняем прежнее.
+    # При смене сертификата, ИНН или контура чужое название не переносим.
+    session.organisation = granted_organisation
     session.expires_at = expires_at
     return session
 
@@ -298,10 +304,14 @@ def authorized(call: Callable[[str], Any]) -> Any:
 
     На 401 сервер запрос не исполнил, поэтому повтор не создаёт второй операции.
     """
+    current_token = token()
     try:
-        return call(token())
+        return call(current_token)
     except transport.AuthRequired:
-        session.clear()
+        # Другой запрос уже мог обновить токен, пока этот ждал ответ 401.
+        with session.lock:
+            if session.token == current_token:
+                session.clear()
         return call(token())
 
 

@@ -40,7 +40,7 @@ COLUMNS = (
     " p.source_status, p.paid_flag, p.operation, p.over_limit, p.priority,"
     " p.edo_state, p.responsible, p.author, p.comment, p.dds_item, p.instead_of, p.unplanned,"
     " p.had_files,"
-    " p.origin, p.origin_ref, p.created_at, p.updated_at,"
+    " p.origin, p.origin_ref, p.created_at, p.updated_at, p.sync_revision,"
     " (SELECT COUNT(*) FROM payment_file f WHERE f.payment_id = p.id) AS files,"
     " p.amount_before, p.amount_changed_at,"
     # Пометка без автора поставлена выгрузкой 1С — так её и называем.
@@ -390,7 +390,14 @@ def patch_payment(payment_id: int, form: PaymentPatch,
     # а не из запроса, поэтому подстановка их в текст SQL безопасна. Значения,
     # как и везде, уходят параметрами.
     sql, params = _update(values, user)
-    db.execute(f"{sql} WHERE id = %(id)s", {**params, "id": payment_id})
+    params.update(id=payment_id, owner=owner["responsible"])
+    condition = "id = %(id)s AND responsible = %(owner)s"
+    if form.expected_revision is not None:
+        condition += " AND sync_revision = %(revision)s"
+        params["revision"] = form.expected_revision
+    if not db.execute(f"{sql} WHERE {condition}", params):
+        raise HTTPException(status_code=409,
+                            detail="Оплата уже изменена другим пользователем. Обновите карточку.")
     # В журнал идёт то, что действительно поменялось, и прежнее значение рядом:
     # приложение присылает правку целиком, и по присланному не понять, что
     # человек тронул. Отметка об оплате следует за статусом и своей строкой не
@@ -427,16 +434,32 @@ def patch_many(form: BulkPatch,
     if not values:
         return BulkResult(changed=0)
 
-    rows = db.fetch_all(
-        "SELECT id, responsible, recipient, amount, pay_date, doc_number"
-        " FROM payment WHERE id = ANY(%s)", (form.ids,))
-    allowed = [r["id"] for r in rows if user.may_edit(r["responsible"])]
-    denied = [r["id"] for r in rows if not user.may_edit(r["responsible"])]
-    if not allowed:
-        return BulkResult(changed=0, denied=denied)
-
-    sql, params = _update(values, user)
-    changed = db.execute(f"{sql} WHERE id = ANY(%(ids)s)", {**params, "ids": allowed})
+    with db.cursor() as cursor:
+        # Same lock order as the journal triggers: global lock, then row locks.
+        cursor.execute("SELECT 1 FROM payment_sync_state WHERE singleton FOR UPDATE")
+        cursor.execute(
+            "SELECT id, responsible, recipient, amount, pay_date, doc_number, sync_revision"
+            " FROM payment WHERE id = ANY(%s) ORDER BY id FOR UPDATE", (form.ids,))
+        rows = cursor.fetchall()
+        allowed = [r["id"] for r in rows if user.may_edit(r["responsible"])]
+        denied = [r["id"] for r in rows if not user.may_edit(r["responsible"])]
+        expected = form.expected_revisions
+        if expected is not None:
+            found = {row["id"] for row in rows}
+            if (set(form.ids) != set(expected) or any(value < 0 for value in expected.values())):
+                raise HTTPException(status_code=422, detail="Нужны версии всех выбранных оплат")
+            if (set(form.ids) - found or any(
+                    row["id"] in allowed and expected[row["id"]] != row["sync_revision"]
+                    for row in rows)):
+                raise HTTPException(status_code=409,
+                                    detail="Выбранные оплаты уже изменены. Обновите список.")
+        if not allowed:
+            return BulkResult(changed=0, denied=denied)
+        sql, params = _update(values, user)
+        cursor.execute(f"{sql} WHERE id = ANY(%(ids)s)", {**params, "ids": allowed})
+        changed = cursor.rowcount
+        cursor.execute(f"SELECT {COLUMNS} FROM payment p WHERE p.id = ANY(%s)", (allowed,))
+        updated = [_out(row, user) for row in cursor.fetchall()]
     # Какие именно оплаты тронуты — первые десять словами: одно «записей: 40»
     # из журнала не расшифровать.
     touched = [f"№{r['id']} {auditlog.describe(auditlog.snapshot(r))}"
@@ -444,13 +467,14 @@ def patch_many(form: BulkPatch,
     _record(user, "payment", 0, "update_many",
             {"ids": len(allowed), "touched": touched[:10],
              **{k: str(v) for k, v in values.items() if k != "paid_flag"}})
-    return BulkResult(changed=changed, denied=denied)
+    return BulkResult(changed=changed, denied=denied, updated=updated)
 
 
 @router.delete("/{payment_id}", status_code=status.HTTP_204_NO_CONTENT,
                summary="Удалить оплату")
 def delete_payment(payment_id: int,
-                   user: User = Depends(security.current_user)) -> None:
+                   user: User = Depends(security.current_user),
+                   expected_revision: int | None = Query(default=None, ge=0)) -> None:
     row = db.fetch_one(
         "SELECT responsible, origin, recipient, amount, pay_date, doc_number,"
         "       status, comment FROM payment WHERE id = %s", (payment_id,))
@@ -466,7 +490,13 @@ def delete_payment(payment_id: int,
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Оплата пришла из 1С — удалить может только администратор")
-    db.execute("DELETE FROM payment WHERE id = %s", (payment_id,))
+    condition, params = "id = %s AND responsible = %s", [payment_id, row["responsible"]]
+    if expected_revision is not None:
+        condition += " AND sync_revision = %s"
+        params.append(expected_revision)
+    if not db.execute(f"DELETE FROM payment WHERE {condition}", params):
+        raise HTTPException(status_code=409,
+                            detail="Оплата уже изменена. Обновите список перед удалением.")
     # Оплаты больше нет, и журнал — единственное место, где остаётся, что это
     # было: поэтому сюда уходит всё существенное, включая статус и комментарий.
     about = auditlog.snapshot(row)

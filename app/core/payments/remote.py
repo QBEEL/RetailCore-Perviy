@@ -22,6 +22,7 @@ from typing import Any, Sequence
 
 from .. import appdata
 from . import transport
+from .live import Changes, Cursor
 from .models import (
     Budget,
     Payment,
@@ -72,7 +73,7 @@ def _origin(value: Any) -> PaymentOrigin:
         return PaymentOrigin.MANUAL
 
 
-def _payment(row: dict) -> Payment:
+def _payment(row: dict, *, owner: tuple | None = None) -> Payment:
     payment = Payment(
         id=int(row["id"]),
         doc_number=row["doc_number"],
@@ -109,10 +110,11 @@ def _payment(row: dict) -> Payment:
                        if row.get("amount_before") is not None else None),
         amount_changed_by=row.get("amount_changed_by") or "",
         amount_changed_at=_moment(row.get("amount_changed_at")),
+        sync_revision=(int(row["sync_revision"]) if row.get("sync_revision") is not None else None),
     )
     # Право на правку не входит в dataclass: он общий с локальным режимом.
     # Хранится рядом, читается через may_edit().
-    _remember(payment.id, bool(row.get("editable", False)))
+    _remember(payment.id, bool(row.get("editable", False)), payment.sync_revision, owner=owner)
     return payment
 
 
@@ -124,16 +126,37 @@ def _payment(row: dict) -> Payment:
 # право на саму открытую запись: своя оплата открывалась только на просмотр.
 # Накопленные права сбрасываются вместе со сменой пользователя, не раньше.
 _RIGHTS: dict[int, bool] = {}
-_RIGHTS_OWNER: str = ""
+_RIGHTS_OWNER: tuple | str = ""
+_VERSIONS: dict[int, int] = {}
+_FEED_EPOCH: tuple | None = None
 
 
-def _remember(payment_id: int, editable: bool) -> None:
+def _owner() -> tuple:
+    return (transport.session.base_url, transport.session.login, transport.session.user_id,
+            transport.session.token)
+
+
+def _remember(payment_id: int, editable: bool, revision: int | None = None, *,
+              owner: tuple | None = None) -> None:
     global _RIGHTS_OWNER
 
-    if _RIGHTS_OWNER != transport.session.login:
+    if owner is not None and owner != _owner():
+        return
+    if _RIGHTS_OWNER != _owner():
         _RIGHTS.clear()
-        _RIGHTS_OWNER = transport.session.login
+        _VERSIONS.clear()
+        _RIGHTS_OWNER = _owner()
+    if revision is not None and revision < _VERSIONS.get(payment_id, -1):
+        return  # A late, discarded poll must not overwrite a confirmed save.
     _RIGHTS[payment_id] = editable
+    if revision is not None:
+        _VERSIONS[payment_id] = revision
+    else:
+        _VERSIONS.pop(payment_id, None)
+
+
+def version_for(payment_id: int) -> int | None:
+    return _VERSIONS.get(payment_id) if _RIGHTS_OWNER == _owner() else None
 
 
 def may_edit(payment: Payment | int) -> bool:
@@ -148,7 +171,7 @@ def may_edit(payment: Payment | int) -> bool:
     if not payment_id:
         # Новая запись: создать её можно всегда, ответственный подставится свой.
         return True
-    if _RIGHTS_OWNER != transport.session.login:
+    if _RIGHTS_OWNER != _owner():
         return False
     return _RIGHTS.get(payment_id, False)
 
@@ -199,8 +222,9 @@ def list_payments(
     limit: int = 0,
 ) -> list[Payment]:
     """Отбор оплат. Порядок задаёт сервер, аргумент `order` не используется."""
+    owner = _owner()
     rows = transport.get("/api/payments", _params(selection))
-    payments = [_payment(row) for row in rows]
+    payments = [_payment(row, owner=owner) for row in rows]
     if selection and selection.origins:
         # Сервер старее клиента пропустит незнакомый отбор молча: лишние
         # параметры запроса FastAPI ошибкой не считает. Без этой проверки на
@@ -218,8 +242,9 @@ def list_payments(
 
 
 def get_payment(payment_id: int, path: str | None = None) -> Payment | None:
+    owner = _owner()
     try:
-        return _payment(transport.get(f"/api/payments/{payment_id}"))
+        return _payment(transport.get(f"/api/payments/{payment_id}"), owner=owner)
     except transport.ServerError as error:
         if error.status == 404:
             return None
@@ -232,13 +257,14 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
     Проверки повторяют локальные: отказать до обращения к серверу дешевле и
     понятнее, чем показать пользователю ответ об ошибке проверки полей.
     """
+    owner = _owner()
     if payment.amount <= 0:
         raise ValueError("Сумма оплаты должна быть больше нуля")
     if not (payment.recipient.strip() or payment.supplier_id):
         raise ValueError("У оплаты должен быть получатель")
 
     if payment.id:
-        row = transport.patch(f"/api/payments/{payment.id}", {
+        body = {
             "pay_date": payment.pay_date,
             "clear_pay_date": payment.pay_date is None,
             "status": payment.status.value,
@@ -249,7 +275,10 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "priority": payment.priority,
             "dds_item": payment.dds_item,
             "instead_of": payment.instead_of,
-        })
+        }
+        if payment.sync_revision is not None:
+            body["expected_revision"] = payment.sync_revision
+        row = transport.patch(f"/api/payments/{payment.id}", body)
     else:
         row = transport.post("/api/payments", {
             "pay_date": payment.pay_date,
@@ -274,12 +303,15 @@ def save_payment(payment: Payment, path: str | None = None) -> Payment:
             "origin": payment.origin.value,
             "origin_ref": payment.origin_ref,
         })
-    return _payment(row)
+    return _payment(row, owner=owner)
 
 
-def delete_payment(payment_id: int, path: str | None = None) -> bool:
+def delete_payment(payment_id: int, path: str | None = None, *,
+                   expected_revision: int | None = None) -> bool:
     try:
-        transport.delete(f"/api/payments/{payment_id}")
+        revision = expected_revision if expected_revision is not None else version_for(payment_id)
+        suffix = f"?expected_revision={revision}" if revision is not None else ""
+        transport.delete(f"/api/payments/{payment_id}{suffix}")
         return True
     except transport.ServerError as error:
         if error.status == 404:
@@ -295,6 +327,7 @@ def update_many(
     pay_date: date | None = None,
     responsible: str | None = None,
     supplier_id: int | None = None,
+    expected_revisions: dict[int, int] | None = None,
 ) -> int:
     """Массовое изменение. Возвращает число действительно изменённых строк.
 
@@ -318,9 +351,48 @@ def update_many(
             "Сменить ответственного можно только в настройках учётной записи")
     if not patch:
         return 0
-    answer = transport.patch("/api/payments",
-                             {"ids": list(ids), "patch": patch})
+    body = {"ids": list(ids), "patch": patch}
+    versions = expected_revisions or {ident: version_for(ident) for ident in ids}
+    if all(value is not None for value in versions.values()):
+        body["expected_revisions"] = versions
+    owner = _owner()
+    answer = transport.patch("/api/payments", body)
+    for row in answer.get("updated", []):
+        _payment(row, owner=owner)
     return int(answer.get("changed", 0))
+
+
+def changes_head() -> Cursor | None:
+    global _FEED_EPOCH
+    owner = _owner()
+    try:
+        row = transport.get("/api/payments/changes/head")
+    except transport.ServerError as error:
+        if error.status in (404, 405, 422):
+            return None  # Older server: normal loading remains available.
+        raise
+    cursor = Cursor(str(row["epoch"]), int(row["revision"]), str(row["access"]))
+    if owner == _owner() and _FEED_EPOCH != (owner, cursor.epoch):
+        _RIGHTS.clear()
+        _VERSIONS.clear()
+        _FEED_EPOCH = owner, cursor.epoch
+    return cursor
+
+
+def changes_since(cursor: Cursor, selection: Filter) -> Changes:
+    owner = _owner()
+    params = {key: value for key, value in _params(selection).items() if value is not None}
+    row = transport.post("/api/payments/changes", {
+        "epoch": cursor.epoch, "after": cursor.revision, "access": cursor.access,
+        "selection": params})
+    removed = [int(ident) for ident in row["removed_ids"]]
+    # removed_ids includes rows outside this filter, not just actual deletions.
+    # Keep cached rights/versions: another open card may still refer to them.
+    return Changes(
+        Cursor(str(row["epoch"]), int(row["revision"]), str(row["access"]),
+               bool(cursor.metadata_dirty or row["metadata"]) and bool(row["more"])),
+        [_payment(item, owner=owner) for item in row["upserted"]], removed,
+        bool(row["metadata"]), bool(row["reset"]), bool(row["more"]))
 
 
 def refresh_overdue(today: date | None = None, path: str | None = None) -> int:

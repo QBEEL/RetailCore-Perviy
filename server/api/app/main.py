@@ -19,6 +19,7 @@ from .routers import (
     imports,
     maintenance,
     payments,
+    payment_changes,
     recipients,
     reports,
     suppliers,
@@ -51,6 +52,7 @@ app = FastAPI(
 app.include_router(auth.router)
 app.include_router(ai.router)
 app.include_router(audit.router)
+app.include_router(payment_changes.router)
 app.include_router(payments.router)
 app.include_router(files.router)
 app.include_router(budgets.router)

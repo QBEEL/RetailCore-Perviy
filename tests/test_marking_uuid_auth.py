@@ -3,7 +3,9 @@
 Контракт: docs.crpt.ru/gismt/True_API/, разделы 1.5.1–1.5.2.
 Обмен и подпись подменены; закрытый ключ и реальные токены не используются.
 """
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier, Event
 
 import pytest
 
@@ -168,3 +170,95 @@ def test_uuid_is_sent_in_bearer_header(monkeypatch):
     transport.get("trueapi4", "/doc/list", contour=Contour.SANDBOX,
                   params={"pg": "cosmetics", "number": "doc-1"}, token=UUID_TOKEN)
     assert sent[0].get_header("Authorization") == "Bearer " + UUID_TOKEN
+
+
+@pytest.mark.parametrize("failure", ["missing-token", "expired-token"])
+def test_failed_login_is_not_retried_before_target_request(auth, failure):
+    calls, reply = auth
+    session.session.thumbprint = "certificate"
+    session.session.token = OLD_TOKEN
+    session.session.expires_at = datetime.now() + timedelta(seconds=30)
+    if failure == "missing-token":
+        reply.pop("uuidToken")
+        reply.pop("token")
+    else:
+        reply["expireDate"] = "2000-01-01T00:00:00Z"
+    requested = []
+
+    with pytest.raises(transport.AuthRequired):
+        session.authorized(lambda token: requested.append(token))
+
+    assert requested == []
+    assert len(calls["signed"]) == len(calls["post"]) == 1
+    assert session.session.token == OLD_TOKEN
+
+
+def test_second_401_is_propagated_without_another_login(auth):
+    calls, _ = auth
+    session.session.thumbprint = "certificate"
+    session.session.token = OLD_TOKEN
+    session.session.expires_at = datetime.now() + timedelta(hours=1)
+    requested = []
+
+    def denied(token):
+        requested.append(token)
+        raise transport.AuthRequired("denied", 401)
+
+    with pytest.raises(transport.AuthRequired, match="denied"):
+        session.authorized(denied)
+
+    assert requested == [OLD_TOKEN, UUID_TOKEN]
+    assert len(calls["signed"]) == len(calls["post"]) == 1
+
+
+def test_delayed_401_reuses_token_refreshed_by_another_thread(auth):
+    calls, _ = auth
+    session.session.thumbprint = "certificate"
+    session.session.token = OLD_TOKEN
+    session.session.expires_at = datetime.now() + timedelta(hours=1)
+    both_requested = Barrier(2)
+    first_retried = Event()
+
+    def first(token):
+        if token == OLD_TOKEN:
+            both_requested.wait(timeout=5)
+            raise transport.AuthRequired("expired", 401)
+        first_retried.set()
+        return token
+
+    def delayed(token):
+        if token == OLD_TOKEN:
+            both_requested.wait(timeout=5)
+            assert first_retried.wait(timeout=5), "first request did not retry"
+            raise transport.AuthRequired("expired", 401)
+        return token
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_result = pool.submit(session.authorized, first)
+        delayed_result = pool.submit(session.authorized, delayed)
+        assert first_result.result(timeout=10) == UUID_TOKEN
+        assert delayed_result.result(timeout=10) == UUID_TOKEN
+
+    assert len(calls["signed"]) == len(calls["post"]) == 1
+    assert session.session.token == UUID_TOKEN
+
+
+@pytest.mark.parametrize("thumbprint, inn, contour", [
+    ("other-certificate", "1234567890", Contour.PRODUCTION),
+    ("certificate", "2222222222", Contour.PRODUCTION),
+    ("certificate", "1234567890", Contour.SANDBOX),
+])
+def test_changed_identity_does_not_inherit_organisation_name(auth, thumbprint, inn, contour):
+    session.session.thumbprint = "certificate"
+    session.session.inn = "1234567890"
+    session.session.contour = Contour.PRODUCTION
+    session.session.organisation = "Previous organisation"
+
+    result = session.sign_in(thumbprint, inn, contour)
+
+    assert result.organisation == ""
+    assert result.inn == inn
+    assert result.thumbprint == thumbprint
+    assert result.contour is contour
+    assert result.title == result.owner + (
+        "" if contour is Contour.PRODUCTION else " · песочница")

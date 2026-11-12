@@ -653,7 +653,7 @@ def filter_page(application, monkeypatch, tmp_path):
     monkeypatch.setattr(store, "database_path", lambda: str(tmp_path / "p.db"))
     monkeypatch.setattr(data, "online", lambda: False)
     widget = module.PaymentsPage(AppSettings(), lambda text, kind: None)
-    monkeypatch.setattr(widget, "reload", lambda: None)
+    monkeypatch.setattr(widget, "reload", lambda **kwargs: None)
     widget._fill_filter_lists({"dds_items": ["Аренда", "Клининг", BEAUTY]})
     return widget
 

@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import socket
@@ -140,21 +141,27 @@ def _url(path: str, params: dict[str, Any] | None = None) -> str:
 def _send(request: urllib.request.Request) -> Any:
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT, context=net.context) as response:
-            body = response.read()
+            body = _response_body(response)
             return json.loads(body) if body else None
     except urllib.error.HTTPError as error:
-        raise _failure(error) from None
-    except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as error:
+        raise _failure(error, authorization=request.get_header("Authorization")) from None
+    except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError, EOFError) as error:
         raise OfflineError(
             "Сервер оплат недоступен. Проверьте подключение к сети."
             f"\n\nПодробности: {error}") from None
 
 
-def _failure(error: urllib.error.HTTPError) -> ServerError:
+def _response_body(response: Any) -> bytes:
+    body = response.read()
+    encoding = response.headers.get("Content-Encoding", "").strip().lower()
+    return gzip.decompress(body) if body and encoding == "gzip" else body
+
+
+def _failure(error: urllib.error.HTTPError, *, authorization: str | None = None) -> ServerError:
     """Ответ об ошибке → исключение с человеческим текстом."""
     try:
-        detail = json.loads(error.read()).get("detail", "")
-    except (ValueError, AttributeError):
+        detail = json.loads(_response_body(error)).get("detail", "")
+    except (ValueError, AttributeError, OSError, EOFError):
         detail = ""
     if isinstance(detail, list):
         # Ошибка проверки полей от FastAPI приходит списком.
@@ -162,14 +169,17 @@ def _failure(error: urllib.error.HTTPError) -> ServerError:
     if error.code in (401, 403) and not detail:
         detail = "Недостаточно прав"
     if error.code == 401:
-        session.clear()
+        # Запоздалый ответ старой задачи не должен завершать новый вход.
+        if authorization is None or authorization == f"Bearer {session.token}":
+            session.clear()
         return AuthError(detail or "Требуется вход", 401)
     return ServerError(detail or f"Сервер ответил кодом {error.code}", error.code)
 
 
 def _request(method: str, path: str, *, params: dict | None = None,
              body: Any = None, authorized: bool = True) -> Any:
-    data, headers = None, {"Accept": "application/json", **CLIENT_HEADERS}
+    data, headers = None, {"Accept": "application/json", "Accept-Encoding": "gzip",
+                           **CLIENT_HEADERS}
     if body is not None:
         data = json.dumps(body, default=_encode).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -258,7 +268,7 @@ def download(path: str, target: str) -> str:
                     handle.write(chunk)
     except urllib.error.HTTPError as error:
         _drop(partial)
-        raise _failure(error) from None
+        raise _failure(error, authorization=request.get_header("Authorization")) from None
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as error:
         _drop(partial)
         raise OfflineError(f"Не удалось скачать вложение: {error}") from None

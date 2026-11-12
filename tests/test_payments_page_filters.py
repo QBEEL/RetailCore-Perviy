@@ -50,7 +50,7 @@ def page(application, monkeypatch, tmp_path):
 
     widget = module.PaymentsPage(AppSettings(), lambda text, kind: None)
     widget.rows = store.list_payments(path=database)
-    monkeypatch.setattr(widget, "reload", lambda: None)
+    monkeypatch.setattr(widget, "reload", lambda **kwargs: None)
     widget.year, widget.month = 2026, 9
     return widget
 
@@ -135,7 +135,7 @@ def test_сброс_очищает_новые_отборы(page):
 def test_сброс_перезагружает_выборку_один_раз(page, monkeypatch):
     """Каждый список подписан на `reload` — сброс не должен звать его шесть раз."""
     calls: list[int] = []
-    monkeypatch.setattr(page, "reload", lambda: calls.append(1))
+    monkeypatch.setattr(page, "reload", lambda **kwargs: calls.append(1))
     page.origin_filter.setCurrentIndex(page.origin_filter.findData(PaymentOrigin.PLAN.value))
     calls.clear()
     page.reset_filters()
@@ -416,12 +416,12 @@ def test_выборка_отбирается_по_направлению(monkeyp
     monkeypatch.setattr(module.directory, "direction_keys",
                         lambda known=None: {"суперкосметикс": ("beauty",)})
 
-    picked, _, _ = module._load_all(Filter(direction="beauty"))
+    picked = module._load_all(Filter(direction="beauty")).rows
     assert [p.amount for p in picked] == [1.0]
-    picked, _, _ = module._load_all(Filter(direction="fashion"))
+    picked = module._load_all(Filter(direction="fashion")).rows
     assert [p.amount for p in picked] == [2.0]
-    picked, _, _ = module._load_all(Filter(direction="none"))
+    picked = module._load_all(Filter(direction="none")).rows
     assert [p.amount for p in picked] == [3.0]
     # Аренда по операции 1С — важнее того, что её оформила Баранова.
-    picked, _, _ = module._load_all(Filter(direction="rent"))
+    picked = module._load_all(Filter(direction="rent")).rows
     assert [p.amount for p in picked] == [4.0]

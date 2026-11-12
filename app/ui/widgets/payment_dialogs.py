@@ -186,6 +186,7 @@ class PaymentDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.payment = payment
+        self._source = self._source_key()
         self._dds_items = list(dds_items) if dds_items else list(dds.BUILTIN_ITEMS)
         self.db_path = db_path
         # Кого заменяли при открытии: пока поле не тронуто, заменять нечего.
@@ -205,6 +206,17 @@ class PaymentDialog(QDialog):
         self._apply_rights()
 
     # --- левая часть: поля ----------------------------------------------------
+
+    @staticmethod
+    def _source_key() -> tuple:
+        account = transport.session
+        return store.backend(), account.base_url, account.login, account.token
+
+    def _source_valid(self) -> bool:
+        if self._source == self._source_key():
+            return True
+        self.error.setText("Сеанс или база изменились. Закройте и откройте карточку заново.")
+        return False
 
     def _fields(
         self,
@@ -703,6 +715,8 @@ class PaymentDialog(QDialog):
                 + (" · не было запланировано" if payment.unplanned else ""))
 
     def _reload_files(self) -> None:
+        if not self._source_valid():
+            return
         self.files.clear()
         if not self.payment.id:
             self.detach_button.setEnabled(False)
@@ -718,11 +732,15 @@ class PaymentDialog(QDialog):
         self.detach_button.setEnabled(bool(attachments))
 
     def _attach(self) -> None:
+        if not self._source_valid():
+            return
         if not self.payment.id:
             self.error.setText("Сначала сохраните оплату — потом приложите документы")
             return
         paths, _ = QFileDialog.getOpenFileNames(self, "Документы к оплате", "", "Все файлы (*.*)")
         for path in paths:
+            if not self._source_valid():
+                return
             try:
                 store.attach_file(self.payment.id, path, self.db_path)
             except (OSError, ValueError, transport.ServerError) as failure:
@@ -732,6 +750,8 @@ class PaymentDialog(QDialog):
         self._reload_files()
 
     def _detach(self) -> None:
+        if not self._source_valid():
+            return
         item = self.files.currentItem()
         if item is None:
             return
@@ -739,6 +759,8 @@ class PaymentDialog(QDialog):
         self._reload_files()
 
     def _open_file(self, item: QListWidgetItem) -> None:
+        if not self._source_valid():
+            return
         wanted = int(item.data(Qt.ItemDataRole.UserRole))
         for attachment in store.files(self.payment.id, self.db_path):
             if attachment.id != wanted or not store.file_available(attachment):
@@ -754,6 +776,8 @@ class PaymentDialog(QDialog):
             try:
                 # У серверного вложения локального пути нет — оно скачивается
                 # при первом открытии и потом берётся из кэша.
+                if not self._source_valid():
+                    return
                 os.startfile(store.open_path(attachment))  # noqa: S606
             except (OSError, ValueError) as failure:
                 self.error.setText(f"Не удалось открыть вложение: {failure}")
@@ -777,6 +801,8 @@ class PaymentDialog(QDialog):
         return payment
 
     def _accept(self) -> None:
+        if not self._source_valid():
+            return
         if self.dds_item.has_unmatched_text():
             self.error.setText("Статьи ДДС нет в списке: выберите её из выпадающего списка "
                                "или очистите поле")
