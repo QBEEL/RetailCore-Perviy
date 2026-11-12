@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import db, migrations
+from .version import API_VERSION
 from .routers import (
     ai,
     audit,
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RetailCore — оплаты",
     description="Общая база оплат поставщикам для категорийных менеджеров.",
-    version="1.0.0",
+    version=API_VERSION,
     lifespan=lifespan,
 )
 
@@ -68,6 +69,11 @@ app.include_router(suppliers.router)
 app.include_router(sync.router)
 app.include_router(torg.router)
 app.include_router(users.router)
+
+
+@app.get("/api/version", tags=["Служебное"], summary="Версия API")
+def api_version() -> dict[str, str]:
+    return {"version": API_VERSION}
 
 
 @app.get("/api/health", tags=["Служебное"], summary="Проверка живости")

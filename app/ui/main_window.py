@@ -25,6 +25,7 @@ from ..core import changelog, mail
 from ..core.settings import AppSettings
 from ..core.vpn import VpnManager
 from . import icons
+from .tasks import run_task
 from .catalog_page import CatalogPage
 from .claims_page import ClaimsPage
 from .claims_watch import ClaimsWatcher, NavBadge, describe
@@ -117,6 +118,11 @@ class MainWindow(QMainWindow):
         # оплатами наедине и без переключателя, которым это видно.
         payments_data.set_local_only(
             settings.payment_local_base and transport.session.is_admin)
+        self._api_version = ""
+        self._api_version_source: tuple[str, str, bool] | None = None
+        self._api_version_gen = 0
+        self._api_version_inflight = False
+        self._version_label: QLabel | None = None
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(icons.app_icon())
 
@@ -199,6 +205,68 @@ class MainWindow(QMainWindow):
             self._watch_vpn(vpn)
         self._apply_tray_setting()
 
+    def _format_version_text(self, api_version: str = "") -> str:
+        resolved = (api_version or "").strip() or "—"
+        return f"версия {__version__} · API {resolved}"
+
+    def _set_api_version(self, api_version: str) -> None:
+        self._api_version = (api_version or "").strip()
+        text = self._format_version_text(self._api_version)
+        if self._version_label is not None:
+            self._version_label.setText(text)
+            self._version_label.setToolTip(text)
+        if hasattr(self, "_collapse_button") and self._collapse_button is not None:
+            self._collapse_button.setToolTip(f"{APP_TITLE} ({text})")
+
+    def _current_api_version_source(self) -> tuple[str, str, bool]:
+        base_url = (
+            ((transport.session.base_url or "").strip() if transport.session.active else "")
+            or (getattr(self.settings, "payment_server", "") or "").strip()
+        ).rstrip("/")
+        token = (getattr(transport.session, "token", "") or "").strip()
+        return (base_url, token, bool(self.offline))
+
+    def _refresh_api_version(self, *, force: bool = False) -> None:
+        source = self._current_api_version_source()
+        source_changed = source != self._api_version_source
+        if source_changed:
+            self._api_version_source = source
+            self._api_version_gen += 1
+            self._api_version_inflight = False
+            self._set_api_version("")
+        elif not force:
+            return
+        else:
+            self._api_version_gen += 1
+
+        base_url, _token, is_offline = source
+        if is_offline or not base_url:
+            self._api_version_inflight = False
+            self._set_api_version("")
+            return
+
+        req_gen = self._api_version_gen
+        req_source = source
+        self._api_version_inflight = True
+
+        def _on_done(resolved: str) -> None:
+            if req_gen != self._api_version_gen or req_source != self._current_api_version_source():
+                return
+            self._api_version_inflight = False
+            self._set_api_version(resolved if isinstance(resolved, str) else "")
+
+        def _on_error(_msg: str) -> None:
+            if req_gen != self._api_version_gen or req_source != self._current_api_version_source():
+                return
+            self._api_version_inflight = False
+            self._set_api_version("")
+
+        run_task(
+            lambda: transport.fetch_api_version(base_url),
+            on_result=_on_done,
+            on_error=_on_error,
+        )
+
     def _watch_vpn(self, vpn: VpnManager) -> None:
         """Следит за туннелем: упавший sing-box нужно заметить сразу.
 
@@ -255,9 +323,11 @@ class MainWindow(QMainWindow):
         brand.setObjectName("Brand")
         brand.setContentsMargins(8, 0, 0, 0)
         brand_layout.addWidget(brand)
-        version = QLabel(f"версия {__version__}", self._brand_box)
+        version = QLabel(self._format_version_text(self._api_version), self._brand_box)
         version.setObjectName("BrandSub")
+        version.setTextFormat(Qt.TextFormat.PlainText)
         version.setContentsMargins(8, 0, 0, 0)
+        self._version_label = version
         brand_layout.addWidget(version)
         header.addWidget(self._brand_box, 1)
         self._collapse_button = QToolButton(bar)
@@ -438,6 +508,8 @@ class MainWindow(QMainWindow):
         # В свёрнутом меню имя не видно, а учётку на общей базе перепутать легко.
         self._profile_button.setToolTip(
             f"Личный кабинет: {label} (Ctrl+P)" if collapsed else "Личный кабинет (Ctrl+P)")
+        self._set_api_version(self._api_version)
+        self._refresh_api_version()
 
     def _lock_server_pages(self) -> None:
         """Гасит разделы общей базы, когда работаем без сервера.

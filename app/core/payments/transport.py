@@ -16,6 +16,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -32,6 +33,62 @@ from .. import net
 from .safe_files import safe_name
 
 TIMEOUT = 120
+VERSION_TIMEOUT = 5
+_SEMVER_RE = re.compile(r"^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})(?:-[0-9A-Za-z.-]{1,32})?$")
+
+
+def _valid_semver(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > 48:
+        return ""
+    return cleaned if _SEMVER_RE.fullmatch(cleaned) else ""
+
+
+def fetch_api_version(base_url: str) -> str:
+    """Запрашивает публичную версию API без изменения текущей сессии."""
+    cleaned_base = (base_url or "").strip().rstrip("/")
+    if not cleaned_base:
+        return ""
+    parsed = urllib.parse.urlparse(cleaned_base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        **CLIENT_HEADERS,
+    }
+    request = urllib.request.Request(
+        f"{cleaned_base}/api/version",
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=VERSION_TIMEOUT,
+            context=net.context,
+        ) as response:
+            if getattr(response, "status", 200) != 200:
+                return ""
+            body = _response_body(response)
+            if not body or len(body) > 4096:
+                return ""
+            payload = json.loads(body)
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        socket.timeout,
+        ssl.SSLError,
+        OSError,
+        EOFError,
+        ValueError,
+    ):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return _valid_semver(payload.get("version"))
 
 
 def _platform() -> str:
