@@ -1760,7 +1760,7 @@ def _issue_page(application, tmp_path, stub, monkeypatch):
     return page, seen
 
 
-def test_коды_забираются_сохраняются_и_сразу_идут_на_печать(application, tmp_path,
+def test_коды_сохраняются_без_автоматической_печати(application, tmp_path,
                                                             stub, monkeypatch):
     page, seen = _issue_page(application, tmp_path, stub, monkeypatch)
 
@@ -1770,10 +1770,10 @@ def test_коды_забираются_сохраняются_и_сразу_ид
     assert seen["asked"] == ["3a8f-0001"]
     assert seen["dialog_products"]["04601234567893"].tnved == "3303001000"
     assert seen["fetched"][0][:3] == ("3a8f-0001", "04601234567893", 3)
-    # Блок лежит на диске и виден в списке, а окно печати открылось само.
+    # Блок сохранён и виден в списке; печать запускается отдельно.
     assert page.batches.rowCount() == 1
     assert page.batches.item(0, 2).text() == "3"
-    assert seen["printed"] == ["blk-1"]
+    assert seen["printed"] == []
     assert page.order_tabs.currentIndex() == 1
 
 

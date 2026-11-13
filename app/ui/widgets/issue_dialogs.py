@@ -288,7 +288,7 @@ class PrintDialog(QDialog):
         self.start.setValue(min(self.batch.printed + 1, max(1, self.batch.total)))
         self.count = QSpinBox(self)
         self.count.setRange(1, max(1, self.batch.total))
-        self.count.setValue(max(1, self.batch.left))
+        self.count.setValue(max(1, self.batch.next_print_count))
         rng = QGridLayout()
         rng.setHorizontalSpacing(8)
         rng.setColumnStretch(0, 1)
@@ -385,7 +385,7 @@ class PrintDialog(QDialog):
         self.count.setMaximum(max(1, left))
         self.count.blockSignals(False)
         self.range_hint.setText(
-            f"выбрано {len(selected)}, уже напечатано {self.batch.printed} "
+            f"выбрано {len(selected)}, уже напечатано {self.batch.printed_count} "
             f"из {self.batch.total}")
         self.print_button.setText(f"Печатать {len(selected)}"
                                   if not pdf else f"В PDF {len(selected)}")
@@ -479,8 +479,8 @@ class PrintDialog(QDialog):
             # Прогресс запоминается порциями: запись на диск после каждой
             # этикетки замедлила бы печать, а потерять при сбое хочется
             # немногое.
-            if done % 25 == 0:
-                issue.mark_printed(self.batch, first + done)
+            if done % 25 == 0 and not target[1]:
+                issue.mark_printed_range(self.batch, first, first + done)
             QApplication.processEvents()
             return not progress.wasCanceled()
 
@@ -493,19 +493,24 @@ class PrintDialog(QDialog):
             self._fail(str(error))
         finally:
             progress.close()
-            if done:
-                issue.mark_printed(self.batch, first + done)
+            if done and not target[1]:
+                issue.mark_printed_range(self.batch, first, first + done)
                 self.printed_now += done
+        if done and target[1]:
+            self._remember()
+            self.hint.setStyleSheet("")
+            self.hint.setText(f"PDF: {done}. {target[1]}")
+            return
         if done:
             self._remember()
             self.start.setMaximum(max(1, self.batch.total))
             self.start.setValue(min(self.batch.printed + 1, self.batch.total))
-            self.count.setValue(max(1, self.batch.left))
+            self.count.setValue(max(1, self.batch.next_print_count))
             self._refresh()
             self.hint.setStyleSheet("")
             self.hint.setText(
                 f"Отправлено на печать: {done}. Напечатано всего "
-                f"{self.batch.printed} из {self.batch.total}."
+                f"{self.batch.printed_count} из {self.batch.total}."
                 + ("" if self.batch.left else " Блок напечатан целиком."))
 
     def _fail(self, message: str) -> None:

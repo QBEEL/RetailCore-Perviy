@@ -97,6 +97,10 @@ from .widgets.common import (
 )
 from .widgets.expiry_tab import ExpiryTab
 from .widgets.issue_dialogs import IntroduceDialog, IssueDialog, PrintDialog
+from .widgets.print_queue_dialog import PrintQueueDialog
+from .widgets.bulk_issue_dialog import BulkIssueDialog
+from .widgets.code_status_dialog import CodeStatusDialog
+from ..core.marking import bulk_issue
 from .widgets.order_dialog import OrderDialog, _plural
 from .widgets.marking_dialogs import (
     CodeInfoDialog,
@@ -652,6 +656,9 @@ class MarkingPage(QWidget):
             "переезжает в подпапку «deleted» — вернуть его можно руками")
         self.batch_delete_button.setEnabled(False)
         header.addWidget(self.batch_delete_button)
+        code_status_button = QPushButton("Статусы марок", card)
+        code_status_button.clicked.connect(self.show_batch_statuses)
+        header.addWidget(code_status_button)
         header.addWidget(self._icon_action(card, "Открыть папку с кодами", "folder",
                                            self.open_batches_folder))
         header.addWidget(self._icon_action(card, "Обновить список блоков", "refresh",
@@ -663,7 +670,7 @@ class MarkingPage(QWidget):
             ["Получен", "Товар", "Всего", "Напечатано", "Ввод в оборот"])
         self.batches.verticalHeader().setVisible(False)
         self.batches.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.batches.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.batches.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.batches.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         head = self.batches.horizontalHeader()
         head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -1763,6 +1770,18 @@ class MarkingPage(QWidget):
         self._set_busy(False)
         self._adopt_credentials(credentials)
         self._sync_orders_hint()
+        if sum(buffer.left > 0 for buffer in order.buffers) > 1:
+            dialog = BulkIssueDialog(order, products, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._set_busy(True)
+            self.orders_hint.setText("Получаем выбранные товары и сохраняем блоки…")
+            run_task(bulk_issue.fetch, self.suz_credentials, order, dialog.requests,
+                     self.contour, self.thumbprint, self.settings.marking_inn,
+                     on_progress=lambda done, total: self.orders_hint.setText(
+                         f"Получено товаров: {done} из {total}. Блоки сохранены на диск."),
+                     on_result=self._on_bulk_fetched, on_error=self._on_fetch_error)
+            return
         dialog = IssueDialog(order, products, self.contour, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1787,7 +1806,28 @@ class MarkingPage(QWidget):
         self.order_tabs.setCurrentIndex(1)
         self.notify(f"Получено кодов: {batch.total}. Сохранены на диск: "
                     f"{issue_module.folder()}", ToastKind.SUCCESS)
-        self.print_batch()
+
+    def _on_bulk_fetched(self, outcome):
+        batches, credentials, error = outcome
+        self._set_busy(False)
+        self._adopt_credentials(credentials)
+        self.reload_batches()
+        self.reload_orders()
+        self.order_tabs.setCurrentIndex(1)
+        message = f"Сохранено блоков: {len(batches)}, кодов: {sum(b.total for b in batches)}."
+        if error:
+            message += f" Получение остановлено: {error}. Проверьте заказ перед повтором."
+        self.notify(message, ToastKind.WARNING if error else ToastKind.SUCCESS)
+
+    def show_batch_statuses(self):
+        rows = sorted({i.row() for i in self.batches.selectionModel().selectedRows()})
+        batches = [self._batches[row] for row in rows]
+        if not batches or any(batch.contour != self.contour.value for batch in batches):
+            self.notify("Выберите блоки текущего контура для проверки статусов.", ToastKind.WARNING)
+            return
+        dialog = CodeStatusDialog(batches, self.contour, self)
+        dialog.load()
+        dialog.exec()
 
     def _on_fetch_error(self, message: str) -> None:
         self._set_busy(False)
@@ -1965,7 +2005,7 @@ class MarkingPage(QWidget):
             stamp = issue_module.parse_stamp(batch.created)
             when = f"{stamp:%d.%m.%Y %H:%M}" if stamp else "—"
             product = f"{batch.name} · {batch.gtin}" if batch.name else batch.gtin
-            done = f"{batch.printed} из {batch.total}"
+            done = f"{batch.printed_count} из {batch.total}"
             introduced = _introduced_text(batch)
             for column, text in enumerate((when, product, str(batch.total), done,
                                            introduced)):
@@ -1974,15 +2014,17 @@ class MarkingPage(QWidget):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignRight
                                           | Qt.AlignmentFlag.AlignVCenter)
                 self.batches.setItem(row, column, cell)
-            if batch.printed >= batch.total:
+            if batch.printed_count >= batch.total:
                 self.batches.item(row, 3).setForeground(QColor(Palette.SUCCESS))
-            elif batch.printed:
+            elif batch.printed_count:
                 self.batches.item(row, 3).setForeground(QColor(Palette.WARNING))
             if batch.id == current:
                 self.batches.selectRow(row)
         self._sync_batches_hint()
 
     def _selected_batch(self):
+        if len(self.batches.selectionModel().selectedRows()) > 1:
+            return None
         row = self.batches.currentRow()
         return self._batches[row] if 0 <= row < len(self._batches) else None
 
@@ -1996,16 +2038,27 @@ class MarkingPage(QWidget):
             return
         if batch is None:
             self.batches_hint.setText(
-                f"Блоков: {len(self._batches)}. Выберите блок, чтобы напечатать "
-                "его или подготовить файл ввода в оборот.")
+                f"Блоков: {len(self._batches)}. Выберите несколько строк с Ctrl или Shift "
+                "для общей очереди печати. Для ввода в оборот выберите один блок.")
             return
         tail = (" Напечатано не всё — «Печать…» продолжит с первой ненапечатанной."
-                if 0 < batch.printed < batch.total else "")
+                if 0 < batch.printed_count < batch.total else "")
         self.batches_hint.setText(
-            f"Выбран блок на {batch.total} кодов, напечатано {batch.printed}."
+            f"Выбран блок на {batch.total} кодов, напечатано {batch.printed_count}."
             f"{tail}")
 
     def print_batch(self) -> None:
+        rows = sorted({index.row() for index in self.batches.selectionModel().selectedRows()})
+        if len(rows) > 1:
+            selected = [self._batches[row] for row in rows]
+            try:
+                dialog = PrintQueueDialog(selected, self)
+            except ValueError as error:
+                self.notify(str(error), ToastKind.WARNING)
+                return
+            dialog.exec()
+            self.reload_batches()
+            return
         batch = self._selected_batch()
         if batch is None:
             self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
@@ -2020,8 +2073,8 @@ class MarkingPage(QWidget):
             self.notify("Выберите блок кодов в списке", ToastKind.WARNING)
             return
         lines = [f"{batch.name or batch.gtin} · {batch.total} кодов, напечатано "
-                 f"{batch.printed}."]
-        if batch.printed < batch.total:
+                 f"{batch.printed_count}."]
+        if batch.printed_count < batch.total:
             lines.append(f"\nНе напечатано ещё {batch.left} этикеток.")
         if not batch.introduced and not batch.doc_id:
             lines.append("\nВ оборот этот блок не вводился.")

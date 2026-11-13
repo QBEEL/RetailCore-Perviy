@@ -50,7 +50,7 @@ def _save_to(monkeypatch, path: Path) -> None:
                         staticmethod(lambda *args, **kwargs: (str(path), "")))
 
 
-def test_печать_в_pdf_ставит_отметку_и_пишет_страницу_на_этикетку(
+def test_экспорт_pdf_не_ставит_отметку_печати(
         application, batch, tmp_path, monkeypatch):
     target = tmp_path / "labels.pdf"
     _save_to(monkeypatch, target)
@@ -61,10 +61,10 @@ def test_печать_в_pdf_ставит_отметку_и_пишет_стра�
     dialog._print()
 
     assert target.exists() and target.stat().st_size > 0
-    assert dialog.printed_now == 3
-    assert issue.load("b1").printed == 3
-    # Следующая печать продолжит с четвёртой этикетки.
-    assert dialog.start.value() == 4
+    assert dialog.printed_now == 0
+    assert issue.load("b1").printed == 0
+    # После экспорта физическая печать начинается с первой этикетки.
+    assert dialog.start.value() == 1
 
 
 def test_допечатка_начинается_с_первой_ненапечатанной(application, batch):

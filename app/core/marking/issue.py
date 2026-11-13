@@ -88,6 +88,7 @@ class Batch:
     # Сколько кодов от начала уже ушло на принтер. Нужно, чтобы допечатать
     # прерванное с нужного места, а не с первой этикетки.
     printed: int = 0
+    printed_ranges: list[list[int]] = field(default_factory=list)
     # Когда сформирован файл ввода в оборот или отправлен документ. Пусто — ещё нет.
     introduced: str = ""
     # Документ, отправленный в «Честный ЗНАК» из программы: его номер, последний
@@ -108,7 +109,31 @@ class Batch:
     @property
     def left(self) -> int:
         """Сколько этикеток ещё не напечатано."""
-        return max(0, self.total - self.printed)
+        return max(0, self.total - self.printed_count)
+
+    @property
+    def printed_count(self) -> int:
+        return sum(end - start for start, end in self.print_ranges())
+
+    def print_ranges(self) -> list[list[int]]:
+        ranges = [[0, min(self.printed, self.total)]] + self.printed_ranges
+        merged: list[list[int]] = []
+        for start, end in sorted(ranges):
+            start, end = max(0, start), min(self.total, end)
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return merged
+
+    @property
+    def next_print_count(self) -> int:
+        """Длина первого непрерывного ненапечатанного диапазона."""
+        end = next((start for start, _ in self.print_ranges()
+                    if start > self.printed), self.total)
+        return max(0, end - self.printed)
 
     @property
     def title(self) -> str:
@@ -124,6 +149,7 @@ class Batch:
             "gtin": self.gtin, "name": self.name, "tnved": self.tnved,
             "product_group": self.product_group,
             "release_method": self.release_method, "printed": self.printed,
+            "printed_ranges": self.print_ranges(),
             "introduced": self.introduced, "doc_id": self.doc_id,
             "doc_status": self.doc_status,
             "introduced_count": self.introduced_count, "country": self.country,
@@ -328,6 +354,7 @@ def load(batch_id: str) -> Batch | None:
         release_method=str(raw.get("release_method") or ""),
         codes=[str(code) for code in raw["codes"]],
         printed=int(raw.get("printed") or 0), introduced=str(raw.get("introduced") or ""),
+        printed_ranges=raw.get("printed_ranges") or [],
         doc_id=str(raw.get("doc_id") or ""), doc_status=str(raw.get("doc_status") or ""),
         introduced_count=int(raw.get("introduced_count") or 0),
         country=str(raw.get("country") or ""), color=str(raw.get("color") or ""),
@@ -361,7 +388,15 @@ def mark_printed(batch: Batch, printed: int) -> None:
     Блок без `id` существует только в памяти (печать одного кода из проверки):
     писать его на диск незачем, а файл с пустым именем стал бы мусором.
     """
-    batch.printed = max(batch.printed, min(printed, batch.total))
+    mark_printed_range(batch, 0, printed)
+
+
+def mark_printed_range(batch: Batch, start: int, end: int) -> None:
+    """Запоминает точный полуинтервал, не отмечая пропущенные этикетки."""
+    batch.printed_ranges.append([start, end])
+    batch.printed_ranges = batch.print_ranges()
+    batch.printed = (batch.printed_ranges[0][1]
+                     if batch.printed_ranges and batch.printed_ranges[0][0] == 0 else 0)
     if batch.id:
         save(batch)
 

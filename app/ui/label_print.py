@@ -57,14 +57,15 @@ def suggested_printer() -> str:
 
 
 def draw_label(painter: QPainter, spec: LabelSpec, code: str, name: str,
-               dpmm_x: float, dpmm_y: float) -> None:
+               dpmm_x: float, dpmm_y: float, *, matrix=None) -> None:
     """Рисует одну этикетку в координатах устройства (точки)."""
     painter.fillRect(QRectF(0, 0, spec.width * dpmm_x, spec.height * dpmm_y),
                      QColor("white"))
     painter.setPen(QColor("black"))
     painter.setBrush(QColor("black"))
 
-    matrix = datamatrix.encode(code)
+    if matrix is None:
+        matrix = datamatrix.encode(code)
     side = len(matrix)
     box = spec.dm_size * min(dpmm_x, dpmm_y)
     module = max(1, int(box // side))
@@ -146,6 +147,7 @@ def make_printer(spec: LabelSpec, printer_name: str, pdf_path: str) -> QPrinter:
 
 def print_codes(codes: list[str], name: str, spec: LabelSpec, printer_name: str,
                 *, pdf_path: str = "",
+                names: list[str] | None = None,
                 progress: Callable[[int, int], bool] | None = None) -> int:
     """Печатает этикетки по порядку и возвращает, сколько ушло на принтер.
 
@@ -155,13 +157,16 @@ def print_codes(codes: list[str], name: str, spec: LabelSpec, printer_name: str,
     """
     if not codes:
         return 0
+    if names is not None and len(names) != len(codes):
+        raise PrintError("Количество названий не совпадает с количеством этикеток.")
     if problems := spec.problems:
         raise PrintError("Макет этикетки не годится: " + "; ".join(problems) + ".")
     # Ошибка кодировки одного кода не должна остановить печать на середине
     # пачки: проверяем всё до первой этикетки.
+    matrices = []
     for code in codes:
         try:
-            datamatrix.encode(code)
+            matrices.append(tuple(bytes(row) for row in datamatrix.encode(code)))
         except datamatrix.DataMatrixError as error:
             raise PrintError(f"Код не помещается в DataMatrix: {error}") from None
 
@@ -179,7 +184,8 @@ def print_codes(codes: list[str], name: str, spec: LabelSpec, printer_name: str,
             if index:
                 if not printer.newPage():
                     raise PrintError("Принтер перестал принимать этикетки.")
-            draw_label(painter, spec, code, name, dpmm_x, dpmm_y)
+            draw_label(painter, spec, code, names[index] if names is not None else name,
+                       dpmm_x, dpmm_y, matrix=matrices[index])
             done = index + 1
             if progress is not None and progress(done, len(codes)) is False:
                 break
