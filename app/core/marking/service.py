@@ -452,6 +452,11 @@ def _info(row: dict) -> CodeInfo:
     merged: dict = {**row, **inner}
     raw_code = _first(merged, ("cis", "requestedCis", "code", "km"))
     parsed = codes_module.parse(raw_code)
+    raw_children = merged.get("child") or merged.get("children") or merged.get("sntins")
+    children = (
+        tuple(str(item).strip() for item in raw_children if str(item).strip())
+        if isinstance(raw_children, list) else ()
+    )
     item = CodeInfo(
         code=_first(merged, ("requestedCis", "cis", "code", "km")),
         gtin=_first(merged, ("gtin", "productGtin")) or parsed.gtin,
@@ -460,6 +465,16 @@ def _info(row: dict) -> CodeInfo:
         owner_inn=_first(merged, ("ownerInn", "owner_inn", "inn")),
         owner_name=_first(merged, ("ownerName", "owner_name", "producerName")),
         product_name=_first(merged, ("productName", "product_name", "name")),
+        product_group=_first(
+            merged, ("productGroup", "pg", "product_group")
+        ).strip().lower(),
+        package_type=_first(
+            merged, ("packageType", "cisType", "packType", "generalPackageType", "package_type")
+        ).strip().upper(),
+        emission_type=_first(
+            merged, ("emissionType", "releaseMethodType", "emission_type", "release_method")
+        ).strip().upper(),
+        children=children,
         raw=row,
     )
     error = _first(row, ("errorMessage", "error_message", "error"))
@@ -584,7 +599,11 @@ STATUS_POLLING_READY = True
 def can_refresh(operation: Operation) -> bool:
     """Документы ГИС МТ с сохранённым номером; УПД опрашивает вкладка продажи."""
     return (operation.status.pending
-            and operation.kind in (OperationKind.WITHDRAWAL, OperationKind.REMARK)
+            and operation.kind in (
+                OperationKind.WITHDRAWAL,
+                OperationKind.REMARK,
+                OperationKind.AGGREGATION,
+            )
             and bool(operation.document_id.strip() and operation.product_group.strip()))
 
 

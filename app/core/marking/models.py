@@ -91,6 +91,7 @@ class OperationKind(str, Enum):
     SHIP = "ship"
     WITHDRAWAL = "withdrawal"
     REMARK = "remark"
+    AGGREGATION = "aggregation"
 
     @property
     def title(self) -> str:
@@ -118,6 +119,7 @@ KIND_TITLES: dict[OperationKind, str] = {
     OperationKind.SHIP: "Отгрузка",
     OperationKind.WITHDRAWAL: "Вывод из оборота",
     OperationKind.REMARK: "Перемаркировка",
+    OperationKind.AGGREGATION: "Формирование набора",
 }
 
 
@@ -379,6 +381,13 @@ class CodeInfo:
     permits: list[PermitDoc] | None = None
     # Почему РД не нужен, если в карточке товара указано такое основание.
     permit_exempt: str = ""
+    # Сведения о товарной группе, типе упаковки (UNIT / SET / GROUP / BOX),
+    # способе выпуска (LOCAL / PRODUCTION / FOREIGN / REMAINS) и вложениях
+    # набора — приходят в `/cises/info` и нужны при формировании наборов.
+    product_group: str = ""
+    package_type: str = ""
+    emission_type: str = ""
+    children: tuple[str, ...] = ()
 
     @property
     def ours(self) -> bool:

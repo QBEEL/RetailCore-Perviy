@@ -90,8 +90,7 @@ class OrderDialog(QDialog):
         self._has_certificate = has_certificate
         self._build()
         self.contact_edit.setText(contact)
-        self._sync_template()
-        self._sync_hint()
+        self._on_group_changed()
 
     # --- разметка -----------------------------------------------------------------
 
@@ -124,6 +123,11 @@ class OrderDialog(QDialog):
         # серийного номера и наличием криптохвоста, это и написано в каждой строке.
         self.template_box = QComboBox(self)
         details.addRow("Шаблон кода", self.template_box)
+
+        self.cis_type_box = QComboBox(self)
+        self.cis_type_box.addItem("Единица товара (UNIT)", "UNIT")
+        self.cis_type_box.addItem("Набор — КИН (SET)", "SET")
+        details.addRow("Тип упаковки", self.cis_type_box)
 
         payment = QHBoxLayout()
         payment.setSpacing(9)
@@ -192,6 +196,7 @@ class OrderDialog(QDialog):
         self.group_box.currentIndexChanged.connect(self._on_group_changed)
         self.method_box.currentIndexChanged.connect(self._sync_hint)
         self.template_box.currentIndexChanged.connect(self._sync_hint)
+        self.cis_type_box.currentIndexChanged.connect(self._sync_hint)
         self.payment_box.valueChanged.connect(self._sync_hint)
         self.contact_edit.textChanged.connect(self._sync_hint)
         self.lines.itemChanged.connect(self._sync_hint)
@@ -209,6 +214,7 @@ class OrderDialog(QDialog):
     def request(self) -> orders_module.Request:
         """Заказ в том виде, в каком он уйдёт в СУЗ."""
         lines = []
+        cis_type = str(self.cis_type_box.currentData() or "UNIT")
         for row in range(self.lines.rowCount()):
             gtin = self.lines.item(row, 0)
             quantity = self.lines.item(row, 1)
@@ -216,6 +222,7 @@ class OrderDialog(QDialog):
                 gtin=gtin.text().strip() if gtin else "",
                 quantity=_number(quantity.text() if quantity else ""),
                 template_id=self._template_id(),
+                cis_type=cis_type,
             ))
         return orders_module.Request(
             product_group=str(self.group_box.currentData() or ""),
@@ -249,6 +256,10 @@ class OrderDialog(QDialog):
         return _number(self.template_box.currentText())
 
     def _on_group_changed(self) -> None:
+        cosmetics = self.group_box.currentData() == "cosmetics"
+        if not cosmetics:
+            self.cis_type_box.setCurrentIndex(self.cis_type_box.findData("UNIT"))
+        self.cis_type_box.setEnabled(cosmetics)
         self._sync_template()
         self._sync_hint()
 

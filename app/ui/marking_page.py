@@ -111,6 +111,7 @@ from .widgets.marking_dialogs import (
 )
 from .widgets.toast import ToastKind
 from .widgets.sale_tab import SaleTab
+from .widgets.sets_tab import SetsTab
 from .widgets.withdrawal_tab import WithdrawalTab
 
 # Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
@@ -141,6 +142,8 @@ EXPIRY_TAB = 3
 WITHDRAWAL_TAB = 4
 # Продажа организации с выводом из оборота через УПД — последней, по той же причине.
 SALE_TAB = 5
+# Формирование наборов из ОСУ (косметика и бытовая химия и др.) — следом.
+SETS_TAB = 6
 
 # Что делает открытая подвкладка и что ей нужно — одной строкой под заголовком.
 TAB_SUBTITLES: dict[int, str] = {
@@ -156,6 +159,8 @@ TAB_SUBTITLES: dict[int, str] = {
                     "организации. Отменить его нельзя.",
     SALE_TAB: "УПД уходит покупателю через «ЭДО Лайт»; коды выбывают из оборота, "
               "когда он подпишет документ.",
+    SETS_TAB: "Формирование наборов (КИН) из товаров, принятых по ОСУ "
+              "(«Косметика и бытовая химия» и др.).",
 }
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
@@ -341,6 +346,13 @@ class MarkingPage(QWidget):
             inn=self._participant_inn)
         self.sale_tab.journal_changed.connect(self.reload_journal)
         self.tabs.addTab(self.sale_tab, icons.icon("price"), "Продажа")
+        # Формирование наборов из товаров, принятых по ОСУ (`AGGREGATION_DOCUMENT`).
+        self.sets_tab = SetsTab(
+            self.settings, self.notify, self,
+            contour=lambda: self.contour, thumbprint=lambda: self.thumbprint,
+            inn=self._participant_inn, organisations=self._saved_organisations)
+        self.sets_tab.journal_changed.connect(self.reload_journal)
+        self.tabs.addTab(self.sets_tab, icons.icon("order"), "Формирование наборов")
         # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
         # в поле сканирования при открытии вкладки — не удобство, а условие
         # работы: иначе первый же код уедет в поле поиска или в никуда.
@@ -1209,6 +1221,7 @@ class MarkingPage(QWidget):
         self._set_busy(False)
         # ИНН на вкладке вывода — того, под кем вошли, а не того, что был раньше.
         self.withdrawal_tab.prefill_inn()
+        self.sets_tab.prefill_inn()
         self.notify(f"Вход выполнен: {service.current().title}", ToastKind.SUCCESS)
         # Вошли за другую организацию — СУЗ должна работать за неё же, а не за
         # ту, чьи реквизиты остались от прошлого раза.
@@ -2668,6 +2681,9 @@ class MarkingPage(QWidget):
         elif index == SALE_TAB:
             self.sale_tab.reload_sent()
             self.sale_tab.focus_scan()
+        elif index == SETS_TAB:
+            self.sets_tab.prefill_inn()
+            self.sets_tab.focus_scan()
 
     def _participant_inn(self) -> str:
         """ИНН, от имени которого уходят документы: вошедшей организации, иначе выбранной."""

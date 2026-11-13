@@ -288,29 +288,59 @@ def remember_checks(items: Sequence[CodeInfo], contour: Contour,
 
 
 def _permits_text(item: CodeInfo) -> str:
-    if item.permits is None:
+    if item.permits is None and not (
+        item.product_group or item.package_type or item.emission_type or item.children
+    ):
         return ""
-    docs = [{"type": doc.kind, "number": doc.number, "date": doc.date,
-             "group": doc.status_group, "color": doc.color} for doc in item.permits]
-    return json.dumps({"docs": docs, "exempt": item.permit_exempt}, ensure_ascii=False)
+    payload: dict[str, object] = {}
+    if item.permits is not None:
+        docs = [{"type": doc.kind, "number": doc.number, "date": doc.date,
+                 "group": doc.status_group, "color": doc.color} for doc in item.permits]
+        payload["docs"] = docs
+        payload["exempt"] = item.permit_exempt
+    if item.product_group:
+        payload["product_group"] = item.product_group
+    if item.package_type:
+        payload["package_type"] = item.package_type
+    if item.emission_type:
+        payload["emission_type"] = item.emission_type
+    if item.children:
+        payload["children"] = list(item.children)
+    return json.dumps(payload, ensure_ascii=False)
 
 
-def _permits_from(text: str) -> tuple[list[PermitDoc] | None, str]:
+def _permits_from(text: str) -> tuple[
+    list[PermitDoc] | None, str, str, str, str, tuple[str, ...]
+]:
     """Обратно из базы. Испорченная запись — «не спрашивали», а не «нет РД»."""
     if not text:
-        return None, ""
+        return None, "", "", "", "", ()
     try:
         data = json.loads(text)
-        docs = [PermitDoc(kind=str(doc.get("type") or ""),
-                          number=str(doc.get("number") or ""),
-                          date=str(doc.get("date") or ""),
-                          status_group=doc.get("group") if isinstance(
-                              doc.get("group"), int) else None,
-                          color=str(doc.get("color") or ""))
-                for doc in data.get("docs") or []]
-        return docs, str(data.get("exempt") or "")
+        docs: list[PermitDoc] | None = None
+        if "docs" in data:
+            docs = [PermitDoc(kind=str(doc.get("type") or ""),
+                              number=str(doc.get("number") or ""),
+                              date=str(doc.get("date") or ""),
+                              status_group=doc.get("group") if isinstance(
+                                  doc.get("group"), int) else None,
+                              color=str(doc.get("color") or ""))
+                    for doc in data.get("docs") or []]
+        children_raw = data.get("children")
+        children = (
+            tuple(str(item).strip() for item in children_raw if str(item).strip())
+            if isinstance(children_raw, list) else ()
+        )
+        return (
+            docs,
+            str(data.get("exempt") or ""),
+            str(data.get("product_group") or ""),
+            str(data.get("package_type") or ""),
+            str(data.get("emission_type") or ""),
+            children,
+        )
     except (ValueError, AttributeError, TypeError):
-        return None, ""
+        return None, "", "", "", "", ()
 
 
 def known_checks(codes: Sequence[str], contour: Contour,
@@ -334,7 +364,14 @@ def known_checks(codes: Sequence[str], contour: Contour,
                 f"SELECT * FROM code_check WHERE contour = ? AND code IN ({marks})",
                 (contour.value, *part)).fetchall()
             for row in rows:
-                permits, exempt = _permits_from(row["permits"] or "")
+                (
+                    permits,
+                    exempt,
+                    product_group,
+                    package_type,
+                    emission_type,
+                    children,
+                ) = _permits_from(row["permits"] or "")
                 result[row["code"]] = CodeInfo(
                     code=row["code"],
                     gtin=row["gtin"] or "",
@@ -347,6 +384,10 @@ def known_checks(codes: Sequence[str], contour: Contour,
                     product_name=row["product_name"] or "",
                     permits=permits,
                     permit_exempt=exempt,
+                    product_group=product_group,
+                    package_type=package_type,
+                    emission_type=emission_type,
+                    children=children,
                 )
     return result
 
