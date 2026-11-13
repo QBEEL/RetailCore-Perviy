@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from typing import Callable
 
@@ -119,6 +120,9 @@ class SetsTab(QWidget):
         self._busy = False
 
         self.set_code: str = ""
+        self.set_codes_pool: list[str] = []
+        self._use_all_pool: bool = True
+        self._resolved_group: str = ""
         self.codes: list[str] = []
         self._keys: set[str] = set()
         self._names: dict[str, str] = {}
@@ -187,7 +191,7 @@ class SetsTab(QWidget):
         set_row.setSpacing(8)
         self.set_edit = QLineEdit(card)
         self.set_edit.setPlaceholderText(
-            "Отсканируйте или вставьте код идентификации набора (КИН)…"
+            "Отсканируйте, вставьте или загрузите из CSV код идентификации набора (КИН)…"
         )
         self.set_edit.setMinimumHeight(36)
         self.set_edit.returnPressed.connect(self.accept_set_scan)
@@ -195,14 +199,40 @@ class SetsTab(QWidget):
         self.set_paste_button = self._button(
             card, "Вставить КИН", "copy", self.paste_set_code
         )
+        self.set_file_button = self._button(
+            card, "Загрузить CSV…", "open", self.load_set_file
+        )
         self.set_clear_button = self._button(
             card, "Очистить КИН", "clear", self.clear_set_code
         )
+        self.set_paste_button.setToolTip("Вставить код набора (КИН) из буфера обмена")
+        self.set_file_button.setToolTip(
+            "Загрузить код набора (КИН) или список КИН из CSV / текстового файла"
+        )
+        self.set_clear_button.setToolTip("Очистить код набора (КИН)")
         set_row.addWidget(self.set_edit, 1)
         set_row.addWidget(self.set_paste_button)
+        set_row.addWidget(self.set_file_button)
         set_row.addWidget(self.set_clear_button)
 
-        for combo in (self.inn_box, self.group_box):
+        self.set_pool_widget = QWidget(card)
+        pool_row = QHBoxLayout(self.set_pool_widget)
+        pool_row.setContentsMargins(0, 0, 0, 0)
+        pool_row.setSpacing(8)
+        self.set_pool_label = QLabel("КИН из CSV:", self.set_pool_widget)
+        self.set_pool_box = QComboBox(self.set_pool_widget)
+        self.set_pool_box.setToolTip("Выбор кода набора (КИН) из загруженного файла CSV")
+        self.set_pool_box.currentIndexChanged.connect(self._pick_pool_set_code)
+        self.set_next_button = self._button(
+            self.set_pool_widget, "Следующий КИН", "refresh", self.next_set_code
+        )
+        self.set_next_button.setToolTip("Переключить на следующий КИН из загруженного CSV")
+        pool_row.addWidget(self.set_pool_label)
+        pool_row.addWidget(self.set_pool_box, 1)
+        pool_row.addWidget(self.set_next_button)
+        self.set_pool_widget.hide()
+
+        for combo in (self.inn_box, self.group_box, self.set_pool_box):
             combo.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
             )
@@ -214,12 +244,13 @@ class SetsTab(QWidget):
         grid.addWidget(self.group_box, 0, 3)
         grid.addWidget(QLabel("Код набора (КИН)", card), 1, 0)
         grid.addLayout(set_row, 1, 1, 1, 3)
-        grid.addWidget(QLabel("Максимум вложений", card), 2, 0)
-        grid.addWidget(self.capacity_box, 2, 1)
+        grid.addWidget(self.set_pool_widget, 2, 1, 1, 3)
+        grid.addWidget(QLabel("Максимум вложений", card), 3, 0)
+        grid.addWidget(self.capacity_box, 3, 1)
         self.set_status_label = QLabel("КИН не задан", card)
         self.set_status_label.setWordWrap(True)
-        grid.addWidget(QLabel("Сведения о КИН", card), 2, 2)
-        grid.addWidget(self.set_status_label, 2, 3)
+        grid.addWidget(QLabel("Сведения о КИН", card), 3, 2)
+        grid.addWidget(self.set_status_label, 3, 3)
         body.addLayout(grid)
 
         self.details_hint = Hint(
@@ -243,17 +274,26 @@ class SetsTab(QWidget):
         header.addWidget(SectionTitle("Вложения набора (КИ)", card))
         header.addStretch(1)
         self.paste_button = self._button(card, "Вставить", "copy", self.paste_codes)
-        self.file_button = self._button(card, "Из файла", "open", self.load_file)
+        self.file_button = self._button(card, "Загрузить CSV…", "open", self.load_file)
         self.remove_button = self._button(card, "Убрать", "trash", self.remove_selected)
+        self.remove_gtin_button = self._button(
+            card, "Убрать этот GTIN", "trash", self.remove_selected_gtin
+        )
         self.clear_button = self._button(card, "Очистить всё", "clear", self.clear)
         self.paste_button.setToolTip("Вставить коды вложений (КИ) из буфера обмена")
-        self.file_button.setToolTip("Загрузить коды вложений (КИ) из текстового файла или CSV")
+        self.file_button.setToolTip(
+            "Загрузить коды маркировки продукции в наборе (КИ вложений) из CSV или текстового файла"
+        )
         self.remove_button.setToolTip("Убрать выбранные в таблице коды вложений")
+        self.remove_gtin_button.setToolTip(
+            "Убрать из списка все коды вложений с тем же GTIN, что у выбранной строки"
+        )
         self.clear_button.setToolTip("Очистить КИН и список вложений набора")
         for button in (
             self.paste_button,
             self.file_button,
             self.remove_button,
+            self.remove_gtin_button,
             self.clear_button,
         ):
             header.addWidget(button)
@@ -378,7 +418,10 @@ class SetsTab(QWidget):
 
     def accept_set_scan(self) -> None:
         """Принимает отсканированный в поле КИН код набора и переводит курсор к вложениям."""
+        self._use_all_pool = False
         if self.set_set_code(self.set_edit.text()) == "added":
+            self._sync_set_pool()
+            self._refresh_table_statuses()
             self.scan_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_set_edited(self) -> None:
@@ -386,21 +429,177 @@ class SetsTab(QWidget):
             return
         typed = self.set_edit.text().strip()
         if typed != self.set_code:
+            self._use_all_pool = False
             self.set_set_code(typed, quiet=True)
+            self._sync_set_pool()
+            self._refresh_table_statuses()
 
     def paste_set_code(self) -> None:
-        lines = codes_module.split_lines(QApplication.clipboard().text())
+        text = QApplication.clipboard().text()
+        lines = codes_module.split_lines(text)
         if not lines:
             self._tell("В буфере обмена нет кода набора (КИН)", ToastKind.WARNING)
             return
+        if len(lines) > 1:
+            self.load_set_codes(text)
+            return
+        self._use_all_pool = False
         self.set_set_code(lines[0])
+        self._sync_set_pool()
+        self._refresh_table_statuses()
+
+    def load_set_file(self, path: str = "") -> int:
+        """Загружает КИН набора (один или список КИН) из файла CSV или TXT."""
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Файл CSV с кодами маркировки наборов (КИН)",
+                "",
+                "Файлы CSV и текст (*.csv *.txt);;CSV (*.csv);;Текст (*.txt);;Все файлы (*.*)",
+            )
+        if not path:
+            return 0
+        try:
+            text = codes_module.read_codes_file(path)
+        except OSError as error:
+            self._tell(f"Не удалось прочитать файл КИН: {error}", ToastKind.ERROR)
+            return 0
+        return self.load_set_codes(text)
+
+    def load_set_codes(self, text: str) -> int:
+        """Разбирает один или несколько КИН из текста/CSV и включает режим партии при N > 1."""
+        lines = codes_module.split_lines(text)
+        if not lines:
+            self._tell("В выбранном файле не найдено кодов наборов (КИН)", ToastKind.WARNING)
+            return 0
+
+        valid_codes: list[str] = []
+        seen_keys: set[str] = set()
+        repeats = 0
+        broken = 0
+        first_problem = ""
+
+        for raw in lines:
+            cleaned = codes_module.from_keyboard((raw or "").strip())
+            parsed = codes_module.parse(cleaned)
+            if not cleaned or not parsed.valid or not parsed.ki:
+                broken += 1
+                if not first_problem:
+                    first_problem = parsed.problems[0] if parsed.problems else "неверный формат КИН"
+                continue
+            key = sets.key_of(cleaned)
+            if key in self._keys or key in seen_keys:
+                repeats += 1
+                continue
+            seen_keys.add(key)
+            valid_codes.append(cleaned)
+
+        self._repeats += repeats
+        self._broken += broken
+
+        if not valid_codes:
+            reason = first_problem or "все коды уже добавлены как вложения"
+            self._say("broken", f"КИН из файла не приняты: {reason}")
+            self._sync()
+            return 0
+
+        self.set_codes_pool = valid_codes if len(valid_codes) > 1 else []
+        self._use_all_pool = len(valid_codes) > 1
+        self.set_set_code(valid_codes[0], quiet=True)
+        self._sync_set_pool()
+        self._refresh_table_statuses()
+
+        parsed_first = codes_module.parse(valid_codes[0])
+        tail: list[str] = []
+        if repeats:
+            tail.append(f"повторов {repeats}")
+        if broken:
+            tail.append(f"не принято {broken}")
+        suffix = (" · " + ", ".join(tail)) if tail else ""
+        if len(valid_codes) == 1:
+            self._say(
+                "added",
+                f"КИН набора загружен · {parsed_first.gtin} · {parsed_first.serial}{suffix}",
+            )
+        else:
+            self._say(
+                "added",
+                f"Загружено КИН наборов: {len(valid_codes)} шт. (партия GTIN {parsed_first.gtin})"
+                f" · вложения распределятся по {len(valid_codes)} наборам{suffix}",
+            )
+        self._save_draft()
+        self._sync()
+        return len(valid_codes)
+
+    def _sync_set_pool(self) -> None:
+        has_pool = len(self.set_codes_pool) > 1
+        self.set_pool_widget.setVisible(has_pool)
+        self.set_pool_box.blockSignals(True)
+        self.set_pool_box.clear()
+        current_key = sets.key_of(self.set_code) if self.set_code.strip() else ""
+        selected_idx = 0
+        if has_pool:
+            self.set_pool_box.addItem(
+                f"Все КИН из CSV — партия ({len(self.set_codes_pool)} наборов)",
+                "__ALL__",
+            )
+        for idx, code in enumerate(self.set_codes_pool):
+            parsed = codes_module.parse(code)
+            label = f"Только №{idx + 1} · GTIN {parsed.gtin} · сер. {parsed.serial}"
+            self.set_pool_box.addItem(label, code)
+            if not self._use_all_pool and current_key and sets.key_of(code) == current_key:
+                selected_idx = idx + 1
+        if has_pool:
+            self.set_pool_box.setCurrentIndex(selected_idx)
+            self.set_pool_label.setText(f"Режим КИН ({len(self.set_codes_pool)} шт.):")
+        self.set_pool_box.blockSignals(False)
+
+    def _pick_pool_set_code(self, index: int) -> None:
+        if self._restoring or index < 0:
+            return
+        data = self.set_pool_box.itemData(index)
+        if data == "__ALL__":
+            self._use_all_pool = True
+            if self.set_codes_pool:
+                self.set_set_code(self.set_codes_pool[0], quiet=True)
+            self._verification = None
+            self._refresh_table_statuses()
+            self._save_draft()
+            self._sync()
+            return
+        if isinstance(data, str) and data:
+            self._use_all_pool = False
+            self.set_set_code(data)
+            self._refresh_table_statuses()
+
+    def next_set_code(self) -> bool:
+        """Переключает активный КИН на следующий одиночный КИН из загруженного пула CSV."""
+        if len(self.set_codes_pool) <= 1:
+            return False
+        self._use_all_pool = False
+        current_key = sets.key_of(self.set_code) if self.set_code.strip() else ""
+        keys = [sets.key_of(c) for c in self.set_codes_pool]
+        try:
+            idx = keys.index(current_key)
+            next_idx = (idx + 1) % len(self.set_codes_pool)
+        except ValueError:
+            next_idx = 0
+        chosen = self.set_codes_pool[next_idx]
+        result = self.set_set_code(chosen)
+        self._sync_set_pool()
+        self._refresh_table_statuses()
+        return result == "added"
 
     def clear_set_code(self) -> None:
         self.set_code = ""
+        self.set_codes_pool.clear()
+        self._use_all_pool = True
         self.set_edit.blockSignals(True)
         self.set_edit.clear()
         self.set_edit.blockSignals(False)
+        self._sync_set_pool()
         self._verification = None
+        self._refresh_table_statuses()
         self._save_draft()
         self._sync()
         self.set_edit.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -467,7 +666,8 @@ class SetsTab(QWidget):
             return "broken"
 
         key = sets.key_of(text)
-        if self.set_code and key == sets.key_of(self.set_code):
+        active_set_keys = {sets.key_of(sc) for sc in self.active_set_codes}
+        if (self.set_code and key == sets.key_of(self.set_code)) or key in active_set_keys:
             self._repeats += 1
             if not quiet:
                 self._say(
@@ -526,17 +726,33 @@ class SetsTab(QWidget):
         finally:
             self._refreshing = False
 
+    def _assigned_set_map(self) -> dict[str, str]:
+        if not self.batch_mode:
+            return {}
+        units, batch_problems = self.units_and_problems()
+        if batch_problems or len(units) <= 1:
+            return {}
+        mapping: dict[str, str] = {}
+        for idx, unit in enumerate(units, start=1):
+            label = f"Набор №{idx} ({unit.set_serial or unit.set_ki})"
+            for item_ki in unit.item_kis:
+                mapping[item_ki] = label
+        return mapping
+
     def _row_status_cells(
         self,
         ki: str,
         info: CodeInfo | None,
+        assigned_set: str = "",
     ) -> tuple[str, str, str]:
         if info is None:
-            return "не проверен", "", Palette.TEXT_MUTED
+            return "не проверен", assigned_set, Palette.TEXT_MUTED
         if not info.found:
-            return "Не найден", "нет в ГИС МТ", Palette.DANGER
+            note = " · ".join(p for p in (assigned_set, "нет в ГИС МТ") if p)
+            return "Не найден", note, Palette.DANGER
         if not info.valid:
-            return "Недействителен", "; ".join(info.problems), Palette.DANGER
+            note = " · ".join(p for p in (assigned_set, "; ".join(info.problems)) if p)
+            return "Недействителен", note, Palette.DANGER
 
         state_text = info.state.title
         colour = (
@@ -545,6 +761,8 @@ class SetsTab(QWidget):
             else Palette.DANGER
         )
         notes: list[str] = []
+        if assigned_set:
+            notes.append(assigned_set)
         if info.owner_name or info.owner_inn:
             owner = info.owner_name or info.owner_inn
             notes.append(f"Владелец: {owner}")
@@ -569,19 +787,33 @@ class SetsTab(QWidget):
     def paste_codes(self) -> None:
         self.add_many(QApplication.clipboard().text())
 
-    def load_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Файл с кодами вложений", "", "Текст (*.txt *.csv);;Все файлы (*.*)"
-        )
+    def load_file(self, path: str | list[str] | tuple[str, ...] = "") -> tuple[int, int, int]:
+        """Загружает коды маркировки вложений (КИ) из одного или нескольких файлов CSV/TXT."""
         if not path:
-            return
-        try:
-            with open(path, encoding="utf-8-sig", errors="replace") as handle:
-                text = handle.read()
-        except OSError as error:
-            self._tell(f"Не удалось прочитать файл: {error}", ToastKind.ERROR)
-            return
-        self.add_many(text)
+            paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Файлы CSV с кодами маркировки вложений (КИ)",
+                "",
+                "Файлы CSV и текст (*.csv *.txt);;CSV (*.csv);;Текст (*.txt);;Все файлы (*.*)",
+            )
+        elif isinstance(path, str):
+            paths = [path]
+        else:
+            paths = list(path)
+        if not paths:
+            return 0, 0, 0
+
+        chunks: list[str] = []
+        for item_path in paths:
+            try:
+                chunks.append(codes_module.read_codes_file(item_path))
+            except OSError as error:
+                self._tell(f"Не удалось прочитать файл {item_path}: {error}", ToastKind.ERROR)
+                return 0, 0, 0
+        added, repeats, broken = self.add_many("\n".join(chunks))
+        if not (added or repeats or broken):
+            self._tell("В выбранном файле не найдено кодов вложений (КИ)", ToastKind.WARNING)
+        return added, repeats, broken
 
     def add_many(self, text: str) -> tuple[int, int, int]:
         """Добавляет коды вложений списком и показывает сводку."""
@@ -591,6 +823,8 @@ class SetsTab(QWidget):
             added += result == "added"
             repeats += result == "repeat"
             broken += result == "broken"
+        if added:
+            self._refresh_table_statuses()
         if added or repeats or broken:
             tail = []
             if repeats:
@@ -615,8 +849,31 @@ class SetsTab(QWidget):
             self.table.removeRow(row)
         self._verification = None
         self._renumber()
+        self._refresh_table_statuses()
         self._save_draft()
         self._sync()
+
+    def remove_selected_gtin(self) -> int:
+        """Удаляет все коды вложений с GTIN выбранных строк таблицы."""
+        selected_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        target_gtins = {self._gtin_of(row) for row in selected_rows if self._gtin_of(row)}
+        if not target_gtins:
+            return 0
+        rows_to_remove = [
+            row
+            for row in range(len(self.codes) - 1, -1, -1)
+            if (codes_module.parse(self.codes[row]).gtin or self._gtin_of(row)) in target_gtins
+        ]
+        for row in rows_to_remove:
+            self._keys.discard(sets.key_of(self.codes[row]))
+            del self.codes[row]
+            self.table.removeRow(row)
+        self._verification = None
+        self._renumber()
+        self._refresh_table_statuses()
+        self._save_draft()
+        self._sync()
+        return len(rows_to_remove)
 
     def _pending_submission(self) -> bool:
         if self._doc_id.strip():
@@ -634,9 +891,13 @@ class SetsTab(QWidget):
             )
             return
         self.set_code = ""
+        self.set_codes_pool.clear()
+        self._use_all_pool = True
+        self._resolved_group = ""
         self.set_edit.blockSignals(True)
         self.set_edit.clear()
         self.set_edit.blockSignals(False)
+        self._sync_set_pool()
         self.codes.clear()
         self._keys.clear()
         self._checks.clear()
@@ -734,33 +995,83 @@ class SetsTab(QWidget):
         self._sync_composition()
         self._find_names()
 
-    def unit(self) -> sets.SetUnit:
+    @property
+    def batch_mode(self) -> bool:
+        """Режим формирования сразу всей загруженной из CSV партии наборов."""
+        return self._use_all_pool and len(self.set_codes_pool) > 1
+
+    @property
+    def active_set_codes(self) -> tuple[str, ...]:
+        if self.batch_mode:
+            return tuple(self.set_codes_pool)
+        if self.set_code.strip():
+            return (self.set_code.strip(),)
+        return ()
+
+    def units_and_problems(self) -> tuple[tuple[sets.SetUnit, ...], list[str]]:
         capacity = self.capacity_box.value()
-        return sets.SetUnit(
-            set_code=self.set_code.strip(),
-            item_codes=tuple(self.codes),
+        return sets.build_units(
+            self.active_set_codes,
+            self.codes,
             capacity=capacity if capacity > 0 else None,
         )
 
+    def unit(self) -> sets.SetUnit:
+        units, _ = self.units_and_problems()
+        return units[0]
+
     def document(self) -> sets.SetDocument:
+        units, batch_problems = self.units_and_problems()
         return sets.SetDocument(
             inn=self.inn_edit.text().strip(),
-            units=(self.unit(),),
-            product_group=self.group,
+            units=units,
+            product_group=self.effective_group,
+            batch_problems=tuple(batch_problems),
         )
 
     @property
     def group(self) -> str:
         return str(self.group_box.currentData() or DEFAULT_GROUP)
 
+    @property
+    def effective_group(self) -> str:
+        """Код товарной группы для True API (`chemistry` или `cosmetics` по данным ЧЗ)."""
+        base = self.group
+        for raw_set in self.active_set_codes:
+            set_ki = codes_module.parse(raw_set).ki
+            set_info = self._checks.get(set_ki) or self._checks.get(raw_set.strip())
+            if (
+                set_info
+                and set_info.product_group
+                and sets.same_product_group(set_info.product_group, base)
+            ):
+                return set_info.product_group
+        for raw in self.codes:
+            ki = codes_module.parse(raw).ki or raw.strip()
+            info = self._checks.get(ki) or self._checks.get(raw.strip())
+            if (
+                info
+                and info.product_group
+                and sets.same_product_group(info.product_group, base)
+            ):
+                return info.product_group
+        if self._resolved_group and sets.same_product_group(self._resolved_group, base):
+            return self._resolved_group
+        return base
+
     # --- проверка кодов в ГИС МТ ---------------------------------------------------
 
     def check_codes_in_gis(self) -> None:
         """Запрашивает в ГИС МТ свежие статусы КИН и всех КИ вложений."""
-        unit = self.unit()
-        if problems := unit.problems:
-            self._tell(f"Проверка не запущена: {problems[0]}", ToastKind.WARNING)
+        units, batch_problems = self.units_and_problems()
+        if batch_problems:
+            self._tell(f"Проверка не запущена: {batch_problems[0]}", ToastKind.WARNING)
             return
+        for idx, unit in enumerate(units, start=1):
+            if problems := unit.problems:
+                prefix = f"набор №{idx}: " if len(units) > 1 else ""
+                self._tell(f"Проверка не запущена: {prefix}{problems[0]}", ToastKind.WARNING)
+                return
         if not service.signed_in():
             self._tell(
                 "Для проверки кодов войдите по сертификату на вкладке «Проверка кодов»",
@@ -772,7 +1083,7 @@ class SetsTab(QWidget):
             self._tell("Вход выполнен в другом контуре — войдите заново", ToastKind.WARNING)
             return
 
-        all_codes = [unit.set_code, *unit.item_codes]
+        all_codes = [*self.active_set_codes, *self.codes]
         self._busy = True
         self._sync()
         self.hint.setStyleSheet("")
@@ -796,18 +1107,22 @@ class SetsTab(QWidget):
             if item.gtin and item.product_name and not self._names.get(item.gtin):
                 self._names[item.gtin] = item.product_name
 
-        self._verification = sets.verify_codes(
-            self.unit(),
+        units, batch_problems = self.units_and_problems()
+        self._verification = sets.verify_units(
+            units,
             self._checks,
             our_inn=self.inn_edit.text().strip() or (self._inn() or "").strip(),
             product_group=self.group,
+            batch_problems=batch_problems,
         )
         self._refresh_table_statuses()
         self._save_draft()
         self._sync()
 
         if self._verification.problems:
-            text = "Проверка выявила замечания: " + "; ".join(self._verification.problems)
+            text = "Проверка выявила замечания: " + "; ".join(self._verification.problems[:5])
+            if len(self._verification.problems) > 5:
+                text += f" (и ещё {len(self._verification.problems) - 5})"
             self.hint.setStyleSheet(f"color: {Palette.DANGER};")
             self.hint.setText(text)
             self._tell(self._verification.problems[0], ToastKind.WARNING)
@@ -830,13 +1145,16 @@ class SetsTab(QWidget):
         self._tell(f"Не удалось проверить коды: {message}", ToastKind.ERROR)
 
     def _refresh_table_statuses(self) -> None:
+        assigned = self._assigned_set_map()
         self._refreshing = True
         try:
             for row, raw in enumerate(self.codes):
                 parsed = codes_module.parse(raw)
                 ki = parsed.ki or raw.strip()
                 info = self._checks.get(ki)
-                state_text, note_text, colour = self._row_status_cells(ki, info)
+                state_text, note_text, colour = self._row_status_cells(
+                    ki, info, assigned.get(ki, "")
+                )
                 state_item = QTableWidgetItem(state_text)
                 state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if colour:
@@ -895,13 +1213,20 @@ class SetsTab(QWidget):
     def _save_draft(self) -> None:
         if self._restoring:
             return
-        if not self.set_code.strip() and not self.codes and not self._doc_id.strip():
+        if (
+            not self.set_code.strip()
+            and not self.set_codes_pool
+            and not self.codes
+            and not self._doc_id.strip()
+        ):
             sets.clear_draft(self._draft_path)
             return
         draft = sets.SetDraft(
             inn=self.inn_edit.text().strip(),
-            product_group=self.group,
+            product_group=self.effective_group,
             set_code=self.set_code,
+            set_codes_pool=list(self.set_codes_pool),
+            use_all_pool=self._use_all_pool,
             capacity=self.capacity_box.value(),
             item_codes=list(self.codes),
             names=dict(self._names),
@@ -915,6 +1240,7 @@ class SetsTab(QWidget):
         draft = sets.load_draft(self._draft_path)
         if not (
             draft.set_code
+            or draft.set_codes_pool
             or draft.item_codes
             or draft.doc_id
             or draft.inn
@@ -926,7 +1252,15 @@ class SetsTab(QWidget):
                 self.inn_edit.setText(draft.inn)
                 self._filled_inn = draft.inn
             if draft.product_group:
+                self._resolved_group = draft.product_group
                 idx = self.group_box.findData(draft.product_group)
+                if idx < 0:
+                    for i in range(self.group_box.count()):
+                        if sets.same_product_group(
+                            str(self.group_box.itemData(i) or ""), draft.product_group
+                        ):
+                            idx = i
+                            break
                 if idx >= 0:
                     self.group_box.setCurrentIndex(idx)
             self.capacity_box.setValue(max(0, int(draft.capacity or 0)))
@@ -934,10 +1268,18 @@ class SetsTab(QWidget):
             self._operation_id = draft.operation_id
             self._doc_id = draft.doc_id
             self._doc_status = draft.doc_status
+            self.set_codes_pool = [
+                codes_module.from_keyboard(c.strip())
+                for c in draft.set_codes_pool
+                if c.strip()
+            ]
+            self._use_all_pool = bool(draft.use_all_pool)
             if draft.set_code:
                 self.set_set_code(draft.set_code, quiet=True)
+            self._sync_set_pool()
             for code in draft.item_codes:
                 self.add_code(code, quiet=True)
+            self._refresh_table_statuses()
             if self._doc_id:
                 self.hint.setStyleSheet(f"color: {Palette.WARNING};")
                 self.hint.setText(
@@ -1019,19 +1361,29 @@ class SetsTab(QWidget):
             self._tell("Вход выполнен в другом контуре — войдите заново", ToastKind.WARNING)
             return
 
-        unit = self.unit()
-        identifiers = [unit.set_ki, *unit.item_kis]
+        unit = document.units[0]
+        identifiers: list[str] = []
+        for doc_unit in document.units:
+            identifiers.append(doc_unit.set_ki)
+            identifiers.extend(doc_unit.item_kis)
         earlier = service.warn_duplicates(
             Operation(kind=OperationKind.AGGREGATION, codes=identifiers)
         )
         if not self._confirm(document, contour, earlier):
             return
 
-        comment = f"КИН {unit.set_gtin} · вложений: {len(unit.item_codes)}"
+        group = self.effective_group
+        if len(document.units) == 1:
+            comment = f"КИН {unit.set_gtin} · вложений: {len(unit.item_codes)}"
+        else:
+            comment = (
+                f"Партия {len(document.units)} наборов ({unit.set_gtin}) "
+                f"· по {len(unit.item_codes)} вложений"
+            )
         operation = service.start(
             OperationKind.AGGREGATION,
             identifiers,
-            group=self.group,
+            group=group,
             contour=contour,
             reason=sets.UNIT_TYPE_SET,
             comment=comment,
@@ -1064,7 +1416,7 @@ class SetsTab(QWidget):
             _send,
             document,
             self._thumbprint(),
-            self.group,
+            group,
             contour,
             created,
             on_result=lambda outcome: self._on_sent(operation, document, outcome),
@@ -1079,14 +1431,32 @@ class SetsTab(QWidget):
     ) -> bool:
         unit = document.units[0]
         comp = sets.composition(unit, checks=self._checks, names=self._names)
+        n_sets = len(document.units)
+        total_items = sum(len(u.item_codes) for u in document.units)
+        item_parts = [
+            f"{item.gtin}" + (f" ({item.name})" if item.name else "") + f" × {item.quantity} шт."
+            for item in comp.items
+        ]
         lines = [
             f"ИНН участника: {document.inn}.",
             f"Товарная группа: {self.group_box.currentText()} ({self.group}).",
-            f"КИН набора: {comp.set_ki}" + (f" ({comp.set_name})" if comp.set_name else "") + ".",
-            f"Вложений в наборе: {comp.total_items} шт. (товарных позиций GTIN: {comp.distinct_gtins}).",
+        ]
+        if n_sets == 1:
+            lines.extend([
+                f"КИН набора: {comp.set_ki}" + (f" ({comp.set_name})" if comp.set_name else "") + ".",
+                f"Вложений в наборе: {comp.total_items} шт. (товарных позиций GTIN: {comp.distinct_gtins}).",
+            ])
+        else:
+            lines.extend([
+                f"Наборов (КИН) в документе: {n_sets} шт. (GTIN {comp.set_gtin}).",
+                f"Вложений в каждом наборе: {comp.total_items} шт. (всего вложений в партии: {total_items} шт.).",
+            ])
+        if item_parts:
+            lines.append("Состав 1 набора: " + "; ".join(item_parts) + ".")
+        lines.extend([
             "Сверьте GTIN и количества вложений с опубликованной карточкой набора в Национальном каталоге.",
             f"Контур: {contour.title}.",
-        ]
+        ])
         if self._verification is None:
             lines.append(
                 "\nКоды ещё не проверялись кнопкой «Проверить коды в ЧЗ». "
@@ -1108,12 +1478,19 @@ class SetsTab(QWidget):
         confirm = QMessageBox(self)
         confirm.setWindowTitle("Формирование набора")
         confirm.setIcon(QMessageBox.Icon.Warning)
-        confirm.setText(
-            f"Сформировать набор {comp.set_gtin} из {comp.total_items} вложений?"
-        )
+        if n_sets == 1:
+            confirm.setText(
+                f"Сформировать набор {comp.set_gtin} из {comp.total_items} вложений?"
+            )
+        else:
+            confirm.setText(
+                f"Сформировать партию из {n_sets} наборов {comp.set_gtin} "
+                f"по {comp.total_items} вложений в каждом (всего {total_items} КИ)?"
+            )
         confirm.setInformativeText("\n".join(lines))
         yes = confirm.addButton(
-            "Сформировать набор", QMessageBox.ButtonRole.AcceptRole
+            "Сформировать набор" if n_sets == 1 else f"Сформировать {n_sets} наборов",
+            QMessageBox.ButtonRole.AcceptRole,
         )
         cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
         confirm.setDefaultButton(cancel)
@@ -1154,11 +1531,19 @@ class SetsTab(QWidget):
             service.store.update(operation)
             self.journal_changed.emit()
             unit = document.units[0]
-            self.clear(force=True)
-            text = (
-                f"Набор {unit.set_gtin} ({len(unit.item_codes)} вложений) "
-                f"успешно сформирован в ЧЗ. Документ {sent.doc_id} обработан (CHECKED_OK)."
-            )
+            n_sets = len(document.units)
+            self._finish_completed_sets([u.set_code for u in document.units])
+            if n_sets == 1:
+                text = (
+                    f"Набор {unit.set_gtin} ({len(unit.item_codes)} вложений) "
+                    f"успешно сформирован в ЧЗ. Документ {sent.doc_id} обработан (CHECKED_OK)."
+                )
+            else:
+                text = (
+                    f"Партия из {n_sets} наборов {unit.set_gtin} "
+                    f"(по {len(unit.item_codes)} вложений) успешно сформирована в ЧЗ. "
+                    f"Документ {sent.doc_id} обработан (CHECKED_OK)."
+                )
             self.hint.setStyleSheet(f"color: {Palette.SUCCESS};")
             self.hint.setText(text)
             self._tell(text, ToastKind.SUCCESS)
@@ -1174,7 +1559,8 @@ class SetsTab(QWidget):
             self._save_draft()
             self.journal_changed.emit()
             self._sync()
-            text = f"Документ {sent.doc_id} отклонён: {status.text}"
+            summary = self._format_rejection(status.text)
+            text = f"Документ {sent.doc_id} отклонён: {summary}"
             self.hint.setStyleSheet(f"color: {Palette.DANGER};")
             self.hint.setText(text)
             self._tell(f"Набор не сформирован. {text}", ToastKind.ERROR)
@@ -1242,7 +1628,7 @@ class SetsTab(QWidget):
         run_task(
             introduce.status,
             doc_id,
-            self.group,
+            self.effective_group,
             contour,
             on_result=lambda status: self._on_polled(doc_id, status),
             on_error=self._on_poll_error,
@@ -1264,12 +1650,20 @@ class SetsTab(QWidget):
             self.journal_changed.emit()
 
         if status.done:
-            unit = self.unit()
-            self.clear(force=True)
-            text = (
-                f"Документ {doc_id} обработан (CHECKED_OK) — набор {unit.set_gtin} "
-                "сформирован в «Честном ЗНАКе»."
-            )
+            units, _ = self.units_and_problems()
+            unit = units[0]
+            n_sets = len(units)
+            self._finish_completed_sets([u.set_code for u in units])
+            if n_sets == 1:
+                text = (
+                    f"Документ {doc_id} обработан (CHECKED_OK) — набор {unit.set_gtin} "
+                    "сформирован в «Честном ЗНАКе»."
+                )
+            else:
+                text = (
+                    f"Документ {doc_id} обработан (CHECKED_OK) — партия из {n_sets} "
+                    f"наборов {unit.set_gtin} сформирована в «Честном ЗНАКе»."
+                )
             self.hint.setStyleSheet(f"color: {Palette.SUCCESS};")
             self.hint.setText(text)
             self._tell(text, ToastKind.SUCCESS)
@@ -1279,7 +1673,8 @@ class SetsTab(QWidget):
             self._doc_id = ""
             self._save_draft()
             self._sync()
-            text = f"Документ {doc_id} отклонён: {status.text}"
+            summary = self._format_rejection(status.text)
+            text = f"Документ {doc_id} отклонён: {summary}"
             self.hint.setStyleSheet(f"color: {Palette.DANGER};")
             self.hint.setText(text)
             self._tell(text, ToastKind.ERROR)
@@ -1291,6 +1686,54 @@ class SetsTab(QWidget):
         self.hint.setStyleSheet(f"color: {Palette.WARNING};")
         self.hint.setText(text)
         self._tell(text, ToastKind.INFO)
+
+    def _finish_completed_sets(self, used_set_codes: list[str]) -> None:
+        used_keys = {sets.key_of(c) for c in used_set_codes if c.strip()}
+        remaining = [
+            code
+            for code in self.set_codes_pool
+            if sets.key_of(code) not in used_keys
+        ]
+        was_batch = self._use_all_pool
+        self.clear(force=True)
+        if remaining:
+            self.set_codes_pool = remaining if len(remaining) > 1 else []
+            self._use_all_pool = was_batch and len(remaining) > 1
+            self.set_set_code(remaining[0], quiet=True)
+            self._sync_set_pool()
+            self._save_draft()
+            self._sync()
+            self.scan_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _format_rejection(self, status_text: str) -> str:
+        """Сворачивает однотипные ошибки ЧЗ по партии наборов в понятное сообщение."""
+        missing_gtins = sorted(
+            set(
+                re.findall(
+                    r"134:\s*GTIN\s*(\d{14}),\s*предусмотренный иерархией",
+                    status_text,
+                )
+            )
+        )
+        if missing_gtins:
+            loaded_gtins = sorted(
+                {codes_module.parse(c).gtin for c in self.codes if codes_module.parse(c).gtin}
+            )
+            loaded_part = (
+                f" (сейчас загружены GTIN: {', '.join(loaded_gtins)})"
+                if loaded_gtins
+                else ""
+            )
+            return (
+                f"код 134 — в карточке набора в Национальном каталоге указан обязательный "
+                f"товар с GTIN {', '.join(missing_gtins)}, который отсутствует среди "
+                f"загруженных вложений{loaded_part}. Замените неверный GTIN или добавьте "
+                f"CSV с кодами для GTIN {', '.join(missing_gtins)}."
+            )
+        parts = [p.strip() for p in status_text.split(";") if p.strip()]
+        if len(parts) > 3:
+            return "; ".join(parts[:2]) + f" (и ещё ошибок: {len(parts) - 2})"
+        return status_text
 
     def _on_poll_error(self, message: str) -> None:
         self._busy = False
@@ -1306,15 +1749,46 @@ class SetsTab(QWidget):
             self.notify(text, kind)
 
     def _sync_composition(self) -> None:
-        unit = self.unit()
+        units, batch_problems = self.units_and_problems()
+        unit = units[0]
         comp = sets.composition(unit, checks=self._checks, names=self._names)
-        self.tile_items.set_value(comp.total_items)
-        self.tile_gtins.set_value(comp.distinct_gtins)
+        total_items = len(self.codes)
+        distinct_gtins = len({codes_module.parse(c).gtin for c in self.codes if codes_module.parse(c).gtin})
+        self.tile_items.set_value(total_items)
+        self.tile_gtins.set_value(distinct_gtins)
 
         if not self.set_code.strip():
             self.tile_set.set_value("Не задан")
             self.set_status_label.setStyleSheet(f"color: {Palette.TEXT_MUTED};")
-            self.set_status_label.setText("Отсканируйте или вставьте КИН набора")
+            self.set_status_label.setText("Отсканируйте, вставьте или загрузите из CSV КИН набора")
+        elif self.batch_mode:
+            n_sets = len(units)
+            parsed_set = codes_module.parse(self.set_code)
+            checked_sets = [
+                self._checks.get(u.set_ki)
+                for u in units
+                if self._checks.get(u.set_ki) is not None
+            ]
+            has_set_errors = bool(
+                self._verification
+                and any(u.set_ki in self._verification.code_notes for u in units)
+            )
+            self.tile_set.set_value(f"{n_sets} шт.")
+            if has_set_errors:
+                self.set_status_label.setStyleSheet(f"color: {Palette.DANGER};")
+                self.set_status_label.setText(
+                    f"Партия: {n_sets} КИН (GTIN {parsed_set.gtin}) · есть замечания ЧЗ"
+                )
+            elif len(checked_sets) == n_sets:
+                self.set_status_label.setStyleSheet(f"color: {Palette.SUCCESS};")
+                self.set_status_label.setText(
+                    f"Партия: {n_sets} КИН (GTIN {parsed_set.gtin}) · все проверены в ЧЗ"
+                )
+            else:
+                self.set_status_label.setStyleSheet("")
+                self.set_status_label.setText(
+                    f"Партия из CSV: {n_sets} КИН (GTIN {parsed_set.gtin})"
+                )
         else:
             parsed_set = codes_module.parse(self.set_code)
             if not parsed_set.valid or not parsed_set.ki:
@@ -1355,14 +1829,23 @@ class SetsTab(QWidget):
                         parts.append(note)
                     self.set_status_label.setText(" · ".join(parts))
 
-        if not comp.items:
+        if not self.codes:
             self.composition_label.setText("Состав набора пока пуст.")
+            return
+        if batch_problems:
+            self.composition_label.setText(batch_problems[0])
             return
         parts = []
         for item in comp.items:
             title = f"{item.gtin}" + (f" ({item.name})" if item.name else "")
             parts.append(f"{title} × {item.quantity} шт.")
-        self.composition_label.setText("Состав набора: " + "; ".join(parts))
+        if len(units) > 1:
+            self.composition_label.setText(
+                f"Партия: {len(units)} наборов по {comp.total_items} вложения (всего {total_items} КИ). "
+                "В каждом наборе: " + "; ".join(parts)
+            )
+        else:
+            self.composition_label.setText("Состав набора: " + "; ".join(parts))
 
     def _sync(self) -> None:
         self._sync_composition()
@@ -1375,10 +1858,11 @@ class SetsTab(QWidget):
         has_pending_doc = bool(self._doc_id.strip())
         locked = self._pending_submission()
 
-        self.remove_button.setEnabled(
-            bool(self.table.selectionModel() and self.table.selectionModel().hasSelection())
-            and not self._busy and not locked
+        has_selection = bool(
+            self.table.selectionModel() and self.table.selectionModel().hasSelection()
         )
+        self.remove_button.setEnabled(has_selection and not self._busy and not locked)
+        self.remove_gtin_button.setEnabled(has_selection and not self._busy and not locked)
         self.clear_button.setEnabled((has_set or has_items) and not self._busy and not locked)
         self.set_clear_button.setEnabled(has_set and not self._busy and not locked)
         self.check_button.setEnabled(ready and not self._busy and not locked)
@@ -1389,6 +1873,9 @@ class SetsTab(QWidget):
         for widget in (
             self.set_edit,
             self.set_paste_button,
+            self.set_file_button,
+            self.set_pool_box,
+            self.set_next_button,
             self.scan_edit,
             self.paste_button,
             self.file_button,

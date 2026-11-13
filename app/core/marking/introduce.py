@@ -479,6 +479,7 @@ def status(doc_id: str, product_group: str,
         ("trueapi", INFO_PATH.format(doc_id=doc_id), {"pg": group}),
     ]
     last: transport.MarkingError | None = None
+    had_empty_response = False
     unknown = DocStatus(errors=(f"Документ {doc_id} пока не найден в ответе ГИС МТ",))
     for system, path, params in attempts:
         try:
@@ -489,6 +490,7 @@ def status(doc_id: str, product_group: str,
                 raise
             last = error
             continue
+        had_empty_response = True
         result = _parse_status(answer, doc_id, allow_missing_id=path != LIST_PATH)
         if not result.code:
             continue
@@ -501,7 +503,7 @@ def status(doc_id: str, product_group: str,
                 if extra := _details(doc_id, group, contour):
                     result = DocStatus(result.code, extra)
         return result
-    if last is not None:
+    if last is not None and not had_empty_response:
         raise last
     return unknown
 
@@ -544,10 +546,15 @@ def _remember(doc_id: str, answer: Any) -> None:
 
 
 def _path_missing(error: transport.MarkingError) -> bool:
-    """Ответ «такого метода нет», а не отказ по существу."""
+    """Ответ «такого метода нет» или «устаревшее API», а не отказ по существу."""
     text = str(error).lower()
-    return error.status in (404, 405) or "метод с указанным url не найден" in text \
+    return (
+        error.status in (404, 405, 410)
+        or "метод с указанным url не найден" in text
         or "url не найден" in text
+        or "устаревшее api" in text
+        or "deprecated" in text
+    )
 
 
 def _parse_status(answer: Any, doc_id: str, *, allow_missing_id: bool = False) -> DocStatus:

@@ -33,7 +33,7 @@ from typing import Any, Sequence
 
 from .. import appdata
 from . import crypto, transport
-from .models import Contour
+from .models import Contour, same_group
 from .suz import Credentials, TOKEN_HEADER, apply
 
 # Список заказов участника оборота. Чтение: ничего не создаёт и кодов не тратит.
@@ -140,6 +140,7 @@ TEMPLATES: dict[str, tuple[Template, ...]] = {
                                              Template(23, 13, False)),
     "antiseptic": (Template(31, 13, True), Template(25, 13, False)),
     "cosmetics": (Template(46, 6, True), Template(47, 6, False)),
+    "chemistry": (Template(46, 6, True), Template(47, 6, False)),
 }
 
 
@@ -330,7 +331,7 @@ def defaults_for(group: str, known: Sequence[Order]) -> Defaults:
     # шаблонов группы участник пользуется на самом деле.
     fallback = Defaults(template_id=default_template(code))
     for order in known:
-        if order.product_group.strip().lower() != code or not order.buffers:
+        if not same_group(order.product_group, code) or not order.buffers:
             continue
         if best is None or _newer(order, best):
             best = order

@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import csv
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -164,6 +165,22 @@ _RUSSIAN_KEYS = str.maketrans(
 _CYRILLIC = re.compile("[а-яА-ЯёЁ№]")
 
 
+def _unquote_csv(text: str) -> str:
+    """Снимает внешние кавычки одной ячейки CSV (`"..."`) и сдвоенные `""` внутри кода."""
+    value = (text or "").strip().lstrip("\ufeff")
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"' and "\n" not in value and "\r" not in value:
+        try:
+            rows = [next(csv.reader([value], delimiter=sep)) for sep in (",", ";", "\t")]
+        except (csv.Error, StopIteration):
+            rows = []
+        if rows and all(len(row) == 1 for row in rows):
+            inner = rows[0][0].strip()
+            start = next((len(marker) for marker in SYMBOLOGY if inner.startswith(marker)), 0)
+            if inner[start:start + 2].isdigit() or _CYRILLIC.search(inner):
+                return inner
+    return value
+
+
 def from_keyboard(text: str) -> str:
     """Код, набранный сканером при русской раскладке, — обратно латиницей.
 
@@ -173,6 +190,7 @@ def from_keyboard(text: str) -> str:
     цифрами идентификатора: русский текст, который кодом не был, остаётся
     как есть, чтобы человек увидел то, что вставил.
     """
+    text = _unquote_csv(text) if text and text.lstrip("\ufeff").strip().startswith('"') else text
     if not text or not _CYRILLIC.search(text):
         return text
     converted = text.translate(_RUSSIAN_KEYS)
@@ -184,7 +202,7 @@ def from_keyboard(text: str) -> str:
 
 def normalize(text: str) -> str:
     """Приводит код к виду, пригодному для разбора."""
-    value = from_keyboard((text or "").strip())
+    value = from_keyboard(_unquote_csv((text or "").strip()))
     for alias in GS_ALIASES:
         value = value.replace(alias, GS)
     for marker in SYMBOLOGY:
@@ -385,12 +403,132 @@ def parse_many(lines: Iterable[str]) -> Batch:
     return Batch(codes=[parse(line) for line in lines if (line or "").strip()])
 
 
-def split_lines(text: str) -> list[str]:
-    """Делит вставленный текст на коды.
+_CSV_HEADER_NAMES = frozenset({
+    "ки", "кин", "киз", "код", "код маркировки", "коды маркировки",
+    "код идентификации", "код идентификации (ки)", "код набора",
+    "код набора (кин)", "код упаковки", "код товара", "gtin", "cis", "ki",
+    "kiz", "code", "codes", "sgtin", "sntin", "uit", "уит", "datamatrix",
+    "штрихкод", "марка", "набор", "статус", "status", "наименование",
+    "наименование товара", "товар", "серийный номер", "serial", "тип упаковки",
+    "package_type", "packagetype", "cistype", "№", "id", "number",
+})
 
-    Сканер обычно завершает код переводом строки, но при вставке из письма или
-    таблицы разделителем оказывается что угодно. Внутри самого кода перевода
-    строки быть не может, а вот пробел — может, поэтому по пробелам не делим.
+
+def _is_clean_single_code(text: str) -> bool:
+    """Является ли строка одним кодом маркировки без приклеенных колонок CSV."""
+    if not text or "\t" in text:
+        return False
+    parsed = parse(text)
+    if not parsed.valid or not parsed.ki:
+        return False
+    if "92" in parsed.fields:
+        tail_sig = parsed.fields["92"]
+        return not any(sep in tail_sig for sep in (";", ",", " ", "\t", '"'))
+    if "93" in parsed.fields:
+        return True
+    serial = parsed.serial
+    if not serial or len(serial) > 20 or " " in serial or _CYRILLIC.search(serial):
+        return False
+    if ";" in serial or "," in serial:
+        # Для КИ без криптохвоста серийный номер в ЧЗ имеет длину 6, 7 или 13 символов.
+        # Если вся строка уже имеет стандартную длину КИ (24, 25 или 31 символ),
+        # то `;` или `,` внутри неё — это часть серийного номера GS1-82, а не разделитель CSV.
+        if len(serial) in (6, 7, 13):
+            return True
+        for sep in (";", ","):
+            if sep in text:
+                first_cell = text.split(sep, 1)[0].strip()
+                first_parsed = parse(first_cell)
+                if first_parsed.valid and len(first_parsed.serial) >= 6:
+                    return False
+    return True
+
+
+def _starts_like_gs1_code(text: str) -> bool:
+    value = _unquote_csv(text).strip()
+    for marker in SYMBOLOGY:
+        if value.startswith(marker):
+            value = value[len(marker):]
+            break
+    return (value.startswith("01") or value.startswith("00")) and value[:6].isdigit()
+
+
+def _is_csv_header_row(cells: list[str], line_index: int, total_lines: int) -> bool:
+    cleaned = [cell.strip().strip('"').strip().lower() for cell in cells if cell.strip()]
+    if not cleaned:
+        return True
+    if any(_starts_like_gs1_code(cell) for cell in cells):
+        return False
+    if any(cell in _CSV_HEADER_NAMES for cell in cleaned):
+        return line_index == 0 or len(cleaned) > 1
+    return False
+
+
+def split_lines(text: str) -> list[str]:
+    """Делит вставленный текст или содержимое CSV-файла на коды маркировки.
+
+    Сканер обычно завершает код переводом строки, а при загрузке из CSV или
+    вставке из таблицы коды могут быть заключены в кавычки (`"..."` со
+    сдвоенными `""`), сопровождаться шапкой таблицы и соседними колонками
+    через `;`, `,` или табуляцию.
     """
-    return [from_keyboard(line) for line in re.split(r"[\r\n\t]+", text or "")
-            if line.strip()]
+    raw_lines = [
+        line.strip().lstrip("\ufeff")
+        for line in re.split(r"[\r\n]+", text or "")
+        if line.strip().lstrip("\ufeff")
+    ]
+    result: list[str] = []
+    total = len(raw_lines)
+    for idx, raw_line in enumerate(raw_lines):
+        unquoted = from_keyboard(_unquote_csv(raw_line))
+        if _is_clean_single_code(unquoted):
+            result.append(unquoted)
+            continue
+
+        # Пробуем разобрать строку как строку CSV/TSV с несколькими ячейками.
+        cells: list[str] = [unquoted]
+        for sep in ("\t", ";", ","):
+            if sep in raw_line:
+                try:
+                    parsed_row = next(csv.reader([raw_line], delimiter=sep))
+                except (csv.Error, StopIteration):
+                    continue
+                non_empty = [from_keyboard(_unquote_csv(c)) for c in parsed_row if c.strip()]
+                if len(non_empty) > 1:
+                    cells = non_empty
+                    break
+
+        valid_cells = [cell for cell in cells if _is_clean_single_code(cell) or parse(cell).valid]
+        if valid_cells:
+            result.extend(valid_cells)
+            continue
+
+        if _is_csv_header_row(cells, idx, total):
+            continue
+
+        # Если в строке есть ячейка, начинающаяся как GS1-код (с ошибкой), отдаём её.
+        gs1_like = [cell for cell in cells if _starts_like_gs1_code(cell)]
+        if gs1_like:
+            result.extend(gs1_like)
+        elif "\t" in raw_line:
+            result.extend(cells)
+        else:
+            result.append(unquoted)
+    return result
+
+
+def read_codes_file(path: str) -> str:
+    """Читает текстовый или CSV-файл с кодами маркировки с автоопределением кодировки."""
+    with open(path, "rb") as raw_file:
+        data = raw_file.read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")

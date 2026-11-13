@@ -76,11 +76,28 @@ GROUPS: tuple[ProductGroup, ...] = (
 
 GROUP_BY_CODE: dict[str, ProductGroup] = {group.code: group for group in GROUPS}
 
+# В ответах ГИС МТ (`/cises/info`) товарная группа 35 «Косметика и бытовая химия»
+# возвращается под техническим кодом `chemistry`, а в программе и ряде методов
+# обозначается как `cosmetics`. Оба кода относятся к одной товарной группе.
+GROUP_ALIASES: dict[str, str] = {
+    "chemistry": "cosmetics",
+}
+
 
 def group_of(code: Any) -> ProductGroup | None:
     if isinstance(code, ProductGroup):
         return code
-    return GROUP_BY_CODE.get(str(code or ""))
+    key = str(code or "").strip().lower()
+    return GROUP_BY_CODE.get(key) or GROUP_BY_CODE.get(GROUP_ALIASES.get(key, ""))
+
+
+def same_group(first: Any, second: Any) -> bool:
+    """Относятся ли два кода товарной группы к одной и той же группе (с учётом синонимов ЧЗ)."""
+    left = str(first.code if isinstance(first, ProductGroup) else first or "").strip().lower()
+    right = str(second.code if isinstance(second, ProductGroup) else second or "").strip().lower()
+    if not left or not right:
+        return left == right
+    return GROUP_ALIASES.get(left, left) == GROUP_ALIASES.get(right, right)
 
 
 class OperationKind(str, Enum):

@@ -765,3 +765,230 @@ def test_страница_маркировки_содержит_вкладку_�
     application.processEvents()
     assert page.subtitle.text() == TAB_SUBTITLES[SETS_TAB]
 
+
+def test_группа_chemistry_от_чз_принимается_как_косметика_и_бытовая_химия(
+    application, world
+):
+    tab, state, _ = world
+    tab.set_set_code(SET_RAW)
+    tab.add_code(ITEM1_RAW)
+    tab.add_code(ITEM2_RAW)
+
+    # В ответах `/cises/info` ЧЗ возвращает `productGroup: "chemistry"` для группы
+    # «Косметика и бытовая химия», тогда как в UI выбрана `cosmetics`.
+    state["checked"] = [
+        _checked_set(product_group="chemistry", state=CodeState.APPLIED),
+        _checked_item(
+            ITEM1_KI,
+            ITEM1_GTIN,
+            product_group="chemistry",
+            owner_inn=SUPPLIER_INN,
+            state=CodeState.INTRODUCED,
+        ),
+        _checked_item(
+            ITEM2_KI,
+            ITEM2_GTIN,
+            product_group="chemistry",
+            owner_inn=SUPPLIER_INN,
+            state=CodeState.INTRODUCED,
+        ),
+    ]
+
+    tab.check_codes_in_gis()
+    _settle(application)
+
+    assert tab._verification is not None
+    assert tab._verification.ok, tab._verification.problems
+    assert tab.effective_group == "chemistry"
+
+    state["answer"] = introduce.Sent(
+        "док-набор-chem", introduce.DocStatus(code="CHECKED_OK")
+    )
+    tab.create_document()
+    _settle(application)
+
+    assert len(state["sent"]) == 1
+    sent_doc, _thumb, group, _contour = state["sent"][0]
+    assert group == "chemistry"
+    assert sent_doc.wire_type(group) == "AGGREGATION_DOCUMENT"
+
+
+def test_загрузка_csv_с_кодами_наборов_кин_и_переключение_пула(
+    application, world, tmp_path
+):
+    tab, state, _ = world
+    set2_ki = f"01{SET_GTIN}21SET0000000002"
+    set2_raw = f"{set2_ki}\x1d91EE06\x1d92dGVzdC1zZXQtY3J5cHRvLTI="
+
+    # CSV с заголовком, кавычками и несколькими колонками (выгрузка СУЗ / ЧЗ)
+    csv_file = tmp_path / "set_codes.csv"
+    csv_content = (
+        "КИ;GTIN;Тип упаковки;Статус\n"
+        f'"{SET_RAW}";{SET_GTIN};SET;APPLIED\n'
+        f'"{set2_raw}";{SET_GTIN};SET;APPLIED\n'
+    )
+    csv_file.write_text(csv_content, encoding="utf-8-sig")
+
+    loaded = tab.load_set_file(str(csv_file))
+    assert loaded == 2
+    assert tab.set_code == SET_RAW
+    assert len(tab.set_codes_pool) == 2
+    assert tab.batch_mode is True
+    assert not tab.set_pool_widget.isHidden()
+    assert tab.set_pool_box.count() == 3  # «Все КИН из CSV» + 2 одиночных КИН
+
+    # Переключение на следующий одиночный КИН кнопкой «Следующий КИН»
+    assert tab.next_set_code() is True
+    assert tab.batch_mode is False
+    assert tab.set_code == set2_raw
+    assert tab.next_set_code() is True
+    assert tab.set_code == SET_RAW
+
+    # После успешного формирования первого набора автоматически выбирается оставшийся КИН
+    tab.add_code(ITEM1_RAW)
+    state["answer"] = introduce.Sent(
+        "док-набор-пул-1", introduce.DocStatus(code="CHECKED_OK")
+    )
+    tab.create_document()
+    _settle(application)
+
+    assert tab.set_code == set2_raw
+    assert tab.codes == []
+    assert tab.set_codes_pool == []
+
+
+def test_формирование_партии_из_40_наборов_из_csv_распределяет_вложения_по_наборам(
+    application, world, tmp_path
+):
+    tab, state, _ = world
+
+    # Синтетические 40 КИН наборов (включая серийные номера со спецсимволами `,`, `;`, `"`)
+    special_serials = ["5I6GQQ", "5Xi,i:", "5Db;IZ", '5"rSK5', '5ewr0"']
+    set_kis = [
+        f"01{SET_GTIN}21" + (special_serials[i] if i < len(special_serials) else f"S{i:05d}")
+        for i in range(40)
+    ]
+    item1_kis = [f"01{ITEM1_GTIN}21A{i:05d}" for i in range(40)]
+    item2_kis = [f"01{ITEM2_GTIN}21B{i:05d}" for i in range(40)]
+
+    nabor_csv = tmp_path / "nabor.csv"
+    krem_csv = tmp_path / "krem.csv"
+    karma_csv = tmp_path / "karma.csv"
+    nabor_csv.write_text("\r\n".join(set_kis) + "\r\n", encoding="utf-8")
+    krem_csv.write_text("\r\n".join(item1_kis) + "\r\n", encoding="utf-8")
+    karma_csv.write_text("\r\n".join(item2_kis) + "\r\n", encoding="utf-8")
+
+    assert tab.load_set_file(str(nabor_csv)) == 40
+    assert tab.batch_mode is True
+    assert len(tab.active_set_codes) == 40
+
+    assert tab.load_file([str(krem_csv), str(karma_csv)]) == (80, 0, 0)
+    assert len(tab.codes) == 80
+
+    doc = tab.document()
+    assert not doc.problems, doc.problems
+    assert len(doc.units) == 40
+    # В каждом из 40 наборов ровно 2 вложения (по 1 каждого GTIN), а не 80 в первом!
+    for i, unit in enumerate(doc.units):
+        assert unit.set_ki == set_kis[i]
+        assert unit.item_kis == (item1_kis[i], item2_kis[i])
+
+    rendered = json.loads(doc.render())
+    assert len(rendered["aggregationUnits"]) == 40
+    assert rendered["aggregationUnits"][0] == {
+        "aggregationType": "AGGREGATION",
+        "sntins": [item1_kis[0], item2_kis[0]],
+        "unitSerialNumber": set_kis[0],
+        "unitSerialNumberType": "PRODUCT_SET",
+    }
+
+    state["answer"] = introduce.Sent(
+        "док-партия-40", introduce.DocStatus(code="CHECKED_OK")
+    )
+    tab.create_document()
+    _settle(application)
+
+    assert len(state["sent"]) == 1
+    sent_doc, _, _, _ = state["sent"][0]
+    assert len(sent_doc.units) == 40
+    assert tab.codes == [] and tab.set_code == "" and tab.set_codes_pool == []
+
+
+def test_загрузка_csv_с_кодами_продукции_вложений_в_разных_форматах(
+    world, tmp_path
+):
+    tab, _, _ = world
+    tab.set_set_code(SET_RAW)
+
+    # CSV в кодировке Windows-1251 с заголовком, кавычками и удвоенными кавычками внутри КМ
+    quoted_serial_ki = f'01{ITEM1_GTIN}21SER"Q1'
+    quoted_serial_raw = f'{quoted_serial_ki}\x1d91EE06\x1d92dGVzdC1pdGVtLWNyeXB0by0x'
+    csv_escaped = quoted_serial_raw.replace('"', '""')
+
+    items_csv = tmp_path / "items.csv"
+    lines = [
+        "Код маркировки;GTIN;Наименование",
+        f'"{ITEM1_RAW}";{ITEM1_GTIN};"Шампунь 250 мл"',
+        f'"{ITEM2_RAW}";{ITEM2_GTIN};"Бальзам 250 мл"',
+        f'"{csv_escaped}";{ITEM1_GTIN};"Шампунь с кавычкой в серии"',
+    ]
+    items_csv.write_bytes("\r\n".join(lines).encode("cp1251"))
+
+    added, repeats, broken = tab.load_file(str(items_csv))
+    assert (added, repeats, broken) == (3, 0, 0)
+    assert len(tab.codes) == 3
+    assert sets.key_of(tab.codes[2]) == quoted_serial_ki
+
+
+def test_опрос_статуса_после_создания_не_прерывается_на_устаревшее_api_v3(monkeypatch):
+    from app.core.marking import session
+    from app.core.marking.transport import MarkingError
+
+    doc_list_attempt = 0
+
+    def fake_get(system, path, *, contour=None, params=None, token=None):
+        nonlocal doc_list_attempt
+        if system == "trueapi4" and path == introduce.LIST_PATH:
+            doc_list_attempt += 1
+            if doc_list_attempt == 1:
+                # В первую секунду после создания документ ещё не проиндексирован в /doc/list
+                return {"results": []}
+            return {
+                "results": [
+                    {
+                        "number": "98b6583f-04a3-46bb-ad79-165e0fe9fff2",
+                        "status": "CHECKED_OK",
+                    }
+                ]
+            }
+        if system == "trueapi4" and path.startswith("/doc/"):
+            raise MarkingError("404 Not Found", status=404)
+        if system == "trueapi" and path.startswith("/doc/"):
+            raise MarkingError("Устаревшее API", status=400)
+        raise AssertionError(f"Unexpected call: {system} {path}")
+
+    monkeypatch.setattr(
+        introduce,
+        "submit",
+        lambda *args, **kwargs: "98b6583f-04a3-46bb-ad79-165e0fe9fff2",
+    )
+    monkeypatch.setattr(session, "authorized", lambda fn: fn("TOK"))
+    monkeypatch.setattr(transport, "get", fake_get)
+
+    doc = _doc()
+    sent = introduce.send(
+        doc,
+        "THUMB",
+        "chemistry",
+        Contour.SANDBOX,
+        sleep=lambda sec: None,
+        wait=6.0,
+        interval=3.0,
+    )
+    assert sent.doc_id == "98b6583f-04a3-46bb-ad79-165e0fe9fff2"
+    assert sent.status.done
+    assert sent.status.code == "CHECKED_OK"
+    assert doc_list_attempt == 2
+
+
+

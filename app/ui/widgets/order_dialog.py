@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.marking import GROUPS, orders as orders_module
+from ...core.marking.models import same_group
 from ...core.marking.orders import ReleaseMethod
 from .. import icons
 from ..theme import Metrics, Palette
@@ -243,7 +244,7 @@ class OrderDialog(QDialog):
         return frozenset(
             int(buffer.raw.get("templateId") or 0)
             for order in self._orders
-            if order.product_group.strip().lower() == group
+            if same_group(order.product_group, group)
             for buffer in order.buffers
             if buffer.raw.get("templateId")
         )

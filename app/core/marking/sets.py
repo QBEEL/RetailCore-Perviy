@@ -43,7 +43,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .. import appdata
 from . import codes as codes_module
 from .introduce import MAX_PRODUCTS, IntroduceProblem, _INN
-from .models import CodeInfo, CodeState, group_of
+from .models import CodeInfo, CodeState, group_of, same_group
 
 DOCUMENT_TYPE = "AGGREGATION_DOCUMENT"
 UNIT_TYPE_SET = "PRODUCT_SET"
@@ -51,8 +51,17 @@ AGGREGATION_TYPE = "AGGREGATION"
 DEFAULT_PRODUCT_GROUP = "cosmetics"
 DRAFT_FILE = "marking_sets_draft.json"
 
+# В ответах ГИС МТ (`/cises/info`) товарная группа 35 («Косметика и бытовая химия»)
+# возвращается как `chemistry`, тогда как в параметрах ЛК / UI встречается `cosmetics`.
+COSMETICS_GROUPS = frozenset({"cosmetics", "chemistry"})
+
 # В этом сценарии проверены правила ОСУ только для выбранной пользователем группы.
-OSU_GROUPS = frozenset({"cosmetics"})
+OSU_GROUPS = COSMETICS_GROUPS
+
+
+def same_product_group(first: str, second: str) -> bool:
+    """Сравнивает коды товарной группы с учётом синонимов ГИС МТ (`cosmetics` == `chemistry`)."""
+    return same_group(first, second)
 
 # Допустимые значения типа упаковки для КИН набора и для вложений, если ГИС МТ
 # вернула это поле в `/cises/info`.
@@ -146,6 +155,81 @@ class SetUnit:
         }
 
 
+def build_units(
+    set_codes: Sequence[str],
+    item_codes: Sequence[str],
+    *,
+    capacity: int | None = None,
+) -> tuple[tuple[SetUnit, ...], list[str]]:
+    """Распределяет коды вложений (`КИ`) по набору или партии наборов (`КИН`).
+
+    Если задан один `КИН`, все коды вложений относятся к этому набору.
+    Если загружена партия из $N > 1$ `КИН` (например, 40 кодов наборов из CSV),
+    а также коды вложений по одному или нескольким товарам (GTIN), то в каждый
+    из $N$ наборов равномерно распределяется соответствующая доля кодов каждого
+    GTIN (`len(gtin_codes) // N`).
+    """
+    clean_sets = [code.strip() for code in set_codes if code and code.strip()]
+    clean_items = [code.strip() for code in item_codes if code and code.strip()]
+    if len(clean_sets) <= 1:
+        single_set = clean_sets[0] if clean_sets else ""
+        return (
+            (SetUnit(set_code=single_set, item_codes=tuple(clean_items), capacity=capacity),),
+            [],
+        )
+
+    n_sets = len(clean_sets)
+    if not clean_items:
+        return (
+            tuple(SetUnit(set_code=sc, item_codes=(), capacity=capacity) for sc in clean_sets),
+            [f"загружено наборов (КИН): {n_sets}, но не добавлено ни одного кода вложения (КИ)"],
+        )
+
+    by_gtin: dict[str, list[str]] = {}
+    for raw in clean_items:
+        gtin = codes_module.parse(raw).gtin or "—"
+        by_gtin.setdefault(gtin, []).append(raw)
+
+    if len(clean_items) % n_sets != 0:
+        return (
+            tuple(SetUnit(set_code=sc, item_codes=(), capacity=capacity) for sc in clean_sets),
+            [
+                f"в партии {n_sets} КИН наборов, а кодов вложений (КИ) загружено {len(clean_items)} — "
+                f"количество вложений должно делиться поровну на {n_sets} наборов "
+                "(загрузите недостающие CSV вложений или выберите один КИН)"
+            ],
+        )
+
+    uneven = [
+        f"{gtin} ({len(group)} шт.)"
+        for gtin, group in by_gtin.items()
+        if len(group) % n_sets != 0
+    ]
+    if uneven:
+        return (
+            tuple(SetUnit(set_code=sc, item_codes=(), capacity=capacity) for sc in clean_sets),
+            [
+                f"количество кодов вложений по товарам ({', '.join(uneven)}) "
+                f"не делится поровну на {n_sets} наборов (КИН)"
+            ],
+        )
+
+    units: list[SetUnit] = []
+    for idx, set_code in enumerate(clean_sets):
+        unit_items: list[str] = []
+        for group_codes in by_gtin.values():
+            per_set = len(group_codes) // n_sets
+            unit_items.extend(group_codes[idx * per_set : (idx + 1) * per_set])
+        units.append(
+            SetUnit(
+                set_code=set_code,
+                item_codes=tuple(unit_items),
+                capacity=capacity,
+            )
+        )
+    return tuple(units), []
+
+
 @dataclass(frozen=True, slots=True)
 class SetDocument:
     """Документ «Формирование упаковки» (`AGGREGATION_DOCUMENT`) для наборов."""
@@ -153,6 +237,7 @@ class SetDocument:
     inn: str
     units: tuple[SetUnit, ...]
     product_group: str = DEFAULT_PRODUCT_GROUP
+    batch_problems: tuple[str, ...] = ()
 
     kind = "aggregation"
     title = "Формирование упаковки (набора)"
@@ -191,8 +276,11 @@ class SetDocument:
             found.append("ИНН участника — 10 цифр для организации, 12 для ИП")
         if not self.product_group.strip():
             found.append("не выбрана товарная группа")
-        elif self.product_group.strip().lower() != DEFAULT_PRODUCT_GROUP:
+        elif self.product_group.strip().lower() not in COSMETICS_GROUPS:
             found.append("формирование наборов подключено только для товарной группы «Косметика и бытовая химия»")
+        if self.batch_problems:
+            found.extend(self.batch_problems)
+            return found
         if not self.units:
             found.append("не добавлено ни одного набора")
             return found
@@ -230,7 +318,7 @@ class SetDocument:
         group = (product_group or self.product_group).strip()
         if not group:
             raise IntroduceProblem("Не указана товарная группа.")
-        if group.lower() != DEFAULT_PRODUCT_GROUP or group.lower() != self.product_group.strip().lower():
+        if group.lower() not in COSMETICS_GROUPS or not same_product_group(group, self.product_group):
             raise IntroduceProblem("Формирование наборов подключено только для группы «Косметика и бытовая химия».")
         return DOCUMENT_TYPE
 
@@ -487,6 +575,52 @@ def verify_codes(
     )
 
 
+def verify_units(
+    units: Sequence[SetUnit],
+    checks: Mapping[str, CodeInfo],
+    *,
+    our_inn: str = "",
+    product_group: str = DEFAULT_PRODUCT_GROUP,
+    batch_problems: Sequence[str] = (),
+) -> SetVerification:
+    """Проверяет один набор или партию наборов перед отправкой `AGGREGATION_DOCUMENT`."""
+    if batch_problems:
+        return SetVerification(problems=tuple(batch_problems))
+    if not units:
+        return SetVerification(problems=("не добавлено ни одного набора",))
+    if len(units) == 1:
+        return verify_codes(
+            units[0],
+            checks,
+            our_inn=our_inn,
+            product_group=product_group,
+        )
+
+    problems: list[str] = []
+    warnings: list[str] = []
+    notes: list[str] = []
+    code_notes: dict[str, str] = {}
+    for index, unit in enumerate(units, start=1):
+        ver = verify_codes(
+            unit,
+            checks,
+            our_inn=our_inn,
+            product_group=product_group,
+        )
+        code_notes.update(ver.code_notes)
+        label = unit.set_serial or unit.set_ki or f"№{index}"
+        for problem in ver.problems:
+            problems.append(f"набор №{index} ({label}): {problem}")
+        warnings.extend(ver.warnings)
+        notes.extend(ver.notes)
+    return SetVerification(
+        problems=tuple(dict.fromkeys(problems)),
+        warnings=tuple(dict.fromkeys(warnings)),
+        notes=tuple(dict.fromkeys(notes)),
+        code_notes=code_notes,
+    )
+
+
 def _verify_set_code(
     set_ki: str,
     info: CodeInfo,
@@ -510,7 +644,7 @@ def _verify_set_code(
         if not info.product_group:
             problems.append("товарная группа кода набора (КИН) не получена от ЧЗ")
             remarks.append("товарная группа неизвестна")
-        elif group and info.product_group != group:
+        elif group and not same_product_group(info.product_group, group):
             problems.append(
                 f"код набора (КИН) относится к группе «{info.product_group}», "
                 f"а выбрана «{group_title}»"
@@ -607,7 +741,7 @@ def _verify_item_code(
     if not info.product_group:
         problems.append(f"товарная группа кода вложения {ki} не получена от ЧЗ")
         remarks.append("товарная группа неизвестна")
-    elif group and info.product_group != group:
+    elif group and not same_product_group(info.product_group, group):
         problems.append(
             f"код вложения {ki} относится к группе «{info.product_group}», "
             f"а выбрана «{group_title}»"
@@ -674,6 +808,8 @@ class SetDraft:
     inn: str = ""
     product_group: str = DEFAULT_PRODUCT_GROUP
     set_code: str = ""
+    set_codes_pool: list[str] = field(default_factory=list)
+    use_all_pool: bool = True
     capacity: int = 0
     item_codes: list[str] = field(default_factory=list)
     names: dict[str, str] = field(default_factory=dict)
@@ -700,6 +836,8 @@ def save_draft(draft: SetDraft, path: str | None = None) -> SetDraft:
         "inn": draft.inn,
         "product_group": draft.product_group or DEFAULT_PRODUCT_GROUP,
         "set_code": draft.set_code,
+        "set_codes_pool": list(draft.set_codes_pool),
+        "use_all_pool": bool(draft.use_all_pool),
         "capacity": int(draft.capacity or 0),
         "item_codes": list(draft.item_codes),
         "names": dict(draft.names),
@@ -725,6 +863,11 @@ def load_draft(path: str | None = None) -> SetDraft:
             data = json.load(file)
         if not isinstance(data, dict):
             return SetDraft()
+        raw_pool = data.get("set_codes_pool")
+        set_codes_pool = (
+            [str(item) for item in raw_pool if str(item).strip()]
+            if isinstance(raw_pool, list) else []
+        )
         raw_items = data.get("item_codes")
         item_codes = (
             [str(item) for item in raw_items if str(item).strip()]
@@ -739,6 +882,8 @@ def load_draft(path: str | None = None) -> SetDraft:
             inn=str(data.get("inn") or ""),
             product_group=str(data.get("product_group") or DEFAULT_PRODUCT_GROUP),
             set_code=str(data.get("set_code") or ""),
+            set_codes_pool=set_codes_pool,
+            use_all_pool=bool(data.get("use_all_pool", True)),
             capacity=int(data.get("capacity") or 0),
             item_codes=item_codes,
             names=names,
