@@ -49,6 +49,7 @@ def selftest(argv: list[str]) -> int:
     ok &= _check_charts(report)
     ok &= _check_payments(report)
     ok &= _check_pdf(report)
+    ok &= _check_pdf_labels(report)
     ok &= _check_mail(report)
 
     report.append("РЕЗУЛЬТАТ: " + ("успешно" if ok else "есть ошибки"))
@@ -207,6 +208,22 @@ def _check_pdf(report: list[str]) -> bool:
         report.append(f"счета PDF: ОШИБКА — {error}")
         return False
     report.append("счета PDF: pdfminer и таблицы кодировок на месте")
+    return True
+
+
+def _check_pdf_labels(report: list[str]) -> bool:
+    """Проверяет QtPdf в готовой сборке, где он нужен уже при запуске окна."""
+    try:
+        from PySide6.QtPdf import QPdfDocument
+
+        from app.ui import pdf_label_print  # noqa: F401
+
+        document = QPdfDocument()
+        document.close()
+    except Exception as error:  # noqa: BLE001 — результат нужен в отчёте selftest
+        report.append(f"этикетки PDF: ОШИБКА — {error}")
+        return False
+    report.append("этикетки PDF: QtPdf на месте")
     return True
 
 

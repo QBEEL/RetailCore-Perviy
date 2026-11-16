@@ -73,6 +73,16 @@ jobs:
           $size = (Get-Item $exe).Length / 1MB
           Write-Host "RetailCore.exe: $([math]::Round($size, 1)) MB"
 
+      - name: Smoke test packaged application
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          & .\dist\RetailCore.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "Packaged application selftest failed" }
+          $report = Get-Content selftest.log -Raw -Encoding utf8
+          if ($report -notmatch "этикетки PDF: QtPdf на месте" -or
+              $report -notmatch "РЕЗУЛЬТАТ: успешно") { throw "Packaged QtPdf check failed: $report" }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -124,6 +134,14 @@ jobs:
           echo "RetailCore.app: $(du -sh "$APP" | cut -f1)"
           # Проверяем, что бинарь запускается (--selftest без GUI)
           # dist/RetailCore.app/Contents/MacOS/RetailCore --version || true
+
+      - name: Smoke test packaged application
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          dist/RetailCore.app/Contents/MacOS/RetailCore --selftest
+          grep -F 'этикетки PDF: QtPdf на месте' selftest.log
+          grep -F 'РЕЗУЛЬТАТ: успешно' selftest.log
 
       - name: Create .dmg
         run: |

@@ -15,7 +15,7 @@ EXCLUDED = [
     "PySide6.QtDataVisualization", "PySide6.QtBluetooth", "PySide6.QtNfc",
     "PySide6.QtPositioning", "PySide6.QtLocation", "PySide6.QtSerialPort",
     "PySide6.QtSensors", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner",
-    "PySide6.QtHelp", "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtPdf",
+    "PySide6.QtHelp", "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets",
     "PySide6.QtPdfWidgets", "PySide6.QtSpatialAudio", "PySide6.QtTextToSpeech",
     "PySide6.QtRemoteObjects", "PySide6.QtScxml", "PySide6.QtStateMachine",
     "PySide6.QtNetworkAuth", "PySide6.QtHttpServer", "PySide6.QtUiTools",
@@ -60,7 +60,7 @@ a = Analysis(
     # COM, — через статический разбор PyInstaller его не видит. Без него
     # `.exe` не читает личные сертификаты («No module named 'win32timezone'»),
     # хотя из `start.bat` всё работает: там модуль лежит в окружении.
-    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtPrintSupport", "PySide6.QtCharts",
+    hiddenimports=["app", "rapidfuzz", "openpyxl", "PySide6.QtNetwork", "PySide6.QtPrintSupport", "PySide6.QtCharts", "PySide6.QtPdf",
                    "certifi", "win32timezone"],
     hookspath=[],
     hooksconfig={},
