@@ -434,7 +434,10 @@ class Request:
             found.append(
                 f"шаблон {', '.join(str(n) for n in sorted(wrong))} не годится "
                 f"для этой товарной группы — подойдёт {fits}")
-        if self.method.needs_production:
+        if self.method.needs_production and not (
+            same_group(self.product_group, "cosmetics")
+            and self.method is ReleaseMethod.PRODUCTION
+        ):
             found.append(
                 f"«{self.method.title}» требует сведений о производственной "
                 "площадке — они пока не подключены")
@@ -442,6 +445,19 @@ class Request:
 
     def as_json(self) -> dict[str, Any]:
         """Тело запроса. Состав и порядок — те же, что у ПРИНТМАРКИ."""
+        if same_group(self.product_group, "cosmetics"):
+            # Руководство СУЗ, 4.4.1.1.26: реквизиты заказа этой группы лежат
+            # в attributes, а технический код группы у СУЗ — chemistry.
+            return {
+                "productGroup": "chemistry",
+                "products": [line.as_json() for line in self.lines],
+                "attributes": {
+                    "contactPerson": self.contact.strip(),
+                    "releaseMethodType": self.method.value,
+                    "createMethodType": "SELF_MADE",
+                    "paymentType": int(self.payment_type),
+                },
+            }
         return {
             "productGroup": self.product_group.strip(),
             "contactPerson": self.contact.strip(),

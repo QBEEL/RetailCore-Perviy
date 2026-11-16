@@ -189,6 +189,28 @@ def test_производство_названо_неготовым_на_экр�
     assert "производственной площадке" in dialog.hint.text()
 
 
+def test_заказ_кин_косметики_с_производством_готов_к_суз(application):
+    dialog = _filled(application)
+    dialog.group_box.setCurrentIndex(dialog.group_box.findData("cosmetics"))
+    dialog.cis_type_box.setCurrentIndex(dialog.cis_type_box.findData("SET"))
+    dialog.method_box.setCurrentIndex(
+        dialog.method_box.findData(ReleaseMethod.PRODUCTION.value))
+
+    request = dialog.request
+    assert not request.problems
+    assert dialog.order_button.isEnabled()
+    assert request.as_json() == {
+        "productGroup": "chemistry",
+        "products": [request.lines[0].as_json()],
+        "attributes": {
+            "contactPerson": "Иванов Евгений",
+            "releaseMethodType": "PRODUCTION",
+            "createMethodType": "SELF_MADE",
+            "paymentType": 2,
+        },
+    }
+
+
 def test_контактное_лицо_подставлено_и_обязательно(application):
     dialog = OrderDialog([], True, "")
     dialog.add_line("04601234567893", 5)

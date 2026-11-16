@@ -254,6 +254,115 @@ def _info(code: str, **kwargs) -> CodeInfo:
     return item
 
 
+def test_saved_suz_codes_go_directly_to_sets(application, tmp_path, stub, monkeypatch):
+    from app.core.marking import issue
+    from app.ui.marking_page import SETS_TAB
+
+    gtin = "04610600250062"
+    codes = [f"01{gtin}21SET000{i}" for i in range(2)]
+    batch = issue.Batch(id="synthetic-block", contour=Contour.SANDBOX.value,
+                        gtin=gtin, codes=codes)
+    monkeypatch.setattr(issue, "saved", lambda: [batch])
+    monkeypatch.setattr(issue, "load", lambda _id: batch)
+    page = _page(application, tmp_path, restore=False)
+    page.batches.selectRow(0)
+
+    page.send_batches_to_sets()
+
+    assert page.tabs.currentIndex() == SETS_TAB
+    assert page.sets_tab.active_set_codes == tuple(codes)
+    assert page.sets_tab.batch_mode
+
+    # Повторный перенос не затирает подготовленный черновик.
+    page.send_batches_to_sets()
+    assert page.sets_tab.active_set_codes == tuple(codes)
+
+
+def test_set_application_is_saved_polled_and_never_sent_twice(
+    application, tmp_path, stub, monkeypatch
+):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    gtin = "04601234567893"
+    code = f"01{gtin}21SET001{GS}91EE11{GS}92c3ludGhldGlj"
+    ki = f"01{gtin}21SET001"
+    batch = issue.Batch(id="synthetic-set", contour=Contour.SANDBOX.value,
+                        gtin=gtin, product_group="cosmetics", codes=[code])
+    issue.save(batch)
+    _, state = stub
+    state["signed"] = True
+    state["suz"] = {Contour.SANDBOX: Credentials(
+        oms_id="b1a2c3d4-0000-1111-2222-333344445555",
+        connection_id="device", token="synthetic-token")}
+    page = _page(application, tmp_path)
+    page.batches.selectRow(0)
+
+    class Confirmation:
+        Icon = marking_page.QMessageBox.Icon
+        ButtonRole = marking_page.QMessageBox.ButtonRole
+        def __init__(self, *_args):
+            self.yes = None
+        def setWindowTitle(self, *_args): pass
+        def setIcon(self, *_args): pass
+        def setText(self, *_args): pass
+        def setInformativeText(self, *_args): pass
+        def setDefaultButton(self, *_args): pass
+        def addButton(self, _text, role):
+            button = object()
+            if role == self.ButtonRole.AcceptRole:
+                self.yes = button
+            return button
+        def exec(self): pass
+        def clickedButton(self): return self.yes
+
+    monkeypatch.setattr(marking_page, "QMessageBox", Confirmation)
+    monkeypatch.setattr(marking_page.service, "check", lambda *_args, **_kwargs: [
+        CodeInfo(code=ki, gtin=gtin, state=CodeState.EMITTED, found=True,
+                 valid=True, package_type="SET", product_group="chemistry")])
+    sent = []
+    report_id = "3179f5d2-2bf5-47d1-8df0-9452b257d851"
+    def send(current, credentials, *_args):
+        sent.append(issue.load(current.id).application_status)
+        return report_id, credentials
+    monkeypatch.setattr(marking_page.service, "send_set_application", send)
+    monkeypatch.setattr(marking_page.service, "set_application_status",
+                        lambda _id, credentials, *_args: (("SUCCESS", ""), credentials))
+
+    page.send_set_application()
+    _settle(application)
+
+    saved = issue.load(batch.id)
+    assert sent == ["SENDING"], (page.batches_hint.text(), saved.application_status)
+    assert saved.application_report_id == report_id
+    assert saved.application_status == "SUCCESS"
+    page.batch_application_status_button.click()
+    _settle(application)
+    page.send_set_application()
+    _settle(application)
+    assert sent == ["SENDING"]
+
+
+def test_unknown_application_result_survives_restart_without_resend(
+    application, tmp_path, stub, monkeypatch
+):
+    from app.core.marking import issue
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    batch = issue.Batch(id="unknown-set", contour=Contour.SANDBOX.value,
+                        product_group="cosmetics", application_status="SENDING")
+    issue.save(batch)
+    page = _page(application, tmp_path, restore=False)
+    page.batches.selectRow(0)
+
+    page._on_application_send_error(batch.id, "synthetic timeout")
+
+    assert issue.load(batch.id).application_status == "UNKNOWN"
+    assert issue.load(batch.id).application_report_id == ""
+    assert page.batch_application_status_button.isEnabled()
+
+
 # --- разбор кодов ------------------------------------------------------------------
 
 def test_коды_разбираются_без_входа_и_без_сети(application, tmp_path, stub):

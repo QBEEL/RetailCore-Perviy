@@ -857,6 +857,26 @@ def test_загрузка_csv_с_кодами_наборов_кин_и_пере�
     assert tab.set_codes_pool == []
 
 
+def test_загрузка_pdf_кин_и_вложений_без_csv(application, world, monkeypatch):
+    from app.ui.widgets import sets_tab as module
+
+    tab, _, _ = world
+    set2 = f"01{SET_GTIN}21SET002"
+    def read(path):
+        if path == "sets.pdf":
+            return [SET_KI, set2]
+        return [ITEM1_RAW, ITEM2_RAW]
+
+    monkeypatch.setattr(module.pdf_codes, "read", read)
+    tab.load_set_file("sets.pdf")
+    _settle(application)
+    assert tab.active_set_codes == (SET_KI, set2)
+
+    tab.load_file("items.pdf")
+    _settle(application)
+    assert tab.codes == [ITEM1_RAW, ITEM2_RAW]
+
+
 def test_формирование_партии_из_40_наборов_из_csv_распределяет_вложения_по_наборам(
     application, world, tmp_path
 ):

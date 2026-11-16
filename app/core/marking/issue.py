@@ -84,7 +84,11 @@ class Batch:
     tnved: str = ""
     product_group: str = ""
     release_method: str = ""
+    cis_type: str = ""
     codes: list[str] = field(default_factory=list)
+    application_report_id: str = ""
+    application_status: str = ""
+    application_error: str = ""
     # Сколько кодов от начала уже ушло на принтер. Нужно, чтобы допечатать
     # прерванное с нужного места, а не с первой этикетки.
     printed: int = 0
@@ -148,7 +152,11 @@ class Batch:
             "order_id": self.order_id, "block_id": self.block_id,
             "gtin": self.gtin, "name": self.name, "tnved": self.tnved,
             "product_group": self.product_group,
-            "release_method": self.release_method, "printed": self.printed,
+            "release_method": self.release_method, "cis_type": self.cis_type,
+            "application_report_id": self.application_report_id,
+            "application_status": self.application_status,
+            "application_error": self.application_error,
+            "printed": self.printed,
             "printed_ranges": self.print_ranges(),
             "introduced": self.introduced, "doc_id": self.doc_id,
             "doc_status": self.doc_status,
@@ -191,7 +199,7 @@ def product_info(credentials: Credentials, order_id: str,
 
 def fetch(credentials: Credentials, order_id: str, gtin: str, quantity: int,
           contour: Contour = Contour.SANDBOX, *, product: Product | None = None,
-          product_group: str = "", release_method: str = "") -> Batch:
+          product_group: str = "", release_method: str = "", cis_type: str = "") -> Batch:
     """Забирает коды из буфера заказа и **сразу сохраняет на диск**.
 
     Безвозвратная операция: коды списываются из буфера. Запрос без повторов, а
@@ -224,12 +232,13 @@ def fetch(credentials: Credentials, order_id: str, gtin: str, quantity: int,
             "СУЗ ответила, но кодов в ответе нет. Если они списались из "
             "буфера, их можно вернуть кнопкой «Восстановить».")
     return _store(codes, block_id, order_id, gtin, contour, product,
-                  product_group, release_method)
+                  product_group, release_method, cis_type)
 
 
 def recover(credentials: Credentials, order_id: str, gtin: str,
             contour: Contour = Contour.SANDBOX, *, product: Product | None = None,
-            product_group: str = "", release_method: str = "") -> list[Batch]:
+            product_group: str = "", release_method: str = "",
+            cis_type: str = "") -> list[Batch]:
     """Возвращает блоки, выданные ранее, но не сохранённые на этом компьютере.
 
     Работает, пока заказ не закрыт и первое получение шло через API
@@ -258,7 +267,8 @@ def recover(credentials: Credentials, order_id: str, gtin: str,
         codes, got_id = _codes(reply)
         if codes:
             restored.append(_store(codes, got_id or block_id, order_id, gtin,
-                                   contour, product, product_group, release_method))
+                                   contour, product, product_group, release_method,
+                                   cis_type))
     return restored
 
 
@@ -296,7 +306,7 @@ def _file(batch_id: str) -> str:
 
 def _store(codes: list[str], block_id: str, order_id: str, gtin: str,
            contour: Contour, product: Product | None, product_group: str,
-           release_method: str) -> Batch:
+           release_method: str, cis_type: str) -> Batch:
     now = datetime.now()
     batch = Batch(
         id=f"{now:%Y%m%d-%H%M%S}-{gtin}-{(block_id or 'x')[:8]}",
@@ -304,7 +314,8 @@ def _store(codes: list[str], block_id: str, order_id: str, gtin: str,
         contour=contour.value, order_id=order_id, block_id=block_id, gtin=gtin,
         name=(product.name if product else ""),
         tnved=(product.tnved if product else ""),
-        product_group=product_group, release_method=release_method, codes=codes)
+        product_group=product_group, release_method=release_method,
+        cis_type=cis_type, codes=codes)
     save(batch)
     return batch
 
@@ -352,6 +363,10 @@ def load(batch_id: str) -> Batch | None:
         name=str(raw.get("name") or ""), tnved=str(raw.get("tnved") or ""),
         product_group=str(raw.get("product_group") or ""),
         release_method=str(raw.get("release_method") or ""),
+        cis_type=str(raw.get("cis_type") or ""),
+        application_report_id=str(raw.get("application_report_id") or ""),
+        application_status=str(raw.get("application_status") or ""),
+        application_error=str(raw.get("application_error") or ""),
         codes=[str(code) for code in raw["codes"]],
         printed=int(raw.get("printed") or 0), introduced=str(raw.get("introduced") or ""),
         printed_ranges=raw.get("printed_ranges") or [],
@@ -429,6 +444,16 @@ def mark_status(batch: Batch, status: str, failed: bool = False) -> None:
     batch.doc_status = status
     if failed:
         batch.introduced_count = 0
+    save(batch)
+
+
+def mark_application(batch: Batch, status: str, report_id: str = "",
+                     error: str = "") -> None:
+    """Сохраняет этап нанесения до сети и после каждого подтверждённого ответа."""
+    batch.application_status = status
+    if report_id:
+        batch.application_report_id = report_id
+    batch.application_error = error
     save(batch)
 
 

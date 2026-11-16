@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from typing import Callable, Sequence
+from uuid import UUID
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
@@ -73,11 +74,13 @@ from ..core.marking import (
     codes as codes_module,
 )
 from ..core.marking import check_export, deadlines
+from ..core.marking import application as application_module
 from ..core.marking import issue as issue_module
 from ..core.marking import introduce as introduce_module
 from ..core.marking import orders as orders_module, service
 from ..core.marking import onec as onec_module
 from ..core.marking import reconcile as reconcile_module, upd as upd_module
+from ..core.marking.models import CodeState, same_group
 from ..core.marking.onec import Catalog, LineMatch, MatchKind, OnecProblem
 from ..core.marking.orders import ReleaseMethod
 from ..core.marking.reconcile import Reconciliation, Scan, Verdict
@@ -248,6 +251,7 @@ class MarkingPage(QWidget):
         self._suz_answer = ""
         self._orders: list = []
         self._batches: list[issue_module.Batch] = []
+        self._application_poll_attempts: dict[str, int] = {}
         # Документ, с которым идёт сверка, и её ход. Живут, пока открыто окно:
         # сверку начинают на приёмке и заканчивают через полчаса, уходя за
         # каждой следующей коробкой, и терять её при переключении вкладки
@@ -656,6 +660,17 @@ class MarkingPage(QWidget):
         self.batch_introduce_button = self._action(
             card, "Ввод в оборот…", "export", self.introduce_batch)
         header.addWidget(self.batch_introduce_button)
+        self.batch_application_button = self._action(
+            card, "Нанесение…", "check", self.send_set_application)
+        self.batch_application_button.setToolTip(
+            "Подписать и отправить отчёт о нанесении КИН набора в СУЗ")
+        self.batch_application_status_button = self._action(
+            card, "Статус нанесения", "refresh",
+            lambda: self.check_set_application_status())
+        self.batch_sets_button = self._action(
+            card, "В наборы…", "order", self.send_batches_to_sets)
+        self.batch_sets_button.setToolTip(
+            "Передать КИН из выбранных сохранённых блоков во вкладку «Формирование наборов»")
         self.batch_status_button = self._action(
             card, "Статус документа", "refresh", self.refresh_document_status)
         self.batch_status_button.setToolTip(
@@ -677,16 +692,25 @@ class MarkingPage(QWidget):
                                            self.reload_batches))
         body.addLayout(header)
 
-        self.batches = QTableWidget(0, 5, card)
+        sets_actions = QHBoxLayout()
+        sets_actions.setSpacing(9)
+        sets_actions.addWidget(QLabel("КИН наборов:", card))
+        sets_actions.addWidget(self.batch_application_button)
+        sets_actions.addWidget(self.batch_application_status_button)
+        sets_actions.addWidget(self.batch_sets_button)
+        sets_actions.addStretch(1)
+        body.addLayout(sets_actions)
+
+        self.batches = QTableWidget(0, 6, card)
         self.batches.setHorizontalHeaderLabels(
-            ["Получен", "Товар", "Всего", "Напечатано", "Ввод в оборот"])
+            ["Получен", "Товар", "Всего", "Напечатано", "Ввод в оборот", "Нанесение"])
         self.batches.verticalHeader().setVisible(False)
         self.batches.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.batches.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.batches.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         head = self.batches.horizontalHeader()
         head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in (0, 2, 3, 4):
+        for column in (0, 2, 3, 4, 5):
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.batches.itemDoubleClicked.connect(lambda _item: self.print_batch())
         self.batches.itemSelectionChanged.connect(self._sync_batches_hint)
@@ -1800,12 +1824,14 @@ class MarkingPage(QWidget):
             return
         self._set_busy(True)
         self.orders_hint.setText("Получаем коды и сохраняем их на диск…")
+        cis_type = _order_cis_type(order, dialog.gtin)
+        extra = {"cis_type": cis_type} if cis_type else {}
         run_task(
             service.fetch_suz_codes,
             self.suz_credentials, order.id, dialog.gtin, dialog.count,
             self.contour, self.thumbprint, self.settings.marking_inn,
             product=dialog.product, product_group=order.product_group,
-            release_method=str(order.raw.get("releaseMethodType") or ""),
+            release_method=_order_release_method(order), **extra,
             on_result=self._on_codes_fetched,
             on_error=self._on_fetch_error,
         )
@@ -1981,7 +2007,8 @@ class MarkingPage(QWidget):
             self.suz_credentials, order.id, gtins, self.contour, self.thumbprint,
             self.settings.marking_inn,
             product_group=order.product_group,
-            release_method=str(order.raw.get("releaseMethodType") or ""),
+            release_method=_order_release_method(order),
+            cis_type=_order_cis_type(order, gtins[0]) if len(gtins) == 1 else "",
             on_result=self._on_codes_recovered,
             on_error=self._on_recover_error,
         )
@@ -2020,8 +2047,10 @@ class MarkingPage(QWidget):
             product = f"{batch.name} · {batch.gtin}" if batch.name else batch.gtin
             done = f"{batch.printed_count} из {batch.total}"
             introduced = _introduced_text(batch)
+            application_status = application_module.STATUS_TITLES.get(
+                batch.application_status, batch.application_status or "—")
             for column, text in enumerate((when, product, str(batch.total), done,
-                                           introduced)):
+                                           introduced, application_status)):
                 cell = QTableWidgetItem(text)
                 if column in (2, 3):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignRight
@@ -2043,6 +2072,13 @@ class MarkingPage(QWidget):
 
     def _sync_batches_hint(self) -> None:
         batch = self._selected_batch()
+        selected = self.batches.selectionModel().selectedRows()
+        self.batch_sets_button.setEnabled(bool(selected) and not self._busy)
+        self.batch_application_button.setEnabled(batch is not None and not self._busy)
+        self.batch_application_status_button.setEnabled(
+            bool(batch and (batch.application_report_id or
+                            batch.application_status in ("SENDING", "UNKNOWN")))
+            and not self._busy)
         self.batch_delete_button.setEnabled(batch is not None and not self._busy)
         if not self._batches:
             self.batches_hint.setText(
@@ -2059,6 +2095,239 @@ class MarkingPage(QWidget):
         self.batches_hint.setText(
             f"Выбран блок на {batch.total} кодов, напечатано {batch.printed_count}."
             f"{tail}")
+
+    def send_set_application(self) -> None:
+        """Подтверждает физическое нанесение и проверяет КИН перед отчётом СУЗ."""
+        chosen = self._selected_batch()
+        batch = issue_module.load(chosen.id) if chosen else None
+        if batch is None:
+            self.notify("Выберите один сохранённый блок КИН", ToastKind.WARNING)
+            return
+        if batch.application_status:
+            self.notify(
+                "Для блока уже начата подача отчёта. Проверьте его статус в СУЗ; "
+                "повторная отправка может создать второй отчёт.", ToastKind.WARNING)
+            return
+        if batch.contour != self.contour.value or not same_group(batch.product_group, "cosmetics"):
+            self.notify("Выберите блок наборов косметики текущего контура", ToastKind.WARNING)
+            return
+        if not self.suz_credentials.stripped().filled or not self.thumbprint:
+            self.notify("Для отчёта нужны реквизиты СУЗ и сертификат", ToastKind.WARNING)
+            return
+        if not service.signed_in() or service.current().contour != self.contour:
+            self.notify("Войдите по сертификату для проверки кодов перед отчётом", ToastKind.WARNING)
+            return
+        try:
+            # Тип SET подтверждаем ответом ЧЗ, а не метаданными старого заказа.
+            if not 1 <= batch.total <= application_module.MAX_CODES:
+                raise ValueError("В одном отчёте должно быть от 1 до 30 000 КИН.")
+            parsed = [codes_module.parse(code) for code in batch.codes]
+            if any(not item.valid or not item.full for item in parsed):
+                raise ValueError("В блоке нет полных кодов с проверочной частью.")
+        except ValueError as error:
+            self.notify(str(error), ToastKind.WARNING)
+            return
+
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Отчёт о нанесении КИН")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText("Коды физически нанесены на наборы?")
+        confirm.setInformativeText(
+            f"После подтверждения программа проверит {batch.total} КИН и отправит "
+            "подписанный отчёт в СУЗ. Отправку нельзя отменить.")
+        yes = confirm.addButton("Нанесены — продолжить", QMessageBox.ButtonRole.AcceptRole)
+        cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        confirm.setDefaultButton(cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not yes:
+            return
+        self._set_busy(True)
+        self.batches_hint.setText("Проверяем КИН набора в ЧЗ перед отчётом…")
+        run_task(
+            service.check, batch.codes, contour=self.contour, use_cache=False,
+            on_result=lambda infos: self._on_application_checked(batch.id, infos),
+            on_error=self._on_application_precheck_error,
+        )
+
+    def _on_application_precheck_error(self, message: str) -> None:
+        self._set_busy(False)
+        self.batches_hint.setText(f"Отчёт не отправлен: {message}")
+        self.notify(f"Проверка КИН не удалась: {message}", ToastKind.ERROR)
+
+    def _on_application_checked(self, batch_id: str, infos: list[CodeInfo]) -> None:
+        batch = issue_module.load(batch_id)
+        if batch is None or batch.application_status:
+            self._on_application_precheck_error("Блок изменился во время проверки")
+            return
+        expected = {codes_module.parse(code).ki for code in batch.codes}
+        actual = {info.code for info in infos}
+        if len(expected) != batch.total or actual != expected or len(infos) != batch.total:
+            self._on_application_precheck_error("ЧЗ не вернул сведения обо всех КИН")
+            return
+        if any(not info.found or not info.valid or info.gtin != batch.gtin
+               or info.package_type not in ("SET", "PRODUCT_SET", "LEVEL1")
+               or not same_group(info.product_group, batch.product_group)
+               for info in infos):
+            self._on_application_precheck_error(
+                "Не все коды подтверждены как КИН наборов этой товарной группы")
+            return
+        states = {info.state for info in infos}
+        if states == {CodeState.APPLIED}:
+            batch.cis_type = "SET"
+            issue_module.mark_application(batch, "APPLIED_EXTERNAL")
+            self._set_busy(False)
+            self.reload_batches(select=batch_id)
+            self.notify("Все КИН уже нанесены. Отчёт повторно не отправлен.",
+                        ToastKind.SUCCESS)
+            return
+        if states != {CodeState.EMITTED}:
+            self._on_application_precheck_error(
+                "КИН имеют разные или неподходящие статусы. Отчёт не отправлен.")
+            return
+        batch.cis_type = "SET"
+        try:
+            application_module.payload(batch)
+            issue_module.mark_application(batch, "SENDING")
+        except (ValueError, OSError) as error:
+            self._on_application_precheck_error(str(error))
+            return
+        self.batches_hint.setText("Подписываем и отправляем отчёт о нанесении в СУЗ…")
+        run_task(
+            service.send_set_application, batch, self.suz_credentials,
+            self.contour, self.thumbprint, self.settings.marking_inn,
+            on_result=lambda result: self._on_application_sent(batch_id, result),
+            on_error=lambda message: self._on_application_send_error(batch_id, message),
+        )
+
+    def _on_application_sent(self, batch_id: str, result: tuple) -> None:
+        report_id, credentials = result
+        self._adopt_credentials(credentials)
+        batch = issue_module.load(batch_id)
+        if batch is not None:
+            issue_module.mark_application(batch, "PENDING", report_id)
+        self._set_busy(False)
+        self.reload_batches(select=batch_id)
+        self.notify("Отчёт принят СУЗ. Проверяем результат обработки…", ToastKind.INFO)
+        self._application_poll_attempts[batch_id] = 12
+        self.check_set_application_status(batch_id)
+
+    def _on_application_send_error(self, batch_id: str, message: str) -> None:
+        batch = issue_module.load(batch_id)
+        if batch is not None:
+            issue_module.mark_application(batch, "UNKNOWN", error=message)
+        self._set_busy(False)
+        self.reload_batches(select=batch_id)
+        self.batches_hint.setText("Результат отправки неизвестен. Проверьте отчёты в СУЗ.")
+        self.notify("Результат отправки неизвестен: проверьте отчёты в СУЗ. "
+                    "Автоматический повтор заблокирован.", ToastKind.WARNING)
+
+    def check_set_application_status(self, batch_id: str = "") -> None:
+        chosen = self._selected_batch()
+        batch = issue_module.load(batch_id or chosen.id) if batch_id or chosen else None
+        if batch is None:
+            self.notify("Выберите блок КИН набора", ToastKind.WARNING)
+            return
+        if batch.contour != self.contour.value:
+            self.notify("Выберите контур, в котором отправлен отчёт", ToastKind.WARNING)
+            return
+        if not batch.application_report_id:
+            if batch.application_status not in ("SENDING", "UNKNOWN"):
+                self.notify("У выбранного блока нет номера отчёта о нанесении", ToastKind.WARNING)
+                return
+            entered, accepted = QInputDialog.getText(
+                self, "Номер отчёта о нанесении",
+                "Найдите отчёт в СУЗ и введите его идентификатор для проверки:")
+            if not accepted:
+                return
+            try:
+                report_id = str(UUID(entered.strip()))
+            except ValueError:
+                self.notify("Номер отчёта должен быть UUID из СУЗ", ToastKind.WARNING)
+                return
+            issue_module.mark_application(batch, "PENDING", report_id)
+        self._set_busy(True)
+        self.batches_hint.setText("Читаем статус отчёта о нанесении в СУЗ…")
+        run_task(
+            service.set_application_status, batch.application_report_id,
+            self.suz_credentials, self.contour, self.thumbprint,
+            self.settings.marking_inn,
+            on_result=lambda result: self._on_application_status(batch.id, result),
+            on_error=self._on_application_status_error,
+        )
+
+    def _on_application_status(self, batch_id: str, result: tuple) -> None:
+        (status, reason), credentials = result
+        self._adopt_credentials(credentials)
+        batch = issue_module.load(batch_id)
+        if batch is not None:
+            issue_module.mark_application(batch, status, error=reason)
+        self._set_busy(False)
+        self.reload_batches(select=batch_id)
+        if status == application_module.DONE:
+            self._application_poll_attempts.pop(batch_id, None)
+            self.notify("Отчёт обработан успешно. КИН готовы к формированию набора.",
+                        ToastKind.SUCCESS)
+        elif status in application_module.FAILED:
+            self._application_poll_attempts.pop(batch_id, None)
+            self.notify(f"Отчёт о нанесении не обработан: {status}. {reason}",
+                        ToastKind.ERROR)
+        else:
+            self.notify(f"Отчёт о нанесении: {status}. Проверка продолжится автоматически.",
+                        ToastKind.INFO)
+            remaining = self._application_poll_attempts.get(batch_id, 0)
+            if remaining:
+                self._application_poll_attempts[batch_id] = remaining - 1
+                QTimer.singleShot(15_000, lambda: self._poll_application_later(batch_id))
+
+    def _poll_application_later(self, batch_id: str) -> None:
+        batch = issue_module.load(batch_id)
+        if (not self._busy and batch_id in self._application_poll_attempts
+                and batch and batch.application_status in application_module.PENDING):
+            self.check_set_application_status(batch_id)
+
+    def _on_application_status_error(self, message: str) -> None:
+        self._set_busy(False)
+        self.batches_hint.setText(f"Статус отчёта пока не получен: {message}")
+        self.notify("Статус не получен. Отчёт повторно не отправлен.", ToastKind.WARNING)
+
+    def send_batches_to_sets(self) -> None:
+        """Передаёт сохранённые коды СУЗ в черновик формирования наборов."""
+        rows = sorted({index.row() for index in self.batches.selectionModel().selectedRows()})
+        if not rows:
+            self.notify("Выберите блоки с кодами наборов", ToastKind.WARNING)
+            return
+        if (self.sets_tab.set_code or self.sets_tab.codes
+                or self.sets_tab._pending_submission()):
+            self.notify(
+                "Во вкладке «Формирование наборов» уже есть черновик. "
+                "Завершите или очистите его перед переносом КИН.", ToastKind.WARNING)
+            return
+
+        batches = [issue_module.load(self._batches[row].id) for row in rows]
+        if any(batch is None for batch in batches):
+            self.notify("Один из блоков не найден на диске. Обновите список блоков.",
+                        ToastKind.ERROR)
+            return
+        if any(batch.contour != self.contour.value for batch in batches):
+            self.notify("Выберите блоки текущего контура СУЗ", ToastKind.WARNING)
+            return
+        codes = [code for batch in batches for code in batch.codes]
+        parsed = [codes_module.parse(code) for code in codes]
+        if (not codes or any(not item.valid or not item.ki for item in parsed)
+                or len({item.ki for item in parsed}) != len(parsed)
+                or len({item.gtin for item in parsed}) != 1):
+            self.notify(
+                "Блоки должны содержать уникальные корректные КИН одного GTIN.",
+                ToastKind.WARNING)
+            return
+        loaded = self.sets_tab.load_set_codes("\n".join(codes))
+        if loaded != len(codes):
+            self.notify("Не все КИН перенесены. Проверьте черновик набора.",
+                        ToastKind.ERROR)
+            return
+        self.tabs.setCurrentIndex(SETS_TAB)
+        self.notify(f"Передано КИН наборов: {loaded}. Добавьте коды вложений.",
+                    ToastKind.SUCCESS)
 
     def print_batch(self) -> None:
         rows = sorted({index.row() for index in self.batches.selectionModel().selectedRows()})
@@ -3210,6 +3479,15 @@ class MarkingPage(QWidget):
         self._sync_close_button()
         self.batch_delete_button.setEnabled(
             self._selected_batch() is not None and not self._busy)
+        self.batch_application_button.setEnabled(
+            self._selected_batch() is not None and not self._busy)
+        self.batch_application_status_button.setEnabled(
+            bool(self._selected_batch() and
+                 (self._selected_batch().application_report_id or
+                  self._selected_batch().application_status in ("SENDING", "UNKNOWN")))
+            and not self._busy)
+        self.batch_sets_button.setEnabled(
+            bool(self.batches.selectionModel().selectedRows()) and not self._busy)
         if not self._busy:
             self.session_hint.setText(self._session_summary())
         self._sync_identity()
@@ -3339,6 +3617,17 @@ def _fit_to_current(tabs: QTabWidget) -> None:
                                  else QSizePolicy.Policy.Ignored)
         page.setSizePolicy(policy)
     tabs.updateGeometry()
+
+
+def _order_release_method(order) -> str:
+    attributes = order.raw.get("attributes") or {}
+    return str((attributes.get("releaseMethodType") if isinstance(attributes, dict) else "")
+               or order.raw.get("releaseMethodType") or "")
+
+
+def _order_cis_type(order, gtin: str) -> str:
+    return next((str(buffer.raw.get("cisType") or "")
+                 for buffer in order.buffers if buffer.gtin == gtin), "")
 
 
 def _contour_title(value: str) -> str:

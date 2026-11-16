@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from . import codes as codes_module
-from . import crypto, introduce, issue, orders as orders_module, session, store, suz, transport
+from . import application, crypto, introduce, issue, orders as orders_module, session, store, suz, transport
 from .models import (
     BATCH_SIZE,
     CodeInfo,
@@ -261,7 +261,8 @@ def fetch_suz_codes(credentials: suz.Credentials, order_id: str, gtin: str,
                     quantity: int, contour: Contour = Contour.SANDBOX,
                     thumbprint: str = "", inn: str = "", *,
                     product: issue.Product | None = None, product_group: str = "",
-                    release_method: str = "") -> tuple[issue.Batch, suz.Credentials]:
+                    release_method: str = "", cis_type: str = ""
+                    ) -> tuple[issue.Batch, suz.Credentials]:
     """Забирает коды из буфера и сохраняет их на диск до возврата.
 
     Безвозвратная операция. Повтор после обновления токена безопасен: отказ по
@@ -271,26 +272,28 @@ def fetch_suz_codes(credentials: suz.Credentials, order_id: str, gtin: str,
         credentials, contour, thumbprint, inn,
         lambda ready: issue.fetch(ready, order_id, gtin, quantity, contour,
                                   product=product, product_group=product_group,
-                                  release_method=release_method))
+                                  release_method=release_method, cis_type=cis_type))
 
 
 def recover_suz_codes(credentials: suz.Credentials, order_id: str, gtin: str,
                       contour: Contour = Contour.SANDBOX, thumbprint: str = "",
                       inn: str = "", *, product: issue.Product | None = None,
-                      product_group: str = "", release_method: str = ""
+                      product_group: str = "", release_method: str = "",
+                      cis_type: str = ""
                       ) -> tuple[list[issue.Batch], suz.Credentials]:
     """Возвращает выданные ранее, но не сохранённые здесь блоки кодов."""
     return with_fresh_token(
         credentials, contour, thumbprint, inn,
         lambda ready: issue.recover(ready, order_id, gtin, contour, product=product,
                                     product_group=product_group,
-                                    release_method=release_method))
+                                    release_method=release_method, cis_type=cis_type))
 
 
 def recover_order_codes(credentials: suz.Credentials, order_id: str,
                         gtins: Sequence[str], contour: Contour = Contour.SANDBOX,
                         thumbprint: str = "", inn: str = "", *,
-                        product_group: str = "", release_method: str = ""
+                        product_group: str = "", release_method: str = "",
+                        cis_type: str = ""
                         ) -> tuple[list[issue.Batch], suz.Credentials]:
     """Возвращает потерянные блоки по всем товарам заказа.
 
@@ -304,15 +307,30 @@ def recover_order_codes(credentials: suz.Credentials, order_id: str,
         found, credentials = recover_suz_codes(
             credentials, order_id, gtin, contour, thumbprint, inn,
             product=products.get(gtin), product_group=product_group,
-            release_method=release_method)
+            release_method=release_method, cis_type=cis_type)
         restored.extend(found)
     return restored, credentials
 
 
-# Заказы читаются и заводятся. Признак остаётся: по нему вкладка отличает
-# «пока нельзя» от «можно», и следующие методы СУЗ — получение кодов и отчёт о
-# нанесении — будут добавляться так же.
 ORDERING_READY = True
+
+
+def send_set_application(batch: issue.Batch, credentials: suz.Credentials,
+                         contour: Contour, thumbprint: str, inn: str = ""
+                         ) -> tuple[str, suz.Credentials]:
+    """Подаёт один отчёт о нанесении КИН с обновлением токена при отказе в авторизации."""
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: application.send(batch, ready, thumbprint, contour))
+
+
+def set_application_status(report_id: str, credentials: suz.Credentials,
+                           contour: Contour, thumbprint: str = "", inn: str = ""
+                           ) -> tuple[tuple[str, str], suz.Credentials]:
+    """Читает статус ранее отправленного отчёта, не создавая новый."""
+    return with_fresh_token(
+        credentials, contour, thumbprint, inn,
+        lambda ready: application.status(report_id, ready, contour))
 
 
 # --- проверка кодов ------------------------------------------------------------------
