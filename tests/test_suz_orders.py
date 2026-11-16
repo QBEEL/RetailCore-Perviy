@@ -122,6 +122,42 @@ def test_полученное_и_оставшееся_считаются_отд�
     assert order.buffers[0].available == 250
 
 
+def test_заказ_с_ошибкой_и_отрицательными_счётчиками_можно_закрыть(answered):
+    _, state = answered
+    state["body"] = {"orderInfos": [{
+        "orderId": "ошибка-1", "orderStatus": "CREATED",
+        "declineReason": "Для кода товара не найдена карточка или нет прав",
+        "buffers": [{"gtin": "04601234567893", "leftInBuffer": -1,
+                     "totalPassed": -1, "bufferStatus": "REJECTED"}],
+    }]}
+
+    order = orders.orders(FULL, Contour.SANDBOX)[0]
+
+    assert order.has_error and order.closable
+    assert order.passed == 0 and order.left == 0
+
+
+def test_отклонённый_заказ_уже_завершён(answered):
+    _, state = answered
+    state["body"] = {"orderInfos": [{
+        "orderId": "ошибка-2", "orderStatus": "DECLINED",
+        "declineReason": "Ошибка карточки товара",
+    }]}
+
+    assert not orders.orders(FULL, Contour.SANDBOX)[0].closable
+
+
+def test_скрытые_заказы_разделены_по_станции_и_контуру(profile):
+    orders.archive(Contour.SANDBOX, OMS, ["ошибка-1"])
+
+    assert orders.archived_ids(Contour.SANDBOX, OMS) == {"ошибка-1"}
+    assert orders.archived_ids(Contour.PRODUCTION, OMS) == set()
+    assert orders.archived_ids(Contour.SANDBOX, "другая-станция") == set()
+
+    orders.archive(Contour.SANDBOX, OMS, ["ошибка-1"], hidden=False)
+    assert orders.archived_ids(Contour.SANDBOX, OMS) == set()
+
+
 def test_просроченный_буфер_с_остатком_помечается(answered):
     """Коды в нём числятся, а забрать их уже нельзя — молчать об этом обман."""
     _, state = answered

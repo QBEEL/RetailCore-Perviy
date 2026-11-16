@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -73,6 +74,7 @@ DEFAULT_PAYMENT = 2
 # Журнал, в который попадает ответ незнакомого вида. Разбирать его вручную
 # лучше по записи, чем по пересказу пользователя.
 LOG_FILE = "marking.log"
+ARCHIVE_FILE = "marking_archived_orders.json"
 
 
 # Состояния заказа и буфера приводятся к человеческому виду только там, где мы
@@ -262,12 +264,20 @@ class Order:
     @property
     def left(self) -> int:
         """Сколько кодов ещё можно забрать по всему заказу."""
-        return sum(buffer.left for buffer in self.buffers)
+        return sum(max(buffer.left, 0) for buffer in self.buffers)
 
     @property
     def passed(self) -> int:
         """Сколько кодов уже получено. Разница с заказанным — это и есть остаток."""
-        return sum(buffer.passed for buffer in self.buffers)
+        return sum(max(buffer.passed, 0) for buffer in self.buffers)
+
+    @property
+    def has_error(self) -> bool:
+        """СУЗ сообщила об ошибке заказа или одного из его товаров."""
+        return bool(self.declined or any(
+            buffer.status.upper() == "REJECTED"
+            or buffer.raw.get("rejectionReason")
+            for buffer in self.buffers))
 
     @property
     def products(self) -> int:
@@ -280,12 +290,12 @@ class Order:
 
     @property
     def closable(self) -> bool:
-        """Можно ли закрыть: коды по заказу уже получены, а сам он ещё открыт.
+        """Можно ли закрыть открытый заказ с кодами или ошибкой СУЗ.
 
-        Заказ без единой выданной пачки закрывать нечем — закрывать там нечего,
-        а необратимое действие над нетронутым заказом почти наверняка ошибка.
+        Нетронутый заказ без ошибки закрывать незачем. Отклонённый заказ уже
+        завершён; повторно посылать для него закрытие не нужно.
         """
-        return bool(self.id) and not self.finished and self.passed > 0
+        return bool(self.id) and not self.finished and (self.passed > 0 or self.has_error)
 
     @property
     def expiring(self) -> bool:
@@ -295,6 +305,52 @@ class Order:
         нельзя, и «доступно 300» без оговорки было бы обманом.
         """
         return any(buffer.expired and buffer.left > 0 for buffer in self.buffers)
+
+
+def archived_ids(contour: Contour, oms_id: str) -> set[str]:
+    """Локально скрытые заказы только выбранной станции и контура."""
+    try:
+        with open(appdata.path_to(ARCHIVE_FILE), encoding="utf-8") as handle:
+            records = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(records, list):
+        return set()
+    return {row["order_id"] for row in records if isinstance(row, dict)
+            and row.get("contour") == contour.value
+            and row.get("oms_id") == oms_id
+            and isinstance(row.get("order_id"), str)}
+
+
+def archive(contour: Contour, oms_id: str, order_ids: Sequence[str],
+            *, hidden: bool = True) -> None:
+    """Сохраняет локальную видимость заказов, не меняя их состояние в СУЗ."""
+    path = appdata.path_to(ARCHIVE_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            records = json.load(handle)
+    except FileNotFoundError:
+        records = []
+    except ValueError as error:
+        raise OSError("Локальный список скрытых заказов повреждён.") from error
+    if not isinstance(records, list):
+        raise OSError("Локальный список скрытых заказов повреждён.")
+    ids = set(order_ids)
+    records = [row for row in records if not (
+        isinstance(row, dict) and row.get("contour") == contour.value
+        and row.get("oms_id") == oms_id and row.get("order_id") in ids)]
+    if hidden:
+        records.extend({"contour": contour.value, "oms_id": oms_id,
+                        "order_id": order_id} for order_id in ids)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, ensure_ascii=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 @dataclass(slots=True)

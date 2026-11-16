@@ -2306,6 +2306,55 @@ def test_нетронутый_заказ_закрыть_нельзя(application
     assert closed == [] and asked["text"] == []
 
 
+def test_заказ_с_ошибкой_чз_закрывается_после_подтверждения(
+        application, tmp_path, stub, monkeypatch, asked):
+    failed = _order(status="CREATED", declined="Карточка товара не найдена",
+                    buffers=[Buffer(gtin="04601234567893", left=-3,
+                                    passed=-3, total=3, status="REJECTED")])
+    page, closed = _close_page(application, tmp_path, stub, monkeypatch,
+                               order=failed)
+    page.orders.selectRow(0)
+
+    assert page.close_order_button.isEnabled()
+    assert page.orders.item(0, 4).text() == "0"
+    assert page.orders.item(0, 5).text() == "0"
+    page.close_order()
+    _settle(application)
+
+    assert closed == [("3a8f-0001", Contour.SANDBOX, "ААББ")]
+    assert page.orders.item(0, 2).text() == "Закрыт"
+    assert "Заказов с ошибкой СУЗ: 1" in "\n".join(asked["text"])
+
+
+def test_отклонённый_заказ_скрывается_локально_и_возвращается(
+        application, tmp_path, stub, monkeypatch, asked):
+    _, state = stub
+    state["suz"] = {Contour.SANDBOX: SUZ}
+    state["orders"] = [_order(status="DECLINED", declined="Нет прав на товар",
+                              buffers=[Buffer(gtin="04601234567893", passed=-3)])]
+    page = _page(application, tmp_path)
+    _settle(application)
+    page.orders.selectRow(0)
+
+    assert not page.close_order_button.isEnabled()
+    assert page.archive_order_button.isEnabled()
+    assert page.orders.item(0, 2).text() == "Отклонён: Нет прав на товар"
+    page.archive_order()
+    _settle(application)
+
+    assert page.orders.rowCount() == 0
+    page.show_archived_orders.setChecked(True)
+    _settle(application)
+    assert page.orders.rowCount() == 1
+    page.orders.selectRow(0)
+    assert page.archive_order_button.text() == "Вернуть в список"
+    page.archive_order()
+    _settle(application)
+    page.show_archived_orders.setChecked(False)
+    _settle(application)
+    assert page.orders.rowCount() == 1
+
+
 def test_отказ_суз_при_закрытии_не_делает_заказ_закрытым(application, tmp_path, stub, monkeypatch,
                                           asked):
     from app.ui import marking_page

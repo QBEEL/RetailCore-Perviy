@@ -603,11 +603,22 @@ class MarkingPage(QWidget):
         self.close_order_button = self._action(card, "Закрыть заказ…", "close",
                                                self.close_order)
         self.close_order_button.setToolTip(
-            "Закрывает выбранные заказы в СУЗ, когда коды по ним уже получены. "
+            "Закрывает выбранные заказы в СУЗ, когда коды по ним уже получены "
+            "или СУЗ сообщила об ошибке. "
             "Несколько заказов выбираются с Ctrl или Shift. Необратимо: после "
             "закрытия потерянный блок кодов не вернуть")
         self.close_order_button.setEnabled(False)
         header.addWidget(self.close_order_button)
+        self.archive_order_button = self._action(
+            card, "Убрать отклонённый", "filter", self.archive_order)
+        self.archive_order_button.setToolTip(
+            "Отклонённый заказ уже завершён в СУЗ. Убирает его только из "
+            "списка на этом компьютере")
+        self.archive_order_button.setEnabled(False)
+        header.addWidget(self.archive_order_button)
+        self.show_archived_orders = QCheckBox("Показать скрытые", card)
+        self.show_archived_orders.toggled.connect(self.reload_orders)
+        header.addWidget(self.show_archived_orders)
         self.orders_button = self._icon_action(card, "Обновить список заказов",
                                                "refresh", self.reload_orders)
         header.addWidget(self.orders_button)
@@ -627,7 +638,7 @@ class MarkingPage(QWidget):
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self.orders.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.orders.setMinimumHeight(150)
-        self.orders.itemSelectionChanged.connect(self._sync_close_button)
+        self.orders.itemSelectionChanged.connect(self._sync_order_buttons)
         head = self.orders.horizontalHeader()
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in (1, 2, 3, 4, 5):
@@ -1691,11 +1702,16 @@ class MarkingPage(QWidget):
             # предложить человеку вернуть протухший, нажав «Сохранить».
             self._show_suz(credentials)
             self.notify("Токен СУЗ обновлён по сертификату", ToastKind.INFO)
-        self._orders = list(found)
+        hidden = orders_module.archived_ids(
+            self.contour, self.suz_credentials.stripped().oms_id)
+        self._orders = [order for order in found
+                        if self.show_archived_orders.isChecked() or order.id not in hidden]
         self.orders.setRowCount(len(self._orders))
         for row, order in enumerate(self._orders):
             when = f"{order.created_at:%d.%m.%Y}" if order.created_at else "—"
-            cells = (order.id, when, order.declined or order.title,
+            state = (f"{order.title}: {order.declined}" if order.declined
+                     else order.title)
+            cells = (order.id, when, state,
                      str(order.products), str(order.passed), str(order.left))
             for column, text in enumerate(cells):
                 cell = QTableWidgetItem(text)
@@ -1712,7 +1728,7 @@ class MarkingPage(QWidget):
                 # нельзя. Показать их числом без оговорки — обмануть.
                 self.orders.item(row, 5).setForeground(QColor(Palette.DANGER))
         self.orders_button.setEnabled(True)
-        self._sync_close_button()
+        self._sync_order_buttons()
         self._sync_orders_hint()
 
     def _on_orders_error(self, message: str) -> None:
@@ -1883,8 +1899,44 @@ class MarkingPage(QWidget):
             f"Закрыть заказы ({len(closable)})…" if len(closable) > 1
             else "Закрыть заказ…")
 
+    def _sync_order_buttons(self) -> None:
+        self._sync_close_button()
+        selected = self._selected_orders()
+        declined = [order for order in selected if order.status.upper() == "DECLINED"]
+        self.archive_order_button.setEnabled(bool(declined) and not self._busy)
+        hidden = orders_module.archived_ids(
+            self.contour, self.suz_credentials.stripped().oms_id)
+        restoring = bool(declined) and all(order.id in hidden for order in declined)
+        self.archive_order_button.setText(
+            ("Вернуть в список" if restoring else "Убрать отклонённый")
+            if len(declined) <= 1 else
+            (f"Вернуть в список ({len(declined)})" if restoring else
+             f"Убрать отклонённые ({len(declined)})"))
+
+    def archive_order(self) -> None:
+        """Скрывает уже отклонённые заказы только на этом компьютере."""
+        declined = [order for order in self._selected_orders()
+                    if order.status.upper() == "DECLINED"]
+        if not declined:
+            self.notify("Выберите отклонённый заказ", ToastKind.WARNING)
+            return
+        hidden = orders_module.archived_ids(
+            self.contour, self.suz_credentials.stripped().oms_id)
+        restoring = all(order.id in hidden for order in declined)
+        try:
+            orders_module.archive(
+                self.contour, self.suz_credentials.stripped().oms_id,
+                [order.id for order in declined], hidden=not restoring)
+        except OSError as error:
+            self.notify(f"Не удалось скрыть заказы: {error}", ToastKind.ERROR)
+            return
+        self.notify((f"Возвращено в список: {len(declined)}" if restoring else
+                     f"Убрано из списка на этом компьютере: {len(declined)}. "
+                     "В СУЗ заказы остаются отклонёнными."), ToastKind.INFO)
+        self.reload_orders()
+
     def close_order(self) -> None:
-        """Закрывает выбранные заказы, коды по которым уже получены.
+        """Закрывает выбранные заказы с полученными кодами или ошибкой СУЗ.
 
         Закрытие необратимо, а потерянный после него блок не вернуть, поэтому
         перед вопросом сверяется, всё ли выданное лежит на этом компьютере.
@@ -1897,8 +1949,8 @@ class MarkingPage(QWidget):
             return
         closable = [order for order in chosen if order.closable]
         if not closable:
-            self.notify("Закрыть можно открытый заказ, по которому уже получены "
-                        "коды", ToastKind.WARNING)
+            self.notify("Закрыть можно открытый заказ с полученными кодами или "
+                        "ошибкой СУЗ", ToastKind.WARNING)
             return
         if not self.thumbprint:
             self.notify("Закрытие подписывается — выберите сертификат на вкладке "
@@ -1917,7 +1969,12 @@ class MarkingPage(QWidget):
             lines[-1] += f"\n· …и ещё {len(closable) - shown}"
         if skipped := len(chosen) - len(closable):
             lines.append(f"\nПропущено {skipped}: заказ уже закрыт или кодов по "
-                         "нему не получали.")
+                         "нему не получали и ошибки СУЗ нет.")
+        failed_orders = [order for order in closable if order.has_error]
+        if failed_orders:
+            lines.append(f"\nЗаказов с ошибкой СУЗ: {len(failed_orders)}. "
+                         "После закрытия их нельзя будет продолжить; для "
+                         "получения кодов потребуется новый заказ.")
         unsaved = [order for order in closable
                    if issue_module.stored_for(order.id) < order.passed]
         if unsaved:
@@ -3476,7 +3533,7 @@ class MarkingPage(QWidget):
         # подписывать нечем.
         self.suz_token_button.setEnabled(bool(self.thumbprint) and not self._busy)
         self.order_button.setEnabled(not self._busy)
-        self._sync_close_button()
+        self._sync_order_buttons()
         self.batch_delete_button.setEnabled(
             self._selected_batch() is not None and not self._busy)
         self.batch_application_button.setEnabled(
