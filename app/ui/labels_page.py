@@ -29,7 +29,7 @@ from ..core import price_labels, workbook
 from ..core import price_label_spec as spec_store
 from ..core.price_labels import PriceLabel
 from ..core.settings import AppSettings
-from . import icons, label_print, price_label_print
+from . import icons, label_print, pdf_label_print, price_label_print
 from .tasks import run_task
 from .theme import Metrics, Palette
 from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Title, fade_in
@@ -246,6 +246,11 @@ class LabelsPage(QWidget):
         body.addWidget(self.printer_box)
         self.pdf_box = QCheckBox("Сохранить в PDF вместо печати", card)
         body.addWidget(self.pdf_box)
+        self.print_pdf_button = QPushButton("Напечатать из PDF…", card)
+        self.print_pdf_button.setToolTip(
+            "Готовый PDF: одна страница — одна этикетка 43 × 25 мм на выбранном принтере")
+        self.print_pdf_button.clicked.connect(self.print_from_pdf)
+        body.addWidget(self.print_pdf_button)
 
         shift = QHBoxLayout()
         shift.setSpacing(8)
@@ -650,6 +655,56 @@ class LabelsPage(QWidget):
             return
         single = replace(item, copies=1)
         self._run_print([single], target, 1)
+
+    def print_from_pdf(self) -> None:
+        name = self.printer_box.currentText()
+        if not name:
+            self._fail("Выберите принтер для печати PDF.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать PDF с этикетками", "", "PDF (*.pdf)")
+        if not path:
+            return
+        document = None
+        try:
+            document, size = pdf_label_print.open_labels(path)
+            total = document.pageCount()
+            width, height = size.width() * 25.4 / 72, size.height() * 25.4 / 72
+            answer = QMessageBox.question(
+                self, "Печать этикеток из PDF",
+                f"{total} этикеток. Размер страницы PDF: "
+                f"{width:.1f} × {height:.1f} мм.\n"
+                "Печать на этикетках 43 × 25 мм с сохранением пропорций.\n"
+                f"Принтер: {name}.\n\nНапечатать все страницы по порядку?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            progress = QProgressDialog(
+                "Печатаем PDF…", "Остановить", 0, total, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+
+            def step(done: int, _total: int) -> bool:
+                progress.setValue(done)
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+
+            try:
+                done = pdf_label_print.print_pdf(document, size, name, progress=step)
+            finally:
+                progress.close()
+        except (label_print.PrintError, OSError) as error:
+            self._fail(str(error))
+            return
+        finally:
+            if document is not None:
+                document.close()
+        self._save_settings()
+        text = f"Передано на принтер «{name}»: {done} из {total} этикеток PDF."
+        self.status.setStyleSheet("")
+        self.status.setText(text)
+        self.notify(text, ToastKind.SUCCESS)
 
     def _run_print(self, items: list[PriceLabel], target: tuple[str, str], total: int) -> None:
         # Разделители тоже страницы: без них шкала дошла бы до конца раньше печати.
