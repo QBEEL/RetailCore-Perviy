@@ -77,8 +77,11 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          & .\dist\RetailCore.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "Packaged application selftest failed" }
+          # GUI-приложение PowerShell запускает без ожидания завершения.
+          $process = Start-Process -FilePath (Resolve-Path .\dist\RetailCore.exe).Path `
+            -ArgumentList '--selftest' -WorkingDirectory (Get-Location).Path `
+            -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Packaged application selftest failed" }
           $report = Get-Content selftest.log -Raw -Encoding utf8
           if ($report -notmatch "этикетки PDF: QtPdf на месте" -or
               $report -notmatch "РЕЗУЛЬТАТ: успешно") { throw "Packaged QtPdf check failed: $report" }
