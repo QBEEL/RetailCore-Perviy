@@ -23,6 +23,8 @@ env:
 jobs:
   tests:
     uses: ./.github/workflows/tests.yml
+    with:
+      skip_client_matrix: true
 
   # ─────────────────────────────── Windows ────────────────────────────────
   build-windows:

@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      skip_client_matrix:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -89,6 +93,7 @@ jobs:
 
   tests:
     name: Tests (${{ matrix.os }})
+    if: ${{ inputs.skip_client_matrix != true }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
