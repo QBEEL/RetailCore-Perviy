@@ -3,17 +3,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QSize, QTimer, QUrl, Qt
-from PySide6.QtGui import QDesktopServices, QMovie
+from PySide6.QtCore import QTimer, QUrl, Qt
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
 from ...core import updater
 from ...core.settings import AppSettings
 from .. import icons
-from ..resources import asset
 from ..theme import Metrics, Palette
 from ..update_check import GITHUB_OWNER, GITHUB_REPO, UpdateChecker
 from .common import Hint, SectionTitle
+from .update_animation import UpdateAnimation
 
 _RELEASES_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 _SNOOZE = timedelta(hours=24)
@@ -63,15 +63,7 @@ class UpdateDialog(QWidget):
 
         # Анимация на время загрузки: полминуты над ползущей полоской кажутся
         # зависанием, а живая картинка говорит, что программа работает.
-        self._animation = QLabel(self)
-        self._animation.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._movie = QMovie(str(asset("updating.gif")), parent=self)
-        size = self._movie.frameRect().size()
-        width = 420 - 2 * Metrics.PAD
-        if size.isValid() and size.width() > width:
-            self._movie.setScaledSize(
-                QSize(width, round(size.height() * width / size.width())))
-        self._animation.setMovie(self._movie)
+        self._animation = UpdateAnimation(self)
         self._animation.hide()
         root.addWidget(self._animation)
 
@@ -120,6 +112,7 @@ class UpdateDialog(QWidget):
         if self.settings.update_download_auto and updater.is_frozen():
             self._show_checking(f"Загружается версия {manifest.version}…")
             self._show_changelog(manifest.changelog)
+            self._animation.set_version(manifest.version)
             self._set_animation(True)
             self.show()
             self.checker.download(manifest)
@@ -166,9 +159,9 @@ class UpdateDialog(QWidget):
     def _set_animation(self, playing: bool) -> None:
         self._animation.setVisible(playing)
         if playing:
-            self._movie.start()
+            self._animation.start()
         else:
-            self._movie.stop()
+            self._animation.stop()
         # Пустые подписи при загрузке прячутся: иначе над картинкой остаётся
         # полоса пустого места. Вне загрузки они снова на месте.
         for label in (self._message, self._changelog):
@@ -275,6 +268,7 @@ class UpdateDialog(QWidget):
             self.close()
             return
         self._show_checking(f"Загружается версия {manifest.version}…")
+        self._animation.set_version(manifest.version)
         self._set_animation(True)
         self.checker.download(manifest)
 

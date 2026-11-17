@@ -288,7 +288,7 @@ def test_анимация_обновления_только_на_время_за
     from app.core import updater
 
     dialog = module.UpdateDialog(AppSettings(), UpdateChecker())
-    assert dialog._movie.isValid(), "анимация должна загрузиться из сборки"
+    assert dialog._animation.is_playing is False
     assert dialog._animation.isHidden()
 
     monkeypatch.setattr(updater, "is_frozen", lambda: True)
@@ -296,10 +296,17 @@ def test_анимация_обновления_только_на_время_за
     manifest = updater.ReleaseManifest(version="9.9.9", exe_url="")
     dialog._manifest = manifest
     dialog._start_update(manifest)
+    dialog.show()
+    application.processEvents()
     assert not dialog._animation.isHidden()
+    assert dialog._animation.is_playing
+    assert dialog._animation.version == "9.9.9"
+    assert dialog._animation._timer.isActive()
 
     dialog._on_error("сеть пропала")
     assert dialog._animation.isHidden(), "после ошибки анимация не нужна"
+    assert not dialog._animation.is_playing
+    assert not dialog._animation._timer.isActive()
 
 
 def test_анимация_и_при_автозагрузке(application, monkeypatch):
@@ -316,6 +323,7 @@ def test_анимация_и_при_автозагрузке(application, monkey
     monkeypatch.setattr(dialog, "_is_snoozed", lambda: False)
     dialog._on_found(updater.ReleaseManifest(version="9.9.9", exe_url=""))
     assert not dialog._animation.isHidden()
+    assert dialog._animation.version == "9.9.9"
 
 
 # --- сворачивание меню ----------------------------------------------------------
