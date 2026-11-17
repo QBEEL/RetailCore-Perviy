@@ -1,4 +1,4 @@
-"""Вкладка «Формирование наборов»: сборка наборов (КИН) из товаров с ОСУ.
+"""Вкладка «Формирование наборов»: сборка наборов (КИН) из маркированных товаров.
 
 Для косметики и бытовой химии (`cosmetics`) и других групп с объёмно-сортовым
 учётом (ОСУ) коды экземпляров не приходят в УПД при приёмке. Поэтому для
@@ -89,7 +89,7 @@ class _NameEditor(QStyledItemDelegate):
 
 
 class SetsTab(QWidget):
-    """Формирование наборов из товаров с ОСУ (`AGGREGATION_DOCUMENT`)."""
+    """Формирование наборов (`AGGREGATION_DOCUMENT`)."""
 
     journal_changed = Signal()
 
@@ -124,6 +124,7 @@ class SetsTab(QWidget):
         self._use_all_pool: bool = True
         self._resolved_group: str = ""
         self.codes: list[str] = []
+        self.slots: list[sets.SetSpecSlot] = []
         self._keys: set[str] = set()
         self._names: dict[str, str] = {}
         self._asked: set[str] = set()
@@ -172,9 +173,10 @@ class SetsTab(QWidget):
 
         self.group_box = QComboBox(card)
         self.group_box.addItem("Косметика и бытовая химия", DEFAULT_GROUP)
+        self.group_box.addItem("Духи и туалетная вода", "perfumery")
         self.group_box.currentIndexChanged.connect(self._on_details_changed)
         self.group_box.setToolTip(
-            "Товарная группа набора. По умолчанию — «Косметика и бытовая химия» (`cosmetics`)."
+            "Товарная группа КИН. В мультитоварном наборе хотя бы одно вложение должно быть из этой группы."
         )
 
         self.capacity_box = QSpinBox(card)
@@ -232,6 +234,32 @@ class SetsTab(QWidget):
         pool_row.addWidget(self.set_next_button)
         self.set_pool_widget.hide()
 
+        self.spec_widget = QWidget(card)
+        spec_row = QHBoxLayout(self.spec_widget)
+        spec_row.setContentsMargins(0, 0, 0, 0)
+        self.spec_file_button = self._button(
+            self.spec_widget, "Спецификация CSV/XLSX…", "open", self.load_spec_file
+        )
+        self.spec_clear_button = self._button(
+            self.spec_widget, "Убрать спецификацию", "clear", self.clear_spec
+        )
+        self.spec_remove_button = self._button(
+            self.spec_widget, "Убрать лишние GTIN", "trash", self.remove_outside_spec
+        )
+        self.spec_label = QLabel("Без спецификации: распределение только на всю партию", self.spec_widget)
+        self.spec_label.setWordWrap(True)
+        self.limit_box = QSpinBox(self.spec_widget)
+        self.limit_box.setRange(0, 100000)
+        self.limit_box.setSpecialValueText("Все доступные")
+        self.limit_box.setToolTip("0 — сформировать все доступные полные наборы; другое число — выбранную подпартию")
+        self.limit_box.valueChanged.connect(self._on_details_changed)
+        spec_row.addWidget(self.spec_file_button)
+        spec_row.addWidget(self.spec_clear_button)
+        spec_row.addWidget(self.spec_remove_button)
+        spec_row.addWidget(self.spec_label, 1)
+        spec_row.addWidget(QLabel("Сейчас наборов:", self.spec_widget))
+        spec_row.addWidget(self.limit_box)
+
         for combo in (self.inn_box, self.group_box, self.set_pool_box):
             combo.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -252,6 +280,20 @@ class SetsTab(QWidget):
         grid.addWidget(QLabel("Сведения о КИН", card), 3, 2)
         grid.addWidget(self.set_status_label, 3, 3)
         body.addLayout(grid)
+        body.addWidget(self.spec_widget)
+        self.spec_table = QTableWidget(0, 5, card)
+        self.spec_table.setHorizontalHeaderLabels(
+            ["Ячейка", "Позиция", "GTIN", "Готовность", "ЧЗ / склад"]
+        )
+        self.spec_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.spec_table.setMinimumHeight(130)
+        self.spec_table.setMaximumHeight(210)
+        self.spec_table.verticalHeader().setVisible(False)
+        self.spec_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        body.addWidget(self.spec_table)
+        self.spec_table.hide()
 
         self.details_hint = Hint(
             "ОСУ («Косметика и бытовая химия»): при приёмке по ОСУ коды экземпляров в УПД "
@@ -260,11 +302,78 @@ class SetsTab(QWidget):
             "«Нанесение…». Дождитесь статуса «SUCCESS»; затем "
             "отсканируйте КИН и коды вложений (КИ) с товаров. Если вложения в статусе "
             "«В обороте», после обработки документа набор автоматически перейдёт в статус "
-            "«В обороте», а вложения перейдут в собственность вашей организации.",
+            "«В обороте», а вложения с ОСУ перейдут в собственность вашей организации.",
             card,
         )
         body.addWidget(self.details_hint)
+        body.addWidget(Hint(
+            "Мультитоварный набор (косметика + парфюмерия): выберите группу КИН, "
+            "загрузите спецификацию, сверенную с карточкой Национального каталога, и проверьте коды. Все вложения "
+            "должны быть в обороте; парфюмерные КИ должны принадлежать вашему ИНН.",
+            card,
+        ))
         return card
+
+    def load_spec_file(self, path: str = "") -> None:
+        """Загружает опубликованный состав набора для расчёта подпартии."""
+        if self._busy or self._pending_submission():
+            self._tell("Дождитесь завершения текущей операции с набором", ToastKind.WARNING)
+            return
+        if not isinstance(path, str) or not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Спецификация набора", "", "Спецификация (*.csv *.xlsx)"
+            )
+        if not path:
+            return
+        self._busy = True
+        self._sync()
+        run_task(
+            sets.read_spec, path,
+            on_result=self._on_spec_loaded,
+            on_error=self._on_spec_error,
+        )
+
+    def _on_spec_loaded(self, slots: list[sets.SetSpecSlot]) -> None:
+        self._busy = False
+        self.slots = slots
+        self.limit_box.setValue(0)
+        self._verification = None
+        self._save_draft()
+        self._sync()
+        self._tell(f"Загружена спецификация: {len(slots)} позиций", ToastKind.SUCCESS)
+
+    def _on_spec_error(self, message: str) -> None:
+        self._busy = False
+        self._sync()
+        self._tell(f"Не удалось загрузить спецификацию: {message}", ToastKind.ERROR)
+
+    def clear_spec(self) -> None:
+        if self._busy or self._pending_submission():
+            return
+        self.slots = []
+        self.limit_box.setValue(0)
+        self._verification = None
+        self._save_draft()
+        self._sync()
+
+    def remove_outside_spec(self) -> None:
+        if not self.slots or self._busy or self._pending_submission():
+            return
+        expected = {slot.gtin for slot in self.slots if slot.marked}
+        removed = 0
+        for row in range(len(self.codes) - 1, -1, -1):
+            if codes_module.parse(self.codes[row]).gtin not in expected:
+                self._keys.discard(sets.key_of(self.codes[row]))
+                del self.codes[row]
+                self.table.removeRow(row)
+                removed += 1
+        self._verification = None
+        self._renumber()
+        self._refresh_table_statuses()
+        self._save_draft()
+        self._sync()
+        if removed:
+            self._tell(f"Убрано кодов вне спецификации: {removed}", ToastKind.INFO)
 
     def _codes_card(self) -> Card:
         card = Card(self)
@@ -788,6 +897,9 @@ class SetsTab(QWidget):
         notes: list[str] = []
         if assigned_set:
             notes.append(assigned_set)
+        if info.product_group:
+            group = sets.group_of(info.product_group)
+            notes.append(f"Группа: {group.title if group else info.product_group}")
         if info.owner_name or info.owner_inn:
             owner = info.owner_name or info.owner_inn
             notes.append(f"Владелец: {owner}")
@@ -937,6 +1049,8 @@ class SetsTab(QWidget):
         self.set_code = ""
         self.set_codes_pool.clear()
         self._use_all_pool = True
+        self.slots.clear()
+        self.limit_box.setValue(0)
         self._resolved_group = ""
         self.set_edit.blockSignals(True)
         self.set_edit.clear()
@@ -1054,10 +1168,24 @@ class SetsTab(QWidget):
 
     def units_and_problems(self) -> tuple[tuple[sets.SetUnit, ...], list[str]]:
         capacity = self.capacity_box.value()
+        marked_groups: list[str] = []
+        for slot in self.slots:
+            if slot.marked and slot.product_group:
+                marked_groups.append(slot.product_group)
+            if slot.marked and slot.product_group and slot.product_group.lower() not in sets.SUPPORTED_SET_GROUPS:
+                return (), [
+                    f"позиция {slot.slot} ({slot.name}): группа {slot.product_group} не поддерживается для набора"
+                ]
+        if marked_groups and not any(
+            sets.same_product_group(item_group, self.group) for item_group in marked_groups
+        ):
+            return (), ["в спецификации нет вложения из товарной группы КИН набора"]
         return sets.build_units(
             self.active_set_codes,
             self.codes,
             capacity=capacity if capacity > 0 else None,
+            slots=self.slots,
+            limit_sets=self.limit_box.value() or None,
         )
 
     def unit(self) -> sets.SetUnit:
@@ -1108,7 +1236,7 @@ class SetsTab(QWidget):
     def check_codes_in_gis(self) -> None:
         """Запрашивает в ГИС МТ свежие статусы КИН и всех КИ вложений."""
         units, batch_problems = self.units_and_problems()
-        if batch_problems:
+        if batch_problems and not self.slots:
             self._tell(f"Проверка не запущена: {batch_problems[0]}", ToastKind.WARNING)
             return
         for idx, unit in enumerate(units, start=1):
@@ -1157,6 +1285,7 @@ class SetsTab(QWidget):
             self._checks,
             our_inn=self.inn_edit.text().strip() or (self._inn() or "").strip(),
             product_group=self.group,
+            slots=self.slots,
             batch_problems=batch_problems,
         )
         self._refresh_table_statuses()
@@ -1261,6 +1390,7 @@ class SetsTab(QWidget):
             not self.set_code.strip()
             and not self.set_codes_pool
             and not self.codes
+            and not self.slots
             and not self._doc_id.strip()
         ):
             sets.clear_draft(self._draft_path)
@@ -1273,6 +1403,8 @@ class SetsTab(QWidget):
             use_all_pool=self._use_all_pool,
             capacity=self.capacity_box.value(),
             item_codes=list(self.codes),
+            slots=list(self.slots),
+            limit_sets=self.limit_box.value(),
             names=dict(self._names),
             operation_id=self._operation_id,
             doc_id=self._doc_id,
@@ -1286,6 +1418,7 @@ class SetsTab(QWidget):
             draft.set_code
             or draft.set_codes_pool
             or draft.item_codes
+            or draft.slots
             or draft.doc_id
             or draft.inn
         ):
@@ -1309,6 +1442,8 @@ class SetsTab(QWidget):
                     self.group_box.setCurrentIndex(idx)
             self.capacity_box.setValue(max(0, int(draft.capacity or 0)))
             self._names.update(draft.names)
+            self.slots = list(draft.slots)
+            self.limit_box.setValue(max(0, draft.limit_sets))
             self._operation_id = draft.operation_id
             self._doc_id = draft.doc_id
             self._doc_status = draft.doc_status
@@ -1385,6 +1520,12 @@ class SetsTab(QWidget):
         if self._verification and self._verification.problems:
             self._tell(
                 f"Исправьте ошибки проверки ЧЗ перед отправкой: {self._verification.problems[0]}",
+                ToastKind.WARNING,
+            )
+            return
+        if self.slots and self._verification is None:
+            self._tell(
+                "Перед отправкой подпартии проверьте выбранные КИН и КИ в ЧЗ",
                 ToastKind.WARNING,
             )
             return
@@ -1576,7 +1717,7 @@ class SetsTab(QWidget):
             self.journal_changed.emit()
             unit = document.units[0]
             n_sets = len(document.units)
-            self._finish_completed_sets([u.set_code for u in document.units])
+            self._finish_completed_sets(document.units)
             if n_sets == 1:
                 text = (
                     f"Набор {unit.set_gtin} ({len(unit.item_codes)} вложений) "
@@ -1697,7 +1838,7 @@ class SetsTab(QWidget):
             units, _ = self.units_and_problems()
             unit = units[0]
             n_sets = len(units)
-            self._finish_completed_sets([u.set_code for u in units])
+            self._finish_completed_sets(units)
             if n_sets == 1:
                 text = (
                     f"Документ {doc_id} обработан (CHECKED_OK) — набор {unit.set_gtin} "
@@ -1731,20 +1872,31 @@ class SetsTab(QWidget):
         self.hint.setText(text)
         self._tell(text, ToastKind.INFO)
 
-    def _finish_completed_sets(self, used_set_codes: list[str]) -> None:
-        used_keys = {sets.key_of(c) for c in used_set_codes if c.strip()}
-        remaining = [
-            code
-            for code in self.set_codes_pool
-            if sets.key_of(code) not in used_keys
-        ]
+    def _finish_completed_sets(self, used_units: tuple[sets.SetUnit, ...]) -> None:
+        remaining_sets, remaining_items = sets.remaining_codes(
+            self.set_codes_pool or ([self.set_code] if self.set_code else []),
+            self.codes,
+            used_units,
+        )
         was_batch = self._use_all_pool
+        slots = list(self.slots)
+        names = dict(self._names)
+        limit = self.limit_box.value()
         self.clear(force=True)
-        if remaining:
-            self.set_codes_pool = remaining if len(remaining) > 1 else []
-            self._use_all_pool = was_batch and len(remaining) > 1
-            self.set_set_code(remaining[0], quiet=True)
+        if remaining_sets or remaining_items:
+            self._restoring = True
+            self.slots = slots
+            self._names = names
+            self.limit_box.setValue(limit)
+            self.set_codes_pool = remaining_sets if len(remaining_sets) > 1 else []
+            self._use_all_pool = was_batch and len(remaining_sets) > 1
+            if remaining_sets:
+                self.set_set_code(remaining_sets[0], quiet=True)
+            for code in remaining_items:
+                self.add_code(code, quiet=True)
+            self._restoring = False
             self._sync_set_pool()
+            self._refresh_table_statuses()
             self._save_draft()
             self._sync()
             self.scan_edit.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -1794,9 +1946,9 @@ class SetsTab(QWidget):
 
     def _sync_composition(self) -> None:
         units, batch_problems = self.units_and_problems()
-        unit = units[0]
+        unit = units[0] if units else sets.SetUnit(self.set_code, tuple(self.codes))
         comp = sets.composition(unit, checks=self._checks, names=self._names)
-        total_items = len(self.codes)
+        total_items = sum(len(item.item_codes) for item in units)
         distinct_gtins = len({codes_module.parse(c).gtin for c in self.codes if codes_module.parse(c).gtin})
         self.tile_items.set_value(total_items)
         self.tile_gtins.set_value(distinct_gtins)
@@ -1806,7 +1958,7 @@ class SetsTab(QWidget):
             self.set_status_label.setStyleSheet(f"color: {Palette.TEXT_MUTED};")
             self.set_status_label.setText("Отсканируйте, вставьте или загрузите из CSV КИН набора")
         elif self.batch_mode:
-            n_sets = len(units)
+            n_sets = len(units) if units else len(self.active_set_codes)
             parsed_set = codes_module.parse(self.set_code)
             checked_sets = [
                 self._checks.get(u.set_ki)
@@ -1901,6 +2053,59 @@ class SetsTab(QWidget):
         ready = has_set and has_items
         has_pending_doc = bool(self._doc_id.strip())
         locked = self._pending_submission()
+        if self.slots:
+            available, spec_problems = sets.available_sets(
+                self.active_set_codes, self.codes, self.slots
+            )
+            marked = sum(slot.marked for slot in self.slots)
+            unmarked = len(self.slots) - marked
+            detail = (
+                f"Спецификация: {marked} маркируемых, {unmarked} без ЧЗ · "
+                f"полных наборов доступно: {available} из {len(self.active_set_codes)}"
+            )
+            if spec_problems:
+                detail += " · " + spec_problems[0]
+            self.spec_label.setText(detail)
+            self.spec_label.setToolTip("\n".join(spec_problems))
+            self.spec_table.setVisible(True)
+            self.spec_table.setRowCount(len(self.slots))
+            total_sets = len(self.active_set_codes)
+            item_counts: dict[str, int] = {}
+            checked_counts: dict[str, int] = {}
+            needed_per_set: dict[str, int] = {}
+            for slot in self.slots:
+                if slot.marked:
+                    needed_per_set[slot.gtin] = (
+                        needed_per_set.get(slot.gtin, 0) + slot.quantity_per_set
+                    )
+            for raw in self.codes:
+                parsed = codes_module.parse(raw)
+                item_counts[parsed.gtin] = item_counts.get(parsed.gtin, 0) + 1
+                if self._checks.get(parsed.ki):
+                    checked_counts[parsed.gtin] = checked_counts.get(parsed.gtin, 0) + 1
+            for row, slot in enumerate(self.slots):
+                if slot.marked:
+                    count = item_counts.get(slot.gtin, 0)
+                    required = needed_per_set[slot.gtin]
+                    target = total_sets * required
+                    ready = count // required
+                    progress = f"{count}/{target} КИ · на {ready} наборов"
+                    source = f"Ответ ЧЗ: {checked_counts.get(slot.gtin, 0)} КИ"
+                else:
+                    target = total_sets * slot.quantity_per_set
+                    progress = f"{slot.unmarked_ready_count}/{target} шт. на складе"
+                    source = "Не передаётся в ЧЗ"
+                for column, value in enumerate(
+                    (slot.slot, slot.name, slot.gtin if slot.marked else "—", progress, source)
+                ):
+                    self.spec_table.setItem(row, column, QTableWidgetItem(str(value)))
+        else:
+            self.spec_label.setText("Без спецификации: распределение только на всю партию")
+            self.spec_label.setToolTip("")
+            self.spec_table.hide()
+            self.spec_table.setRowCount(0)
+        _, build_problems = self.units_and_problems()
+        can_build = not self.slots or not build_problems
 
         has_selection = bool(
             self.table.selectionModel() and self.table.selectionModel().hasSelection()
@@ -1911,8 +2116,15 @@ class SetsTab(QWidget):
         self.set_clear_button.setEnabled(has_set and not self._busy and not locked)
         self.check_button.setEnabled(ready and not self._busy and not locked)
         self.poll_button.setEnabled(has_pending_doc and not self._busy)
-        self.file_save_button.setEnabled(ready and not self._busy)
-        self.send_button.setEnabled(ready and not locked and not self._busy)
+        self.file_save_button.setEnabled(ready and can_build and not self._busy)
+        verified = not self.slots or bool(self._verification and self._verification.ok)
+        self.send_button.setEnabled(
+            ready and can_build and verified and not locked and not self._busy
+        )
+        self.spec_file_button.setEnabled(not self._busy and not locked)
+        self.spec_clear_button.setEnabled(bool(self.slots) and not self._busy and not locked)
+        self.spec_remove_button.setEnabled(bool(self.slots) and has_items and not self._busy and not locked)
+        self.limit_box.setEnabled(bool(self.slots) and not self._busy and not locked)
 
         for widget in (
             self.set_edit,

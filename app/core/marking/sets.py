@@ -1,4 +1,4 @@
-"""Формирование наборов из ОСУ: документ «Формирование упаковки» (`AGGREGATION_DOCUMENT`, JSON).
+"""Формирование наборов: документ «Формирование упаковки» (`AGGREGATION_DOCUMENT`, JSON).
 
 Для товаров с объёмно-сортовым учётом (ОСУ), включая товарную группу
 «Косметика и бытовая химия» (`cosmetics`), при приёмке по УПД передаются GTIN и
@@ -15,8 +15,7 @@
 `{"document_format": "MANUAL", "product_document": <base64 JSON>,
 "type": "AGGREGATION_DOCUMENT", "signature": <base64>}`.
 
-По актуальной инструкции Честного ЗНАКа по формированию наборов (редакция от
-19.10.2026):
+По инструкции Честного ЗНАКа по формированию наборов:
 - для товарных групп с ОСУ (без поэкземплярной прослеживаемости, в том числе
   `cosmetics`) проверка владельца вложенных КИ при формировании набора не
   блокирует операцию: после обработки документа вложенные КИ переходят в
@@ -31,9 +30,13 @@
 - если вложенные КИ находятся в статусе «Нанесён», то КИН набора после
   формирования остаётся в статусе «Нанесён» и требует последующего ввода в
   оборот.
+Мультитоварный набор из разных товарных групп требует статуса «В обороте» у
+всех вложений и хотя бы одного вложения из товарной группы КИН.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 from dataclasses import dataclass, field
@@ -55,8 +58,8 @@ DRAFT_FILE = "marking_sets_draft.json"
 # возвращается как `chemistry`, тогда как в параметрах ЛК / UI встречается `cosmetics`.
 COSMETICS_GROUPS = frozenset({"cosmetics", "chemistry"})
 
-# В этом сценарии проверены правила ОСУ только для выбранной пользователем группы.
 OSU_GROUPS = COSMETICS_GROUPS
+SUPPORTED_SET_GROUPS = COSMETICS_GROUPS | {"perfumery"}
 
 
 def same_product_group(first: str, second: str) -> bool:
@@ -155,11 +158,171 @@ class SetUnit:
         }
 
 
+@dataclass(slots=True)
+class SetSpecSlot:
+    """Одна позиция опубликованного состава набора."""
+
+    slot: int
+    name: str
+    marked: bool = True
+    gtin: str = ""
+    product_group: str = ""
+    quantity_per_set: int = 1
+    unmarked_ready_count: int = 0
+
+
+def read_spec(path: str) -> list[SetSpecSlot]:
+    """Читает спецификацию из CSV или XLSX с заголовками столбцов."""
+    if path.lower().endswith(".xlsx"):
+        from openpyxl import load_workbook
+
+        book = load_workbook(path, read_only=True, data_only=True)
+        try:
+            rows = list(book.active.values)
+        finally:
+            book.close()
+    elif path.lower().endswith(".csv"):
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as file:
+                content = file.read()
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="cp1251", newline="") as file:
+                content = file.read()
+        first_line = content.splitlines()[0] if content.splitlines() else ""
+        delimiter = ";" if first_line.count(";") > first_line.count(",") else ","
+        rows = list(csv.reader(io.StringIO(content), delimiter=delimiter))
+    else:
+        raise ValueError("спецификация должна быть в формате CSV или XLSX")
+    if not rows:
+        raise ValueError("файл спецификации пуст")
+
+    aliases = {
+        "slot": "slot", "ячейка": "slot", "номер": "slot", "№": "slot",
+        "name": "name", "наименование": "name", "название": "name", "товар": "name",
+        "marked": "marked", "маркируемый": "marked", "маркировка": "marked",
+        "gtin": "gtin", "код товара": "gtin",
+        "product_group": "product_group", "товарная группа": "product_group",
+        "quantity_per_set": "quantity_per_set", "количество": "quantity_per_set",
+        "кол-во": "quantity_per_set", "количество в наборе": "quantity_per_set",
+        "unmarked_ready_count": "unmarked_ready_count", "в наличии": "unmarked_ready_count",
+    }
+    columns = {
+        aliases[str(value or "").strip().lower()]: index
+        for index, value in enumerate(rows[0])
+        if str(value or "").strip().lower() in aliases
+    }
+    if "name" not in columns or "gtin" not in columns:
+        raise ValueError("нужны столбцы «Наименование» и «GTIN»")
+
+    def cell(row: Sequence[Any], name: str) -> str:
+        index = columns.get(name)
+        if index is None or index >= len(row):
+            return ""
+        value = row[index]
+        return str(value).strip() if value is not None else ""
+
+    result: list[SetSpecSlot] = []
+    for line_no, row in enumerate(rows[1:], start=2):
+        if not any(str(value or "").strip() for value in row):
+            continue
+        name = cell(row, "name")
+        if not name:
+            raise ValueError(f"строка {line_no}: не указано наименование")
+        gtin = cell(row, "gtin")
+        marked_text = cell(row, "marked").lower()
+        if marked_text in ("", "да", "true", "1", "чз", "маркируемый"):
+            marked = True
+        elif marked_text in ("нет", "false", "0", "без чз", "немаркируемый"):
+            marked = False
+        else:
+            raise ValueError(f"строка {line_no}: неизвестное значение маркировки «{marked_text}»")
+        try:
+            result.append(SetSpecSlot(
+                slot=int(cell(row, "slot") or len(result) + 1),
+                name=name,
+                marked=marked,
+                gtin=gtin,
+                product_group=cell(row, "product_group"),
+                quantity_per_set=int(cell(row, "quantity_per_set") or 1),
+                unmarked_ready_count=int(cell(row, "unmarked_ready_count") or 0),
+            ))
+        except ValueError as error:
+            raise ValueError(f"строка {line_no}: неверное число ({error})") from error
+    if not result:
+        raise ValueError("в спецификации нет позиций")
+    _, problems = _marked_quantities(result)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return result
+
+
+def _marked_quantities(slots: Sequence[SetSpecSlot]) -> tuple[dict[str, int], list[str]]:
+    quantities: dict[str, int] = {}
+    problems: list[str] = []
+    for slot in slots:
+        if slot.quantity_per_set < 1:
+            problems.append(f"позиция {slot.slot}: количество в наборе должно быть положительным")
+        if not slot.marked:
+            continue
+        if len(slot.gtin) != 14 or not slot.gtin.isascii() or not slot.gtin.isdigit():
+            problems.append(f"позиция {slot.slot}: для маркируемого товара нужен 14-значный GTIN")
+            continue
+        quantities[slot.gtin] = quantities.get(slot.gtin, 0) + slot.quantity_per_set
+    if not quantities:
+        problems.append("в спецификации нет маркируемых вложений")
+    return quantities, problems
+
+
+def available_sets(
+    set_codes: Sequence[str], item_codes: Sequence[str], slots: Sequence[SetSpecSlot]
+) -> tuple[int, list[str]]:
+    """Считает полные наборы по опубликованному составу и загруженным кодам."""
+    quantities, problems = _marked_quantities(slots)
+    if problems:
+        return 0, problems
+    counts = {gtin: 0 for gtin in quantities}
+    seen: set[str] = set()
+    for raw in item_codes:
+        parsed = codes_module.parse(raw)
+        key = parsed.ki
+        if not parsed.valid or not key:
+            problems.append("среди вложений есть код с ошибкой формата")
+            continue
+        if key in seen:
+            problems.append(f"повторяется код вложения {key}")
+            continue
+        seen.add(key)
+        if parsed.gtin not in counts:
+            problems.append(f"GTIN {parsed.gtin} не входит в спецификацию набора")
+            continue
+        counts[parsed.gtin] += 1
+    if problems:
+        return 0, problems
+    return min(
+        len([code for code in set_codes if code and code.strip()]),
+        *(counts[gtin] // quantity for gtin, quantity in quantities.items()),
+    ), []
+
+
+def remaining_codes(
+    set_codes: Sequence[str], item_codes: Sequence[str], units: Sequence[SetUnit]
+) -> tuple[list[str], list[str]]:
+    """Возвращает запас КИН и КИ после подтверждённой сборки выбранной подпартии."""
+    used_sets = {key_of(unit.set_code) for unit in units}
+    used_items = {key_of(raw) for unit in units for raw in unit.item_codes}
+    return (
+        [raw for raw in set_codes if key_of(raw) not in used_sets],
+        [raw for raw in item_codes if key_of(raw) not in used_items],
+    )
+
+
 def build_units(
     set_codes: Sequence[str],
     item_codes: Sequence[str],
     *,
     capacity: int | None = None,
+    slots: Sequence[SetSpecSlot] = (),
+    limit_sets: int | None = None,
 ) -> tuple[tuple[SetUnit, ...], list[str]]:
     """Распределяет коды вложений (`КИ`) по набору или партии наборов (`КИН`).
 
@@ -171,6 +334,27 @@ def build_units(
     """
     clean_sets = [code.strip() for code in set_codes if code and code.strip()]
     clean_items = [code.strip() for code in item_codes if code and code.strip()]
+    if slots:
+        available, problems = available_sets(clean_sets, clean_items, slots)
+        if problems:
+            return (), problems
+        selected = available if limit_sets is None else limit_sets
+        if selected < 1 or selected > available:
+            return (), [f"можно сформировать от 1 до {available} полных наборов"]
+        quantities, _ = _marked_quantities(slots)
+        by_gtin: dict[str, list[str]] = {gtin: [] for gtin in quantities}
+        for raw in clean_items:
+            by_gtin[codes_module.parse(raw).gtin].append(raw)
+        units: list[SetUnit] = []
+        for idx, set_code in enumerate(clean_sets[:selected]):
+            unit_items: list[str] = []
+            for gtin, quantity in quantities.items():
+                start = idx * quantity
+                unit_items.extend(by_gtin[gtin][start : start + quantity])
+            units.append(SetUnit(set_code, tuple(unit_items), capacity))
+        return tuple(units), []
+    if limit_sets is not None:
+        return (), ["для формирования подпартии нужна спецификация состава набора"]
     if len(clean_sets) <= 1:
         single_set = clean_sets[0] if clean_sets else ""
         return (
@@ -276,8 +460,8 @@ class SetDocument:
             found.append("ИНН участника — 10 цифр для организации, 12 для ИП")
         if not self.product_group.strip():
             found.append("не выбрана товарная группа")
-        elif self.product_group.strip().lower() not in COSMETICS_GROUPS:
-            found.append("формирование наборов подключено только для товарной группы «Косметика и бытовая химия»")
+        elif self.product_group.strip().lower() not in SUPPORTED_SET_GROUPS:
+            found.append("формирование наборов поддерживает группы «Косметика и бытовая химия» и «Духи и туалетная вода»")
         if self.batch_problems:
             found.extend(self.batch_problems)
             return found
@@ -318,8 +502,8 @@ class SetDocument:
         group = (product_group or self.product_group).strip()
         if not group:
             raise IntroduceProblem("Не указана товарная группа.")
-        if group.lower() not in COSMETICS_GROUPS or not same_product_group(group, self.product_group):
-            raise IntroduceProblem("Формирование наборов подключено только для группы «Косметика и бытовая химия».")
+        if group.lower() not in SUPPORTED_SET_GROUPS or not same_product_group(group, self.product_group):
+            raise IntroduceProblem("Товарная группа документа не совпадает с поддерживаемой группой КИН набора.")
         return DOCUMENT_TYPE
 
     def render(self, extension: str = ".json") -> str:
@@ -437,6 +621,7 @@ def verify_codes(
     *,
     our_inn: str = "",
     product_group: str = DEFAULT_PRODUCT_GROUP,
+    slots: Sequence[SetSpecSlot] = (),
 ) -> SetVerification:
     """Проверяет КИН и КИ вложений по правилам ГИС МТ для формирования наборов."""
     problems: list[str] = []
@@ -446,7 +631,6 @@ def verify_codes(
 
     group = product_group.strip().lower()
     group_title = group_of(group).title if group_of(group) else group
-    is_osu = group in OSU_GROUPS
     clean_inn = our_inn.strip()
 
     for problem in unit.problems:
@@ -479,6 +663,12 @@ def verify_codes(
     item_emissions: set[str] = set()
     foreign_owners: set[str] = set()
     item_gtins: set[str] = set()
+    item_groups: set[str] = set()
+    same_group_item = False
+    expected_groups = {
+        slot.gtin: slot.product_group
+        for slot in slots if slot.marked and slot.product_group
+    }
 
     for raw in unit.item_codes:
         parsed = codes_module.parse(raw)
@@ -490,13 +680,19 @@ def verify_codes(
             problems.append(f"код вложения {ki} ещё не проверен в «Честном ЗНАКе»")
             code_notes[ki] = "не проверен в ЧЗ"
             continue
+        if info.product_group:
+            item_groups.add(info.product_group.strip().lower())
+            same_group_item |= same_product_group(info.product_group, group)
+            expected_group = expected_groups.get(parsed.gtin)
+            if expected_group and not same_product_group(info.product_group, expected_group):
+                problems.append(
+                    f"код вложения {ki}: группа ЧЗ «{info.product_group}» не совпадает "
+                    f"со спецификацией «{expected_group}»"
+                )
         _verify_item_code(
             ki,
             info,
             clean_inn=clean_inn,
-            group=group,
-            group_title=group_title,
-            is_osu=is_osu,
             problems=problems,
             warnings=warnings,
             code_notes=code_notes,
@@ -504,6 +700,15 @@ def verify_codes(
             item_emissions=item_emissions,
             foreign_owners=foreign_owners,
         )
+
+    multigroup = any(not same_product_group(item_group, group) for item_group in item_groups)
+    if multigroup:
+        if not same_group_item:
+            problems.append(
+                "в мультитоварном наборе хотя бы одно вложение должно относиться к группе КИН"
+            )
+        if any(state is not CodeState.INTRODUCED for state in item_states):
+            problems.append("все КИ мультитоварного набора должны быть в статусе «В обороте»")
 
     # Сверка сочетания статусов вложений и КИН по правилам ЦРПТ (19.10.2026).
     unique_states = set(item_states)
@@ -560,10 +765,10 @@ def verify_codes(
                     "в оборот."
                 )
 
-    if foreign_owners and is_osu:
+    if foreign_owners:
         owners_list = ", ".join(sorted(foreign_owners)[:3])
         notes.append(
-            f"ОСУ ({group_title}): вложения числятся за поставщиком ({owners_list}) — "
+            f"ОСУ: вложения числятся за поставщиком ({owners_list}) — "
             "при формировании набора они перейдут в собственность вашей организации."
         )
 
@@ -581,6 +786,7 @@ def verify_units(
     *,
     our_inn: str = "",
     product_group: str = DEFAULT_PRODUCT_GROUP,
+    slots: Sequence[SetSpecSlot] = (),
     batch_problems: Sequence[str] = (),
 ) -> SetVerification:
     """Проверяет один набор или партию наборов перед отправкой `AGGREGATION_DOCUMENT`."""
@@ -594,6 +800,7 @@ def verify_units(
             checks,
             our_inn=our_inn,
             product_group=product_group,
+            slots=slots,
         )
 
     problems: list[str] = []
@@ -606,6 +813,7 @@ def verify_units(
             checks,
             our_inn=our_inn,
             product_group=product_group,
+            slots=slots,
         )
         code_notes.update(ver.code_notes)
         label = unit.set_serial or unit.set_ki or f"№{index}"
@@ -706,9 +914,6 @@ def _verify_item_code(
     info: CodeInfo,
     *,
     clean_inn: str,
-    group: str,
-    group_title: str,
-    is_osu: bool,
     problems: list[str],
     warnings: list[str],
     code_notes: dict[str, str],
@@ -741,10 +946,9 @@ def _verify_item_code(
     if not info.product_group:
         problems.append(f"товарная группа кода вложения {ki} не получена от ЧЗ")
         remarks.append("товарная группа неизвестна")
-    elif group and not same_product_group(info.product_group, group):
+    elif info.product_group.strip().lower() not in SUPPORTED_SET_GROUPS:
         problems.append(
-            f"код вложения {ki} относится к группе «{info.product_group}», "
-            f"а выбрана «{group_title}»"
+            f"код вложения {ki} относится к неподдерживаемой группе «{info.product_group}»"
         )
         remarks.append(f"группа {info.product_group}")
 
@@ -770,9 +974,13 @@ def _verify_item_code(
         item_emissions.add(info.emission_type.strip().upper())
 
     owner_inn = info.owner_inn.strip()
+    item_is_osu = info.product_group.strip().lower() in OSU_GROUPS
+    if clean_inn and not owner_inn and not item_is_osu:
+        problems.append(f"владелец кода вложения {ki} не получен от ЧЗ")
+        remarks.append("владелец неизвестен")
     if clean_inn and owner_inn and owner_inn != clean_inn:
         owner_label = f"{info.owner_name} ({owner_inn})" if info.owner_name else owner_inn
-        if is_osu:
+        if item_is_osu:
             foreign_owners.add(owner_label)
             remarks.append(f"ОСУ: переход от {owner_inn}")
         else:
@@ -812,6 +1020,8 @@ class SetDraft:
     use_all_pool: bool = True
     capacity: int = 0
     item_codes: list[str] = field(default_factory=list)
+    slots: list[SetSpecSlot] = field(default_factory=list)
+    limit_sets: int = 0
     names: dict[str, str] = field(default_factory=dict)
     operation_id: int = 0
     doc_id: str = ""
@@ -840,6 +1050,11 @@ def save_draft(draft: SetDraft, path: str | None = None) -> SetDraft:
         "use_all_pool": bool(draft.use_all_pool),
         "capacity": int(draft.capacity or 0),
         "item_codes": list(draft.item_codes),
+        "slots": [
+            {name: getattr(slot, name) for name in SetSpecSlot.__dataclass_fields__}
+            for slot in draft.slots
+        ],
+        "limit_sets": int(draft.limit_sets or 0),
         "names": dict(draft.names),
         "operation_id": int(draft.operation_id or 0),
         "doc_id": draft.doc_id,
@@ -873,6 +1088,21 @@ def load_draft(path: str | None = None) -> SetDraft:
             [str(item) for item in raw_items if str(item).strip()]
             if isinstance(raw_items, list) else []
         )
+        raw_slots = data.get("slots")
+        slots = []
+        if isinstance(raw_slots, list):
+            for entry in raw_slots:
+                if not isinstance(entry, dict):
+                    continue
+                slots.append(SetSpecSlot(
+                    slot=int(entry["slot"]),
+                    name=str(entry["name"]),
+                    marked=bool(entry.get("marked", True)),
+                    gtin=str(entry.get("gtin") or ""),
+                    product_group=str(entry.get("product_group") or ""),
+                    quantity_per_set=int(entry.get("quantity_per_set", 1)),
+                    unmarked_ready_count=int(entry.get("unmarked_ready_count", 0)),
+                ))
         raw_names = data.get("names")
         names = (
             {str(k): str(v) for k, v in raw_names.items() if str(k).strip() and str(v).strip()}
@@ -886,13 +1116,15 @@ def load_draft(path: str | None = None) -> SetDraft:
             use_all_pool=bool(data.get("use_all_pool", True)),
             capacity=int(data.get("capacity") or 0),
             item_codes=item_codes,
+            slots=slots,
+            limit_sets=int(data.get("limit_sets") or 0),
             names=names,
             operation_id=int(data.get("operation_id") or 0),
             doc_id=str(data.get("doc_id") or ""),
             doc_status=str(data.get("doc_status") or ""),
             updated_at=str(data.get("updated_at") or ""),
         )
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, KeyError):
         return SetDraft()
 
 
