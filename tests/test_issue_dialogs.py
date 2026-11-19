@@ -273,6 +273,26 @@ def test_по_умолчанию_предлагается_перемаркиро
     assert not dialog.remark_box.isHidden()
 
 
+def test_internal_return_after_changing_reason(application, batch):
+    import json
+
+    batch.product_group = "perfumery"
+    batch.printed = 1
+    dialog = _intro(batch)
+    dialog.doc_type_box.setCurrentIndex(dialog.doc_type_box.findData("RECEIPT"))
+    dialog.doc_number_edit.setText("123")
+    dialog.cause_box.setCurrentIndex(dialog.cause_box.findData("INTERNAL_RETURN"))
+
+    assert not dialog.doc_type_box.isEnabled()
+    body = json.loads(dialog.document.render())
+    assert body["remarking_cause"] == "INTERNAL_RETURN"
+    product, = body["products"]
+    assert "last_uin" not in product
+    assert not any(key.startswith("primary_document") for key in product)
+    dialog.previous_edit.setPlainText(CODES[1])
+    assert json.loads(dialog.document.render())["products"][0]["last_uin"]
+
+
 def _replace_dialog(batch, first: int, previous=("old-code",)):
     dialog = IntroduceDialog(batch, "250101802801", Contour.SANDBOX, "",
                              previous=previous, fixed_range=(first, first + 1))

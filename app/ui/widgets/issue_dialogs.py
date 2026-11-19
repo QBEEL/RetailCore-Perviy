@@ -620,7 +620,7 @@ class IntroduceDialog(QDialog):
         remark.setSpacing(9)
         self.cause_box = QComboBox(self.remark_box)
         for code, text in introduce.REMARK_CAUSES.items():
-            self.cause_box.addItem(f"{code} — {text}", code)
+            self.cause_box.addItem(f"{text[:1].upper()}{text[1:]} ({code})", code)
         self.cause_box.setCurrentIndex(
             max(0, self.cause_box.findData(self._settings.remark_cause)))
         remark.addRow("Причина", self.cause_box)
@@ -647,9 +647,6 @@ class IntroduceDialog(QDialog):
         remark.addRow("Сведения о товаре", attributes)
 
         self.previous_edit = QPlainTextEdit(self.remark_box)
-        self.previous_edit.setPlaceholderText(
-            "Предыдущие КИ — по одному в строке, в том же порядке, что и новые. "
-            "Для причины KM_SPOILED можно оставить пустым")
         self.previous_edit.setMaximumHeight(70)
         if self._previous:
             self.previous_edit.setPlainText("\n".join(self._previous))
@@ -762,17 +759,18 @@ class IntroduceDialog(QDialog):
             return introduce.Document(self.inn_edit.text().strip(),
                                       self.tnved_edit.text().strip(), codes)
         previous = tuple(line.strip() for line in
-                         self.previous_edit.toPlainText().splitlines() if line.strip())
+                         self.previous_edit.toPlainText().split("\n") if line.strip())
         return introduce.Remark(
             inn=self.inn_edit.text().strip(), tnved=self.tnved_edit.text().strip(),
             cause=str(self.cause_box.currentData() or ""),
             date=self.date_edit.date().toString("yyyy-MM-dd"), codes=codes,
             previous=previous, country=self.country_edit.text().strip(),
             color=self.color_edit.text().strip(), size=self.size_edit.text().strip(),
-            doc_type=str(self.doc_type_box.currentData() or ""),
-            doc_number=self.doc_number_edit.text().strip(),
-            doc_date=self.doc_date_edit.text().strip(),
-            doc_name=self.doc_name_edit.text().strip())
+            **(dict(doc_type=str(self.doc_type_box.currentData() or ""),
+                    doc_number=self.doc_number_edit.text().strip(),
+                    doc_date=self.doc_date_edit.text().strip(),
+                    doc_name=self.doc_name_edit.text().strip())
+               if self.cause_box.currentData() != "INTERNAL_RETURN" else {}))
 
     @property
     def document(self):
@@ -783,6 +781,16 @@ class IntroduceDialog(QDialog):
     def _refresh(self, *_args) -> None:
         if not hasattr(self, "hint"):
             return
+        cause = self.cause_box.currentData()
+        for field in (self.doc_type_box, self.doc_number_edit,
+                      self.doc_date_edit, self.doc_name_edit):
+            field.setEnabled(cause != "INTERNAL_RETURN")
+        self.previous_edit.setPlaceholderText(
+            "Предыдущие КИ в порядке новых кодов, по одному в строке. "
+            + ("Для этой причины укажите каждый предыдущий КИ."
+               if cause == "DESCRIPTION_ERRORS" else
+               "Для парфюмерии с этой причиной поле можно оставить пустым."
+               if cause == "INTERNAL_RETURN" else ""))
         problems = self._document().problems
         self.file_button.setEnabled(not problems)
         self.send_button.setEnabled(not problems and not self._send_problem)
@@ -797,7 +805,12 @@ class IntroduceDialog(QDialog):
                 "Файл можно сохранить и загрузить в личном кабинете.")
             return
         self.hint.setStyleSheet("")
-        if self.kind == "remark":
+        if self.kind == "remark" and cause == "INTERNAL_RETURN":
+            self.hint.setText(
+                "Для парфюмерии, ранее выведенной для собственных нужд. "
+                "Если указываете прежние КИ, проверьте статус «Выбыл» и причину OWN_USE. "
+                "Новые коды должны иметь статус «Нанесён» и тип эмиссии «Перемаркировка».")
+        elif self.kind == "remark":
             self.hint.setText(
                 "Документ будет подписан сертификатом и отправлен в «Честный ЗНАК»; "
                 "КриптоПро может спросить пароль. Новые коды должны быть в статусе "
