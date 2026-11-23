@@ -278,8 +278,18 @@ def test_saved_suz_codes_go_directly_to_sets(application, tmp_path, stub, monkey
     assert page.sets_tab.active_set_codes == tuple(codes)
 
 
-def test_set_application_is_saved_polled_and_never_sent_twice(
-    application, tmp_path, stub, monkeypatch
+@pytest.mark.parametrize("previous_status,code_state,expected_status", [
+    ("", CodeState.EMITTED, "SUCCESS"),
+    ("FAILED", CodeState.EMITTED, "SUCCESS"),
+    ("REJECTED", CodeState.EMITTED, "SUCCESS"),
+    ("FAILED", CodeState.APPLIED, "APPLIED_EXTERNAL"),
+    ("FAILED", CodeState.INTRODUCED, "FAILED"),
+    ("PARTIALLY", CodeState.EMITTED, "PARTIALLY"),
+    ("PENDING", CodeState.EMITTED, "PENDING"),
+    ("UNKNOWN", CodeState.EMITTED, "UNKNOWN"),
+])
+def test_set_application_prechecks_and_only_retries_confirmed_failures(
+    application, tmp_path, stub, monkeypatch, previous_status, code_state, expected_status
 ):
     from app.core.marking import issue
     from app.ui import marking_page
@@ -288,8 +298,15 @@ def test_set_application_is_saved_polled_and_never_sent_twice(
     gtin = "04601234567893"
     code = f"01{gtin}21SET001{GS}91EE11{GS}92c3ludGhldGlj"
     ki = f"01{gtin}21SET001"
+    old_report = ("11111111-1111-1111-1111-111111111111"
+                  if previous_status not in ("", "UNKNOWN") else "")
+    old_error = "synthetic processing error" if previous_status in ("FAILED", "REJECTED") else ""
+    needs_refresh = previous_status == "REJECTED"
     batch = issue.Batch(id="synthetic-set", contour=Contour.SANDBOX.value,
-                        gtin=gtin, product_group="cosmetics", codes=[code])
+                        gtin=gtin, product_group="cosmetics", codes=[code],
+                        application_status="PENDING" if needs_refresh else previous_status,
+                        application_report_id=old_report,
+                        application_error="" if needs_refresh else old_error)
     issue.save(batch)
     _, state = stub
     state["signed"] = True
@@ -298,6 +315,7 @@ def test_set_application_is_saved_polled_and_never_sent_twice(
         connection_id="device", token="synthetic-token")}
     page = _page(application, tmp_path)
     page.batches.selectRow(0)
+    retry = previous_status in ("FAILED", "REJECTED")
 
     class Confirmation:
         Icon = marking_page.QMessageBox.Icon
@@ -318,30 +336,58 @@ def test_set_application_is_saved_polled_and_never_sent_twice(
         def clickedButton(self): return self.yes
 
     monkeypatch.setattr(marking_page, "QMessageBox", Confirmation)
-    monkeypatch.setattr(marking_page.service, "check", lambda *_args, **_kwargs: [
-        CodeInfo(code=ki, gtin=gtin, state=CodeState.EMITTED, found=True,
-                 valid=True, package_type="SET", product_group="chemistry")])
+    checked = []
+    def check(codes, **kwargs):
+        checked.append((codes, kwargs["use_cache"]))
+        return [CodeInfo(code=ki, gtin=gtin, state=code_state, found=True,
+                         valid=True, package_type="SET", product_group="chemistry")]
+    monkeypatch.setattr(marking_page.service, "check", check)
     sent = []
+    polled = []
     report_id = "3179f5d2-2bf5-47d1-8df0-9452b257d851"
     def send(current, credentials, *_args):
-        sent.append(issue.load(current.id).application_status)
+        fresh = issue.load(current.id)
+        sent.append((fresh.application_status, fresh.application_report_id, fresh.application_error))
         return report_id, credentials
     monkeypatch.setattr(marking_page.service, "send_set_application", send)
-    monkeypatch.setattr(marking_page.service, "set_application_status",
-                        lambda _id, credentials, *_args: (("SUCCESS", ""), credentials))
+    def status(requested_id, credentials, *_args):
+        polled.append(requested_id)
+        if requested_id == old_report:
+            return (previous_status, old_error), credentials
+        return ("SUCCESS", ""), credentials
+    monkeypatch.setattr(marking_page.service, "set_application_status", status)
 
-    page.send_set_application()
+    if needs_refresh:
+        page.batch_application_status_button.click()
+        _settle(application)
+        assert issue.load(batch.id).application_status == previous_status
+        assert polled == [old_report]
+        assert sent == checked == []
+        polled.clear()
+    assert page.batch_application_button.text().startswith("Повторить") == retry
+    if retry:
+        assert old_error in page.batches_hint.text()
+    page.batch_application_button.click()
     _settle(application)
 
     saved = issue.load(batch.id)
-    assert sent == ["SENDING"], (page.batches_hint.text(), saved.application_status)
+    assert checked == ([(batch.codes, False)] if retry or not previous_status else [])
+    assert saved.application_status == expected_status
+    if expected_status != "SUCCESS":
+        assert sent == polled == []
+        assert saved.application_report_id == (
+            "" if expected_status == "APPLIED_EXTERNAL" else old_report)
+        return
+
+    assert sent == [("SENDING", "", "")]
     assert saved.application_report_id == report_id
-    assert saved.application_status == "SUCCESS"
+    assert polled == [report_id]
     page.batch_application_status_button.click()
     _settle(application)
     page.send_set_application()
     _settle(application)
-    assert sent == ["SENDING"]
+    assert polled == [report_id, report_id]
+    assert sent == [("SENDING", "", "")]
 
 
 def test_unknown_application_result_survives_restart_without_resend(
@@ -361,6 +407,42 @@ def test_unknown_application_result_survives_restart_without_resend(
     assert issue.load(batch.id).application_status == "UNKNOWN"
     assert issue.load(batch.id).application_report_id == ""
     assert page.batch_application_status_button.isEnabled()
+
+
+def test_manual_application_id_is_saved_only_after_suz_confirms_it(
+    application, tmp_path, stub, monkeypatch
+):
+    from app.core.marking import issue
+    from app.ui import marking_page
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    batch = issue.Batch(id="unknown-set", contour=Contour.SANDBOX.value,
+                        product_group="cosmetics", application_status="UNKNOWN")
+    issue.save(batch)
+    page = _page(application, tmp_path, restore=False)
+    page.batches.selectRow(0)
+    report_id = "3179f5d2-2bf5-47d1-8df0-9452b257d851"
+    monkeypatch.setattr(marking_page.QInputDialog, "getText",
+                        lambda *_args: (report_id, True))
+    requested = []
+
+    def status(current_id, credentials, *_args):
+        requested.append(current_id)
+        if len(requested) == 1:
+            raise MarkingError("СУЗ не вернула статус запрошенного отчёта.")
+        return ("FAILED", "synthetic processing error"), credentials
+
+    monkeypatch.setattr(marking_page.service, "set_application_status", status)
+    page.batch_application_status_button.click()
+    _settle(application)
+    assert issue.load(batch.id) == batch
+
+    page.batch_application_status_button.click()
+    _settle(application)
+    assert requested == [report_id, report_id]
+    saved = issue.load(batch.id)
+    assert (saved.application_status, saved.application_report_id) == ("FAILED", report_id)
+    assert page.batch_application_button.text() == "Повторить нанесение…"
 
 
 # --- разбор кодов ------------------------------------------------------------------

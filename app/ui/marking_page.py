@@ -728,6 +728,7 @@ class MarkingPage(QWidget):
         body.addWidget(self.batches, 1)
 
         self.batches_hint = Hint("", card)
+        self.batches_hint.setTextFormat(Qt.TextFormat.PlainText)
         body.addWidget(self.batches_hint)
         return card
 
@@ -2132,6 +2133,9 @@ class MarkingPage(QWidget):
         selected = self.batches.selectionModel().selectedRows()
         self.batch_sets_button.setEnabled(bool(selected) and not self._busy)
         self.batch_application_button.setEnabled(batch is not None and not self._busy)
+        retry = bool(batch and batch.application_status in application_module.RETRYABLE
+                     and application_module.can_submit(batch))
+        self.batch_application_button.setText("Повторить нанесение…" if retry else "Нанесение…")
         self.batch_application_status_button.setEnabled(
             bool(batch and (batch.application_report_id or
                             batch.application_status in ("SENDING", "UNKNOWN")))
@@ -2149,18 +2153,24 @@ class MarkingPage(QWidget):
             return
         tail = (" Напечатано не всё — «Печать…» продолжит с первой ненапечатанной."
                 if 0 < batch.printed_count < batch.total else "")
+        if batch.application_status in application_module.FAILED and batch.application_error:
+            tail += f" Причина ошибки: {batch.application_error}."
+        if retry:
+            tail += " После устранения причины нажмите «Повторить нанесение…»."
         self.batches_hint.setText(
             f"Выбран блок на {batch.total} кодов, напечатано {batch.printed_count}."
             f"{tail}")
 
     def send_set_application(self) -> None:
         """Подтверждает физическое нанесение и проверяет КИН перед отчётом СУЗ."""
+        if self._busy:
+            return
         chosen = self._selected_batch()
         batch = issue_module.load(chosen.id) if chosen else None
         if batch is None:
             self.notify("Выберите один сохранённый блок КИН", ToastKind.WARNING)
             return
-        if batch.application_status:
+        if not application_module.can_submit(batch):
             self.notify(
                 "Для блока уже начата подача отчёта. Проверьте его статус в СУЗ; "
                 "повторная отправка может создать второй отчёт.", ToastKind.WARNING)
@@ -2189,8 +2199,9 @@ class MarkingPage(QWidget):
         confirm.setWindowTitle("Отчёт о нанесении КИН")
         confirm.setIcon(QMessageBox.Icon.Warning)
         confirm.setText("Коды физически нанесены на наборы?")
+        action = "повторно отправит" if batch.application_status else "отправит"
         confirm.setInformativeText(
-            f"После подтверждения программа проверит {batch.total} КИН и отправит "
+            f"После подтверждения программа проверит {batch.total} КИН и {action} "
             "подписанный отчёт в СУЗ. Отправку нельзя отменить.")
         yes = confirm.addButton("Нанесены — продолжить", QMessageBox.ButtonRole.AcceptRole)
         cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
@@ -2202,7 +2213,7 @@ class MarkingPage(QWidget):
         self.batches_hint.setText("Проверяем КИН набора в ЧЗ перед отчётом…")
         run_task(
             service.check, batch.codes, contour=self.contour, use_cache=False,
-            on_result=lambda infos: self._on_application_checked(batch.id, infos),
+            on_result=lambda infos: self._on_application_checked(batch, infos),
             on_error=self._on_application_precheck_error,
         )
 
@@ -2211,9 +2222,11 @@ class MarkingPage(QWidget):
         self.batches_hint.setText(f"Отчёт не отправлен: {message}")
         self.notify(f"Проверка КИН не удалась: {message}", ToastKind.ERROR)
 
-    def _on_application_checked(self, batch_id: str, infos: list[CodeInfo]) -> None:
+    def _on_application_checked(self, checked_batch: issue_module.Batch,
+                                infos: list[CodeInfo]) -> None:
+        batch_id = checked_batch.id
         batch = issue_module.load(batch_id)
-        if batch is None or batch.application_status:
+        if batch is None or batch != checked_batch or batch.contour != self.contour.value:
             self._on_application_precheck_error("Блок изменился во время проверки")
             return
         expected = {codes_module.parse(code).ki for code in batch.codes}
@@ -2231,7 +2244,7 @@ class MarkingPage(QWidget):
         states = {info.state for info in infos}
         if states == {CodeState.APPLIED}:
             batch.cis_type = "SET"
-            issue_module.mark_application(batch, "APPLIED_EXTERNAL")
+            issue_module.mark_application(batch, "APPLIED_EXTERNAL", report_id="")
             self._set_busy(False)
             self.reload_batches(select=batch_id)
             self.notify("Все КИН уже нанесены. Отчёт повторно не отправлен.",
@@ -2244,7 +2257,7 @@ class MarkingPage(QWidget):
         batch.cis_type = "SET"
         try:
             application_module.payload(batch)
-            issue_module.mark_application(batch, "SENDING")
+            issue_module.mark_application(batch, "SENDING", report_id="")
         except (ValueError, OSError) as error:
             self._on_application_precheck_error(str(error))
             return
@@ -2279,6 +2292,8 @@ class MarkingPage(QWidget):
                     "Автоматический повтор заблокирован.", ToastKind.WARNING)
 
     def check_set_application_status(self, batch_id: str = "") -> None:
+        if self._busy:
+            return
         chosen = self._selected_batch()
         batch = issue_module.load(batch_id or chosen.id) if batch_id or chosen else None
         if batch is None:
@@ -2287,7 +2302,8 @@ class MarkingPage(QWidget):
         if batch.contour != self.contour.value:
             self.notify("Выберите контур, в котором отправлен отчёт", ToastKind.WARNING)
             return
-        if not batch.application_report_id:
+        report_id = batch.application_report_id
+        if not report_id:
             if batch.application_status not in ("SENDING", "UNKNOWN"):
                 self.notify("У выбранного блока нет номера отчёта о нанесении", ToastKind.WARNING)
                 return
@@ -2301,23 +2317,26 @@ class MarkingPage(QWidget):
             except ValueError:
                 self.notify("Номер отчёта должен быть UUID из СУЗ", ToastKind.WARNING)
                 return
-            issue_module.mark_application(batch, "PENDING", report_id)
         self._set_busy(True)
         self.batches_hint.setText("Читаем статус отчёта о нанесении в СУЗ…")
         run_task(
-            service.set_application_status, batch.application_report_id,
+            service.set_application_status, report_id,
             self.suz_credentials, self.contour, self.thumbprint,
             self.settings.marking_inn,
-            on_result=lambda result: self._on_application_status(batch.id, result),
+            on_result=lambda result: self._on_application_status(batch, report_id, result),
             on_error=self._on_application_status_error,
         )
 
-    def _on_application_status(self, batch_id: str, result: tuple) -> None:
+    def _on_application_status(self, checked_batch: issue_module.Batch,
+                               report_id: str, result: tuple) -> None:
         (status, reason), credentials = result
-        self._adopt_credentials(credentials)
+        batch_id = checked_batch.id
         batch = issue_module.load(batch_id)
-        if batch is not None:
-            issue_module.mark_application(batch, status, error=reason)
+        if batch is None or batch != checked_batch or batch.contour != self.contour.value:
+            self._on_application_status_error("Блок изменился во время проверки")
+            return
+        self._adopt_credentials(credentials)
+        issue_module.mark_application(batch, status, report_id, error=reason)
         self._set_busy(False)
         self.reload_batches(select=batch_id)
         if status == application_module.DONE:
@@ -2326,7 +2345,11 @@ class MarkingPage(QWidget):
                         ToastKind.SUCCESS)
         elif status in application_module.FAILED:
             self._application_poll_attempts.pop(batch_id, None)
-            self.notify(f"Отчёт о нанесении не обработан: {status}. {reason}",
+            title = application_module.STATUS_TITLES[status]
+            details = f" {reason}" if reason else ""
+            if status in application_module.RETRYABLE:
+                details += " После устранения причины нажмите «Повторить нанесение…»."
+            self.notify(f"Отчёт о нанесении: {title}.{details}",
                         ToastKind.ERROR)
         else:
             self.notify(f"Отчёт о нанесении: {status}. Проверка продолжится автоматически.",

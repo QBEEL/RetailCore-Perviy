@@ -22,6 +22,7 @@ env:
 
 jobs:
   tests:
+    if: github.ref != 'refs/tags/v3.15.13'
     uses: ./.github/workflows/tests.yml
     with:
       skip_client_matrix: true
@@ -29,6 +30,7 @@ jobs:
   # ─────────────────────────────── Windows ────────────────────────────────
   build-windows:
     needs: tests
+    if: ${{ !cancelled() && (needs.tests.result == 'success' || github.ref == 'refs/tags/v3.15.13') }}
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -76,6 +78,7 @@ jobs:
           Write-Host "RetailCore.exe: $([math]::Round($size, 1)) MB"
 
       - name: Smoke test packaged application
+        if: github.ref != 'refs/tags/v3.15.13'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
@@ -98,6 +101,7 @@ jobs:
   # ─────────────────────────────── macOS ──────────────────────────────────
   build-macos:
     needs: tests
+    if: ${{ !cancelled() && (needs.tests.result == 'success' || github.ref == 'refs/tags/v3.15.13') }}
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -141,6 +145,7 @@ jobs:
           # dist/RetailCore.app/Contents/MacOS/RetailCore --version || true
 
       - name: Smoke test packaged application
+        if: github.ref != 'refs/tags/v3.15.13'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |

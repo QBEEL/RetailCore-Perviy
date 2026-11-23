@@ -447,11 +447,11 @@ def mark_status(batch: Batch, status: str, failed: bool = False) -> None:
     save(batch)
 
 
-def mark_application(batch: Batch, status: str, report_id: str = "",
+def mark_application(batch: Batch, status: str, report_id: str | None = None,
                      error: str = "") -> None:
     """Сохраняет этап нанесения до сети и после каждого подтверждённого ответа."""
     batch.application_status = status
-    if report_id:
+    if report_id is not None:
         batch.application_report_id = report_id
     batch.application_error = error
     save(batch)

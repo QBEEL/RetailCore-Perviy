@@ -1,7 +1,7 @@
 """Отчёт о нанесении КИН набора через API СУЗ.
 
-Руководство СУЗ 3.0, разделы 4.4.11 и 4.4.13. Отчёт отправляется один раз;
-последующие проверки используют только идентификатор полученного отчёта.
+Руководство СУЗ 3.0, разделы 4.4.11 и 4.4.13. Каждая попытка отправляется
+один раз, а статус проверяется по идентификатору полученного отчёта.
 """
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ SEND_PATH = "/utilisation"
 STATUS_PATH = "/report/info"
 MAX_CODES = 30_000
 PENDING = frozenset({"DRAFT", "PENDING", "READY_TO_SEND", "SENT", "CHECK"})
-FAILED = frozenset({"REJECTED", "FAILED", "PARTIALLY"})
+RETRYABLE = frozenset({"REJECTED", "FAILED"})
+FAILED = RETRYABLE | {"PARTIALLY"}
 DONE = "SUCCESS"
 STATUS_TITLES = {
     "SENDING": "Отправляется",
@@ -40,6 +41,13 @@ def _uuid(value: object) -> str:
         return str(UUID(str(value)))
     except (ValueError, AttributeError, TypeError):
         return ""
+
+
+def can_submit(batch: Batch) -> bool:
+    """Разрешает первую подачу или повтор после полного отказа по известному отчёту."""
+    if batch.application_status in RETRYABLE:
+        return bool(_uuid(batch.application_report_id))
+    return not batch.application_status and not batch.application_report_id
 
 
 def payload(batch: Batch) -> dict:
@@ -67,7 +75,7 @@ def send(batch: Batch, credentials: Credentials, thumbprint: str,
          contour: Contour) -> str:
     """Подписывает и однократно отправляет отчёт; возвращает только проверенный reportId."""
     if batch.application_status != "SENDING" or batch.application_report_id:
-        raise ValueError("Отчёт не подготовлен к первой отправке или уже отправлен.")
+        raise ValueError("Отчёт не подготовлен к отправке или уже отправлен.")
     body = payload(batch)
     if batch.contour != contour.value:
         raise ValueError("Контур блока не совпадает с выбранным контуром СУЗ.")
