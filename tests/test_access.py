@@ -176,6 +176,36 @@ def test_карточка_учётки_показывает_уже_закрыт�
     assert checked["marking"] is False and checked["payments"] is True
 
 
+def test_карточка_позволяет_изменить_логин_существующей_учётки(application, monkeypatch):
+    from app.core.payments import admin
+    from app.ui.widgets.account_dialogs import AccountDialog
+
+    account = admin.Account(id=7, login="old.login", full_name="Тестовый менеджер")
+    dialog = AccountDialog(account, known_responsible=[])
+    assert dialog.login.isEnabled()
+    dialog.login.setText("new login")
+    dialog._accept()
+    assert dialog.result() != dialog.DialogCode.Accepted
+
+    dialog.login.setText("  New.Login  ")
+    dialog._accept()
+    assert dialog.result() == dialog.DialogCode.Accepted
+    changed = dialog.result_account()
+    assert account.login == "old.login"
+    assert changed.login == "new.login"
+
+    def rename(path, body):
+        assert path == "/api/users/7"
+        assert body["login"] == "old.login"
+        assert body["new_login"] == "new.login"
+        return {**body, "id": 7, "login": body["new_login"]}
+
+    monkeypatch.setattr(transport, "patch", rename)
+    saved = admin.save(changed, previous_login=account.login)
+    assert saved.id == account.id
+    assert saved.login == "new.login"
+
+
 # --- таблица учётных записей --------------------------------------------------------
 
 def test_в_таблице_видно_что_закрыто():

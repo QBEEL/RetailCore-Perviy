@@ -257,10 +257,9 @@ class OrderDialog(QDialog):
         return _number(self.template_box.currentText())
 
     def _on_group_changed(self) -> None:
-        cosmetics = self.group_box.currentData() == "cosmetics"
-        if not cosmetics:
-            self.cis_type_box.setCurrentIndex(self.cis_type_box.findData("UNIT"))
-        self.cis_type_box.setEnabled(cosmetics)
+        group = self.group_box.currentData()
+        self.cis_type_box.setCurrentIndex(self.cis_type_box.findData("UNIT"))
+        self.cis_type_box.setEnabled(group in ("cosmetics", "perfumery"))
         self._sync_template()
         self._sync_hint()
 
@@ -381,6 +380,12 @@ class OrderDialog(QDialog):
 
     def _sync_hint(self, *_args) -> None:
         request = self.request
+        perfumery_set = (request.product_group == "perfumery"
+                         and self.cis_type_box.currentData() == "SET")
+        self.payment_box.setEnabled(not perfumery_set)
+        self.payment_box.setToolTip(
+            "Для заказа КИН парфюмерии условия оплаты определяет СУЗ."
+            if perfumery_set else "")
         problems = self._problems()
         self.order_button.setEnabled(not problems)
         if problems:

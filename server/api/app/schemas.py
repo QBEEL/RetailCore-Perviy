@@ -236,6 +236,11 @@ class UserIn(BaseModel):
     is_active: bool = True
 
 
+class UserUpdate(UserIn):
+    # При смене логина поле login содержит прежнее значение.
+    new_login: str | None = None
+
+
 class UserOut(BaseModel):
     id: int
     login: str

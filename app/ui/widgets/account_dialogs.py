@@ -1,6 +1,8 @@
 """Карточка учётной записи и показ выданного пароля."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -71,7 +73,7 @@ class AccountDialog(QDialog):
                  *, is_self: bool = False, directions: list[tuple[str, str]] | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.account = account
+        self.account = replace(account)
         self.is_self = is_self
         # Справочник направлений приходит снаружи, с сервера: прошивать
         # «Beauty и Fashion» в окно нельзя, направления будут добавляться.
@@ -90,9 +92,8 @@ class AccountDialog(QDialog):
 
         self.login = QLineEdit(self.account.login)
         self.login.setPlaceholderText("например, e.ivanov")
-        # Логин — ключ учётки, по нему человек входит. Менять его у заведённой
-        # записи нельзя: сервер такого не умеет, и обещать это в окне не нужно.
-        self.login.setEnabled(not self.account.id)
+        if self.account.id:
+            self.login.setToolTip("При следующем входе потребуется новый логин.")
         form.addRow("Логин", self.login)
 
         self.full_name = QLineEdit(self.account.full_name)
@@ -285,8 +286,9 @@ class AccountDialog(QDialog):
         if not login:
             self._fail("Укажите логин")
             return
-        if not login.replace(".", "").replace("-", "").replace("_", "").isalnum():
-            self._fail("Логин — латиница, цифры, точка, дефис и подчёркивание")
+        login_letters = login.replace(".", "").replace("-", "").replace("_", "")
+        if login != self.account.login and not login_letters.isalnum():
+            self._fail("Логин должен содержать буквы или цифры. Допустимы точка, дефис и подчёркивание.")
             return
         if not self.full_name.text().strip():
             self._fail("Укажите ФИО — оно подставляется автором в новые оплаты")

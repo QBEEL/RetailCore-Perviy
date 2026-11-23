@@ -16,6 +16,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from hashlib import sha256
 from typing import Iterable, Iterator, Sequence
 
 from .. import appdata
@@ -69,6 +70,32 @@ def _author() -> str:
         return getpass.getuser()
     except Exception:  # noqa: BLE001 — имя пользователя не должно ломать запись
         return ""
+
+
+def remember_set_items(
+    contour: Contour, keys: Iterable[str], *, allow_existing: Iterable[str] = ()
+) -> bool:
+    """Регистрирует КИ вложений. При недопустимом повторе откатывает всю запись."""
+    allowed = set(allow_existing)
+    with connect() as connection, connection:
+        for key in keys:
+            inserted = connection.execute(
+                "INSERT INTO set_item_history (contour, code_hash) VALUES (?, ?) "
+                "ON CONFLICT (contour, code_hash) DO NOTHING",
+                (contour.value, sha256(key.encode("utf-8")).digest()),
+            )
+            if not inserted.rowcount and key not in allowed:
+                connection.rollback()
+                return False
+    return True
+
+
+def forget_set_items(contour: Contour) -> int:
+    """Удаляет историю КИ вложений выбранного контура."""
+    with connect() as connection, connection:
+        return connection.execute(
+            "DELETE FROM set_item_history WHERE contour = ?", (contour.value,)
+        ).rowcount
 
 
 # --- операции ---------------------------------------------------------------------

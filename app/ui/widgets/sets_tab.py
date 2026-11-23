@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from datetime import datetime
 from typing import Callable
 
@@ -520,6 +521,14 @@ class SetsTab(QWidget):
         controls_row.addWidget(self.sound_box)
         self.composition_label = Hint("Состав набора пока пуст.", card)
         controls_row.addWidget(self.composition_label, 1)
+        self.forget_button = self._button(
+            card, "Забыть коды", "trash", self.forget_codes
+        )
+        self.forget_button.setToolTip(
+            "Очистить локальную историю кодов вложений в текущем контуре. "
+            "Коды в открытом наборе останутся в таблице."
+        )
+        controls_row.addWidget(self.forget_button)
         body.addLayout(controls_row)
 
         self.table = QTableWidget(0, 7, card)
@@ -876,7 +885,7 @@ class SetsTab(QWidget):
             self._sync()
             return "broken"
 
-        key = sets.key_of(text)
+        key = parsed.ki
         active_set_keys = {sets.key_of(sc) for sc in self.active_set_codes}
         if (self.set_code and key == sets.key_of(self.set_code)) or key in active_set_keys:
             self._repeats += 1
@@ -894,6 +903,24 @@ class SetsTab(QWidget):
                 self._say("repeat", f"Уже в наборе · {parsed.gtin} · {parsed.serial}")
             self._sync()
             return "repeat"
+
+        if not self._restoring:
+            try:
+                remembered = service.store.remember_set_items(self._contour(), (key,))
+            except (OSError, sqlite3.Error):
+                self._broken += 1
+                self._say("broken", "Код не принят. Не удалось сохранить историю кодов.")
+                self._sync()
+                return "broken"
+            if not remembered:
+                self._repeats += 1
+                if not quiet:
+                    self._say(
+                        "repeat",
+                        f"Код уже добавляли в набор · {parsed.gtin} · {parsed.serial}",
+                    )
+                self._sync()
+                return "repeat"
 
         self._keys.add(key)
         self.codes.append(text)
@@ -1126,6 +1153,20 @@ class SetsTab(QWidget):
         self._reset_content()
         sets.clear_draft(self._draft_path)
         self._sync()
+        self.focus_scan()
+
+    def forget_codes(self) -> None:
+        if self._busy or self._pending_submission():
+            return
+        contour = self._contour()
+        try:
+            removed = service.store.forget_set_items(contour)
+        except (OSError, sqlite3.Error):
+            self._tell("Не удалось очистить историю кодов вложений.", ToastKind.ERROR)
+            return
+        message = f"История кодов вложений очищена ({contour.title}). Удалено записей: {removed}."
+        self._say("added", message)
+        self._tell(message, ToastKind.SUCCESS)
         self.focus_scan()
 
     def _reset_content(self) -> None:
@@ -1681,6 +1722,28 @@ class SetsTab(QWidget):
                 item_codes=[code for unit in units for code in unit.item_codes],
                 names=dict(self._names),
             )
+            keys = {sets.key_of(code) for code in draft.item_codes}
+            current_units, _ = self.units_and_problems()
+            current_pairs = {
+                (unit.set_ki, ki) for unit in current_units for ki in unit.item_kis
+            }
+            same_assignment = {
+                ki for unit in units for ki in unit.item_kis
+                if (unit.set_ki, ki) in current_pairs
+            }
+            try:
+                remembered = service.store.remember_set_items(
+                    self._contour(), keys, allow_existing=same_assignment
+                )
+            except (OSError, sqlite3.Error):
+                self._tell("Не удалось сохранить историю кодов вложений.", ToastKind.ERROR)
+                return
+            if not remembered:
+                self._tell(
+                    "В JSON есть коды вложений, которые уже добавляли в другой набор.",
+                    ToastKind.WARNING,
+                )
+                return
             sets.save_draft(draft, self._draft_path)
             self._restoring = True
             try:
@@ -1693,7 +1756,7 @@ class SetsTab(QWidget):
                 self.set_codes_pool = draft.set_codes_pool
                 self._sync_set_pool()
                 self.codes = draft.item_codes
-                self._keys = {sets.key_of(code) for code in self.codes}
+                self._keys = keys
                 for row, code in enumerate(self.codes):
                     self._append_row(row, code)
                 self._refresh_table_statuses()
@@ -2362,6 +2425,7 @@ class SetsTab(QWidget):
         self.remove_button.setEnabled(has_selection and not self._busy and not locked)
         self.remove_gtin_button.setEnabled(has_selection and not self._busy and not locked)
         self.clear_button.setEnabled((has_set or has_items) and not self._busy and not locked)
+        self.forget_button.setEnabled(not self._busy and not locked)
         self.set_clear_button.setEnabled(has_set and not self._busy and not locked)
         self.check_button.setEnabled(ready and not self._busy and not locked)
         self.poll_button.setEnabled(has_pending_doc and not self._busy)

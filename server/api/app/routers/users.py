@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from psycopg import errors
 
 from .. import auditlog, db, security
-from ..schemas import UserIn, UserOut
+from ..schemas import UserIn, UserOut, UserUpdate
 from ..security import User
 
 router = APIRouter(prefix="/api/users", tags=["Пользователи"])
@@ -39,39 +40,29 @@ _SELECT = (
 )
 
 
-def _save_directions(user_id: int, codes: list[str]) -> None:
-    """Переписывает направления учётки.
-
-    Целиком, а не по одному: список короткий, приходит из диалога сразу
-    готовым, и разбирать, что добавилось, а что убралось, здесь не за чем.
-    """
-    db.execute("DELETE FROM user_direction WHERE user_id = %s", (user_id,))
-    for code in codes:
+def _save_access(handle, user_id: int, form: UserIn) -> None:
+    handle.execute("DELETE FROM user_responsible WHERE user_id = %s", (user_id,))
+    for name in form.responsible:
+        handle.execute("INSERT INTO user_responsible (user_id, responsible)"
+                       " VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, name))
+    handle.execute("DELETE FROM user_direction WHERE user_id = %s", (user_id,))
+    for code in form.directions:
         # Направления расхода учётке не назначаются: пересчёт закреплений
         # разнёс бы «Налоги» по всем поставщикам человека. Молча, а не
         # отказом: приложение 3.6.3 покажет их флажками в учётке, и отказ
         # сохранить всю учётку из-за одной лишней галочки был бы непонятен.
-        db.execute(
+        handle.execute(
             "INSERT INTO user_direction (user_id, direction_id)"
             " SELECT %s, id FROM direction WHERE code = %s AND for_people"
             " ON CONFLICT DO NOTHING", (user_id, code))
-
-
-def _save_pages(user_id: int, codes: list[str]) -> None:
-    """Переписывает список закрытых разделов — так же целиком, как направления."""
-    db.execute("DELETE FROM user_page_denied WHERE user_id = %s", (user_id,))
-    for code in codes:
-        db.execute(
+    handle.execute("DELETE FROM user_page_denied WHERE user_id = %s", (user_id,))
+    for code in form.denied_pages:
+        handle.execute(
             "INSERT INTO user_page_denied (user_id, page_code) VALUES (%s, %s)"
             " ON CONFLICT DO NOTHING", (user_id, code))
-
-
-def _save_ai_limit(user_id: int, form: UserIn) -> None:
-    """Личный предел ИИ-правки. Не переданный клиентом — остаётся как был."""
-    if "ai_limit" not in form.model_fields_set:
-        return
-    db.execute("UPDATE app_user SET ai_daily_limit = %s WHERE id = %s",
-               (form.ai_limit, user_id))
+    if "ai_limit" in form.model_fields_set:
+        handle.execute("UPDATE app_user SET ai_daily_limit = %s WHERE id = %s",
+                       (form.ai_limit, user_id))
 
 
 @router.get("/me", response_model=UserOut, summary="Кто я")
@@ -91,71 +82,85 @@ def list_users(user: User = Depends(security.admin_only)) -> list[UserOut]:
 def create_user(form: UserIn,
                 user: User = Depends(security.admin_only)) -> dict:
     login = form.login.strip().lower()
-    if db.fetch_one("SELECT 1 FROM app_user WHERE login = %s", (login,)):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
-                            detail=f"Логин {login} уже занят")
-
     password = security.random_password()
-    row = db.fetch_one(
-        "INSERT INTO app_user (login, full_name, password_hash, is_admin,"
-        "                      is_active, must_change_password)"
-        " VALUES (%s, %s, %s, %s, %s, TRUE) RETURNING id",
-        (login, form.full_name, security.hash_password(password),
-         form.is_admin, form.is_active))
-    for name in form.responsible:
-        db.execute("INSERT INTO user_responsible (user_id, responsible)"
-                   " VALUES (%s, %s) ON CONFLICT DO NOTHING", (row["id"], name))
-    _save_directions(row["id"], form.directions)
-    _save_pages(row["id"], form.denied_pages)
-    _save_ai_limit(row["id"], form)
-    db.execute(
-        "INSERT INTO audit_log (user_id, entity, entity_id, action)"
-        " VALUES (%s, 'app_user', %s, 'create')", (user.id, row["id"]))
+    password_hash = security.hash_password(password)
+    with db.cursor() as handle:
+        handle.execute(
+            "INSERT INTO app_user (login, full_name, password_hash, is_admin,"
+            "                      is_active, must_change_password)"
+            " VALUES (%s, %s, %s, %s, %s, TRUE)"
+            " ON CONFLICT (login) DO NOTHING RETURNING id",
+            (login, form.full_name, password_hash, form.is_admin, form.is_active))
+        row = handle.fetchone()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Логин {login} уже занят")
+        _save_access(handle, row["id"], form)
+        handle.execute(
+            "INSERT INTO audit_log (user_id, entity, entity_id, action)"
+            " VALUES (%s, 'app_user', %s, 'create')", (user.id, row["id"]))
     # Пароль возвращается один раз, в ответ на создание: в базе лежит только
     # хеш, и восстановить его потом нельзя — можно лишь назначить новый.
     return {"id": row["id"], "login": login, "password": password}
 
 
 @router.put("/{user_id}", response_model=UserOut, summary="Изменить учётку")
-def update_user(user_id: int, form: UserIn,
+@router.patch("/{user_id}", response_model=UserOut, summary="Изменить учётку с новым логином")
+def update_user(user_id: int, form: UserUpdate,
                 user: User = Depends(security.admin_only)) -> UserOut:
-    old = db.fetch_one("SELECT ai_daily_limit FROM app_user WHERE id = %s", (user_id,))
-    if not old:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Учётная запись не найдена")
     if user_id == user.id and not form.is_admin:
         # Иначе единственный администратор способен разжаловать сам себя, и
         # заводить учётки станет некому.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Нельзя снять с себя права администратора")
 
-    db.execute(
-        "UPDATE app_user SET full_name = %s, is_admin = %s, is_active = %s,"
-        # Отключение заканчивает выданные входы: включённая позже учётка
-        # входит заново. Правая часть видит строку до изменения.
-        "                    token_version = token_version"
-        "                      + CASE WHEN is_active AND NOT %s THEN 1 ELSE 0 END"
-        " WHERE id = %s",
-        (form.full_name, form.is_admin, form.is_active, form.is_active, user_id))
-    db.execute("DELETE FROM user_responsible WHERE user_id = %s", (user_id,))
-    for name in form.responsible:
-        db.execute("INSERT INTO user_responsible (user_id, responsible)"
-                   " VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, name))
-    _save_directions(user_id, form.directions)
-    _save_pages(user_id, form.denied_pages)
-    old_limit = old["ai_daily_limit"]
-    _save_ai_limit(user_id, form)
-    changes = {}
-    if "ai_limit" in form.model_fields_set and form.ai_limit != old_limit:
-        # Смена предела — решение администратора о расходах: в журнале видно, кто
-        # и с какого значения на какое.
-        changes = {"ai_limit": form.ai_limit, auditlog.WAS: {"ai_limit": old_limit}}
-    db.execute(
-        "INSERT INTO audit_log (user_id, entity, entity_id, action, changes)"
-        " VALUES (%s, 'app_user', %s, 'update', %s)",
-        (user.id, user_id, json.dumps(changes, ensure_ascii=False)))
-    return UserOut(**db.fetch_one(_SELECT + " WHERE u.id = %s GROUP BY u.id",
-                                  (user_id,)))
+    login = None
+    if form.new_login is not None:
+        login = form.new_login.strip().lower()
+        if not login.replace(".", "").replace("-", "").replace("_", "").isalnum():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Логин должен содержать буквы или цифры. "
+                                       "Допустимы точка, дефис и подчёркивание.")
+
+    try:
+        with db.cursor() as handle:
+            handle.execute("SELECT ai_daily_limit FROM app_user WHERE id = %s", (user_id,))
+            old = handle.fetchone()
+            if not old:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                    detail="Учётная запись не найдена")
+            handle.execute(
+                "UPDATE app_user SET login = COALESCE(%s, login), full_name = %s,"
+                "                    is_admin = %s, is_active = %s,"
+                # Отключение завершает выданные входы.
+                "                    token_version = token_version"
+                "                      + CASE WHEN is_active AND NOT %s THEN 1 ELSE 0 END"
+                " WHERE id = %s AND (NOT %s OR login = %s)",
+                (login, form.full_name, form.is_admin, form.is_active, form.is_active,
+                 user_id, login is not None, form.login))
+            if not handle.rowcount:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                    detail="Учётная запись изменилась. Обновите список и повторите правку.")
+            _save_access(handle, user_id, form)
+            changes = {}
+            was = {}
+            if login is not None and login != form.login:
+                changes["login"], was["login"] = login, form.login
+            if "ai_limit" in form.model_fields_set and form.ai_limit != old["ai_daily_limit"]:
+                changes["ai_limit"], was["ai_limit"] = form.ai_limit, old["ai_daily_limit"]
+            if was:
+                changes[auditlog.WAS] = was
+            handle.execute(
+                "INSERT INTO audit_log (user_id, entity, entity_id, action, changes)"
+                " VALUES (%s, 'app_user', %s, 'update', %s)",
+                (user.id, user_id, json.dumps(changes, ensure_ascii=False)))
+            handle.execute(_SELECT + " WHERE u.id = %s GROUP BY u.id", (user_id,))
+            return UserOut(**handle.fetchone())
+    except errors.UniqueViolation as error:
+        if error.diag.constraint_name != "app_user_login_key":
+            raise
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Логин {login} уже занят") from None
 
 
 @router.post("/{user_id}/password", response_model=dict,

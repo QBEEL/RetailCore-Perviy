@@ -738,9 +738,16 @@ def test_экспортированный_json_открывается_в_фор�
     assert exported["participantId"] == SUPPLIER_INN
     assert f"01{ITEM1_GTIN}21ITEM93ABCD" in exported["aggregationUnits"][0]["sntins"]
 
-    # Загрузка через кнопку в пустой черновик с сохранённой товарной группой.
+    # Повторный импорт тех же вложений после очистки черновика блокируется.
     tab.clear()
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+    tab.file_load_button.click()
+    _settle(application)
+    assert not tab.codes
+    assert "уже добавляли в другой набор" in state["told"][-1][0]
+
+    # Явная очистка истории позволяет повторно открыть экспортированный JSON.
+    tab.forget_button.click()
     tab.file_load_button.click()
     _settle(application)
 
@@ -785,6 +792,15 @@ def test_загрузка_json_сохраняет_черновик_при_оши
     assert Path(draft_path).read_bytes() == original
 
     state["yes"] = True
+    another_set = _doc().render().replace(SET_KI, f"01{SET_GTIN}21SET002")
+    path.write_text(another_set, encoding="utf-8")
+    tab.load_document_file(str(path))
+    _settle(application)
+    assert tab.codes == [ITEM1_RAW]
+    assert "уже добавляли в другой набор" in state["told"][-1][0]
+    assert Path(draft_path).read_bytes() == original
+
+    path.write_text(_doc().render(), encoding="utf-8-sig")
     tab.load_document_file(str(path))
     _settle(application)
     assert tab.codes == [ITEM1_KI, ITEM2_KI]
@@ -842,6 +858,55 @@ def test_сканирование_кин_в_поле_вложений_или_д�
     assert tab.codes == [ITEM1_RAW]
     assert tab.tile_repeats._value.text() == "2"
     assert tab.tile_broken._value.text() == "1"
+
+
+def test_история_вложений_переживает_очистку_черновика_и_перезапуск(application, world):
+    tab, state, draft_file = world
+    tab.set_set_code(SET_RAW)
+    tab.scan_edit.setText(ITEM1_RAW)
+    tab.scan_edit.returnPressed.emit()
+    assert tab.codes == [ITEM1_RAW]
+    tab.clear_button.click()
+
+    reopened = type(tab)(
+        tab.settings, contour=lambda: state["contour"], draft_path=draft_file
+    )
+    reopened.set_set_code(f"01{SET_GTIN}21SET002")
+    reopened.scan_edit.setText(ITEM1_KI)
+    reopened.scan_edit.returnPressed.emit()
+    assert reopened.codes == []
+    assert "Код уже добавляли в набор" in reopened.verdict_label.text()
+    assert reopened.tile_repeats._value.text() == "1"
+    assert reopened.add_many(f"{ITEM1_KI}\n{ITEM2_RAW}") == (1, 1, 0)
+
+    reopened.forget_button.click()
+    assert reopened.codes == [ITEM2_RAW]
+    assert "очищена" in reopened.verdict_label.text()
+    assert reopened.add_code(ITEM2_KI) == "repeat"
+
+    restored = type(tab)(
+        tab.settings, contour=lambda: state["contour"], draft_path=draft_file
+    )
+    assert restored.codes == [ITEM2_RAW]
+    assert restored.add_code(ITEM1_KI) == "added"
+    _settle(application)
+
+
+def test_очистка_истории_песочницы_не_затрагивает_рабочий_контур(world):
+    tab, state, _ = world
+    state["contour"] = Contour.PRODUCTION
+    assert tab.add_code(ITEM1_RAW) == "added"
+    tab.clear()
+
+    state["contour"] = Contour.SANDBOX
+    assert tab.add_code(ITEM1_RAW) == "added"
+    tab.clear()
+    tab.forget_button.click()
+    assert tab.add_code(ITEM1_KI) == "added"
+    tab.clear()
+
+    state["contour"] = Contour.PRODUCTION
+    assert tab.add_code(ITEM1_KI) == "repeat"
 
 
 def test_проверка_кодов_в_чз_отображает_статусы_и_блокирует_отправку_при_ошибке(
@@ -1152,6 +1217,7 @@ def test_подпартия_после_перезапуска_списывает
     assert len(state["sent"]) == 1
     assert reopened.set_code == second_set
     assert reopened.codes == [second_item]
+    assert reopened.add_code(ITEM1_KI) == "repeat"
     assert sets.load_draft(draft_file).doc_id == ""
 
 

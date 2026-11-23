@@ -262,6 +262,7 @@ FIELD_TITLES = {
     "title": "название",
     "paid_flag": "отметка об оплате",
     "recipient": "получатель",
+    "login": "логин",
     "vat": "НДС",
     "instead_of": "вместо",
     "responsible": "ответственный",
@@ -378,12 +379,25 @@ def create(account: Account) -> tuple[Account, str]:
     return account, answer["password"]
 
 
-def save(account: Account) -> Account:
-    return _account(transport.put(f"/api/users/{account.id}", {
+def save(account: Account, *, previous_login: str | None = None) -> Account:
+    path = f"/api/users/{account.id}"
+    body = {
         "login": account.login, "full_name": account.full_name,
         "responsible": account.responsible, "directions": account.directions,
         "denied_pages": account.denied_pages, "ai_limit": account.ai_limit,
-        "is_admin": account.is_admin, "is_active": account.is_active}))
+        "is_admin": account.is_admin, "is_active": account.is_active,
+    }
+    if previous_login is None or previous_login == account.login:
+        return _account(transport.put(path, body))
+
+    body["login"] = previous_login
+    body["new_login"] = account.login
+    try:
+        return _account(transport.patch(path, body))
+    except transport.ServerError as error:
+        if error.status == 405:
+            raise transport.ServerError("Для смены логина нужно обновить сервер RetailCore.", 405) from None
+        raise
 
 
 def reset_password(account_id: int) -> str:

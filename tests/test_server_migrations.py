@@ -279,3 +279,60 @@ def test_api_serves_health_after_migrations(database, load_api):
             response = client.get(path, headers=headers)
             assert response.status_code == 200, (path, response.text)
     assert main.db.pool.closed
+
+
+def test_admin_renames_user_without_changing_account_identity(database, load_api):
+    dsn, connection = database
+    migrate(connection)
+    main, client = load_api(dsn)
+    security = importlib.import_module(main.__package__ + ".security")
+    password = "test-password-123"
+    password_hash = security.hash_password(password)
+    connection.execute("INSERT INTO app_user(login,password_hash,is_admin) VALUES ('admin',%s,TRUE)",
+                       (password_hash,))
+    target = connection.execute(
+        "INSERT INTO app_user(login,password_hash,full_name) VALUES ('manager',%s,'Manager') RETURNING id",
+        (password_hash,)).fetchone()["id"]
+    connection.execute("INSERT INTO user_responsible(user_id,responsible) VALUES (%s,'Manager')",
+                       (target,))
+
+    def sign_in(login):
+        return client.post("/api/auth/token", data={"username": login, "password": password})
+
+    def bearer(response):
+        assert response.status_code == 200, response.text
+        return {"Authorization": "Bearer " + response.json()["access_token"]}
+
+    path = f"/api/users/{target}"
+    form = {"login": "manager", "new_login": "  New.Login  ", "full_name": "Manager",
+            "responsible": ["Manager"], "denied_pages": ["marking"]}
+    with client:
+        administrator = bearer(sign_in("admin"))
+        manager = bearer(sign_in("manager"))
+        assert client.patch(path, headers=manager, json=form).status_code == 403
+        duplicate = client.patch(path, headers=administrator, json={
+            **form, "new_login": " ADMIN ", "full_name": "Must not be saved"})
+        assert duplicate.status_code == 409
+        assert duplicate.json()["detail"] == "Логин admin уже занят"
+        assert client.get("/api/users/me", headers=manager).json()["full_name"] == "Manager"
+
+        changed = client.patch(path, headers=administrator, json=form)
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["login"] == "new.login"
+        assert changed.json()["id"] == target
+        assert changed.json()["responsible"] == ["Manager"]
+        assert changed.json()["denied_pages"] == ["marking"]
+        assert sign_in("manager").status_code == 401
+        assert sign_in("new.login").json()["user_id"] == target
+        assert client.get("/api/users/me", headers=manager).json()["login"] == "new.login"
+
+        stale = client.patch(path, headers=administrator, json={**form, "new_login": "other"})
+        assert stale.status_code == 409
+        legacy = {key: value for key, value in form.items() if key != "new_login"}
+        assert client.put(path, headers=administrator, json=legacy).json()["login"] == "new.login"
+
+    changes = connection.execute(
+        "SELECT changes FROM audit_log WHERE entity = 'app_user' AND entity_id = %s ORDER BY id",
+        (target,)).fetchall()
+    assert [row["changes"] for row in changes] == [
+        {"login": "new.login", "was": {"login": "manager"}}, {}]

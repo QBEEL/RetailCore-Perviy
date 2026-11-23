@@ -85,7 +85,17 @@ def _step_2(connection: sqlite3.Connection) -> None:
         "ALTER TABLE code_check ADD COLUMN permits TEXT NOT NULL DEFAULT ''")
 
 
-_MIGRATIONS = (_step_1, _step_2)
+def _step_3(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS set_item_history (
+            contour TEXT NOT NULL,
+            code_hash BLOB NOT NULL,
+            PRIMARY KEY (contour, code_hash)
+        ) WITHOUT ROWID
+    """)
+
+
+_MIGRATIONS = (_step_1, _step_2, _step_3)
 VERSION = len(_MIGRATIONS)
 
 

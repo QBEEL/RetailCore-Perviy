@@ -219,6 +219,7 @@ class OrderConfirmDialog(QDialog):
         rows = QPlainTextEdit(self)
         rows.setReadOnly(True)
         rows.setPlainText(chr(10).join(f"{line.gtin} — {line.quantity} шт."
+                                    + (" · Набор (КИН)" if line.cis_type == "SET" else "")
                                     for line in request.lines))
         font = rows.font()
         font.setPointSize(font.pointSize() + 2)

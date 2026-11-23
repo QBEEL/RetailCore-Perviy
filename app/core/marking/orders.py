@@ -450,6 +450,12 @@ class Request:
         return sum(int(line.quantity) for line in self.lines)
 
     @property
+    def perfumery_set_order(self) -> bool:
+        return (same_group(self.product_group, "perfumery")
+                and bool(self.lines)
+                and all(line.cis_type == "SET" for line in self.lines))
+
+    @property
     def problems(self) -> tuple[str, ...]:
         """Что помешает отправке. Проверяется до сети — и до денег.
 
@@ -491,8 +497,8 @@ class Request:
                 f"шаблон {', '.join(str(n) for n in sorted(wrong))} не годится "
                 f"для этой товарной группы — подойдёт {fits}")
         if self.method.needs_production and not (
-            same_group(self.product_group, "cosmetics")
-            and self.method is ReleaseMethod.PRODUCTION
+            self.method is ReleaseMethod.PRODUCTION
+            and (same_group(self.product_group, "cosmetics") or self.perfumery_set_order)
         ):
             found.append(
                 f"«{self.method.title}» требует сведений о производственной "
@@ -501,18 +507,21 @@ class Request:
 
     def as_json(self) -> dict[str, Any]:
         """Тело запроса. Состав и порядок — те же, что у ПРИНТМАРКИ."""
-        if same_group(self.product_group, "cosmetics"):
-            # Руководство СУЗ, 4.4.1.1.26: реквизиты заказа этой группы лежат
-            # в attributes, а технический код группы у СУЗ — chemistry.
+        cosmetics = same_group(self.product_group, "cosmetics")
+        if cosmetics or self.perfumery_set_order:
+            # Руководство СУЗ, 4.4.1.1.5 и 4.4.1.1.26: реквизиты в attributes.
+            # Для парфюмерии в таблице 17 способ оплаты не указан.
+            attributes = {
+                "contactPerson": self.contact.strip(),
+                "releaseMethodType": self.method.value,
+                "createMethodType": "SELF_MADE",
+            }
+            if cosmetics:
+                attributes["paymentType"] = int(self.payment_type)
             return {
-                "productGroup": "chemistry",
+                "productGroup": "chemistry" if cosmetics else "perfumery",
                 "products": [line.as_json() for line in self.lines],
-                "attributes": {
-                    "contactPerson": self.contact.strip(),
-                    "releaseMethodType": self.method.value,
-                    "createMethodType": "SELF_MADE",
-                    "paymentType": int(self.payment_type),
-                },
+                "attributes": attributes,
             }
         return {
             "productGroup": self.product_group.strip(),

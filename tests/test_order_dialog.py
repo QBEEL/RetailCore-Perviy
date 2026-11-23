@@ -17,11 +17,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPlainTextEdit
 
 from app.core.marking import orders as orders_module
+from app.core.marking.models import Contour
 from app.core.marking.orders import Buffer, Order, ReleaseMethod, parse_lines
 from app.ui.widgets import order_dialog
+from app.ui.widgets.marking_dialogs import OrderConfirmDialog
 from app.ui.widgets.order_dialog import OrderDialog
 
 
@@ -218,6 +220,38 @@ def test_контактное_лицо_подставлено_и_обязате�
     assert "контактное лицо" in dialog.hint.text()
     dialog.contact_edit.setText("Иванов")
     assert dialog.order_button.isEnabled()
+
+
+def test_заказ_кин_парфюмерии_с_производством_готов_к_суз(application):
+    dialog = _filled(application)
+    dialog.group_box.setCurrentIndex(dialog.group_box.findData("perfumery"))
+    dialog.method_box.setCurrentIndex(
+        dialog.method_box.findData(ReleaseMethod.PRODUCTION.value))
+
+    assert dialog.cis_type_box.isEnabled()
+    assert dialog.cis_type_box.currentData() == "UNIT"
+    assert not dialog.order_button.isEnabled()
+
+    dialog.cis_type_box.setCurrentIndex(dialog.cis_type_box.findData("SET"))
+    assert dialog.order_button.isEnabled()
+    assert not dialog.payment_box.isEnabled()
+    request = dialog.request
+    assert request.as_json() == {
+        "productGroup": "perfumery",
+        "products": [{"gtin": "04601234567893", "quantity": 500,
+                      "serialNumberType": "OPERATOR", "templateId": 9,
+                      "cisType": "SET"}],
+        "attributes": {"contactPerson": "Иванов Евгений",
+                       "releaseMethodType": "PRODUCTION",
+                       "createMethodType": "SELF_MADE"},
+    }
+    confirm = OrderConfirmDialog(request, Contour.SANDBOX)
+    assert "Набор (КИН)" in confirm.findChild(QPlainTextEdit).toPlainText()
+
+    dialog.group_box.setCurrentIndex(dialog.group_box.findData("lp"))
+    assert not dialog.cis_type_box.isEnabled()
+    assert dialog.cis_type_box.currentData() == "UNIT"
+    assert dialog.payment_box.isEnabled()
 
 
 def test_кнопка_заказа_не_кнопка_по_умолчанию(application):

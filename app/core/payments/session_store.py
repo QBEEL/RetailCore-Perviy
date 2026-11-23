@@ -119,6 +119,15 @@ def save(session: object) -> None:
     _write(saved)
 
 
+def update_login(base_url: str, user_id: int, previous_login: str, login: str) -> None:
+    """Обновляет имя сохранённого входа, сохраняя срок подтверждения."""
+    saved = load()
+    if (saved.base_url == base_url and saved.login == previous_login
+            and saved.user_id in (0, user_id)):
+        saved.login = login
+        _write(saved)
+
+
 def forget() -> None:
     """Выход из учётной записи: токен удаляется, память о входе остаётся.
 

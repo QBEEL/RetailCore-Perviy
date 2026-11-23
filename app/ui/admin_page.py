@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..core.payments import admin, data, dds, transport
+from ..core.payments import admin, data, dds, session_store, transport
 from ..core.payments.admin import Account, Cover, Entry, Scope
 from ..core.suppliers import directory
 from ..core.settings import AppSettings
@@ -692,17 +692,30 @@ class AdminPage(QWidget):
         if account is None:
             self.notify("Выберите учётную запись", ToastKind.INFO)
             return
+        previous_login = account.login
+        session = transport.session
+        base_url = session.base_url
+        is_self = account.id == session.user_id if session.user_id else previous_login == session.login
         dialog = AccountDialog(account, self._known,
-                               is_self=account.login == transport.session.login,
+                               is_self=is_self,
                                directions=self._directions, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         changed = dialog.result_account()
-        run_task(lambda: admin.save(changed),
-                 on_result=lambda _: self._saved(changed), on_error=self._failed)
+        run_task(lambda: admin.save(changed, previous_login=previous_login),
+                 on_result=lambda saved: self._saved(saved, previous_login, base_url, is_self),
+                 on_error=self._failed)
 
-    def _saved(self, account: Account) -> None:
-        self.notify(f"Учётная запись {account.login} изменена", ToastKind.SUCCESS)
+    def _saved(self, account: Account, previous_login: str, base_url: str, is_self: bool) -> None:
+        if account.login != previous_login:
+            session = transport.session
+            if (is_self and session.active and session.base_url == base_url
+                    and session.login == previous_login and session.user_id in (0, account.id)):
+                session.login = account.login
+                session_store.update_login(base_url, account.id, previous_login, account.login)
+            self.notify(f"Логин изменён с {previous_login} на {account.login}", ToastKind.SUCCESS)
+        else:
+            self.notify(f"Учётная запись {account.login} изменена", ToastKind.SUCCESS)
         self.reload()
 
     def reset_password(self) -> None:
