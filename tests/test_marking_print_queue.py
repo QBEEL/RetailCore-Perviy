@@ -52,3 +52,35 @@ def test_dialog_submits_one_job_with_names_and_preserves_pdf_progress(monkeypatc
         assert len(dialog._entries) == (2 if pdf else 1)
     finally:
         dialog.close()
+
+
+def test_print_dialog_keeps_names_aligned_with_selected_range(monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QApplication
+    from app.ui import label_print, pdf_label_print
+    from app.ui.widgets.issue_dialogs import PrintDialog
+
+    application = QApplication.instance() or QApplication([])
+    codes = [label_print.SAMPLE_CODE.replace("Xy7", serial) for serial in ("Ab8", "Bc9", "Cd0")]
+    calls = []
+    print_codes = label_print.print_codes
+
+    def record(selected, name, spec, printer, **kwargs):
+        calls.append((selected, kwargs["names"]))
+        return print_codes(selected, name, spec, printer, **kwargs)
+
+    monkeypatch.setattr(label_print, "print_codes", record)
+    target = str(tmp_path / "labels.pdf")
+    dialog = PrintDialog(issue.Batch(codes=codes), names=["Первый", "Второй", "Третий"])
+    monkeypatch.setattr(dialog, "_target", lambda: ("", target))
+    try:
+        dialog.start.setValue(2)
+        dialog.count.setValue(2)
+        dialog._print()
+        assert calls == [(codes[1:], ["Второй", "Третий"])]
+        document, _ = pdf_label_print.open_labels(target)
+        try:
+            assert document.pageCount() == 2
+        finally:
+            document.close()
+    finally:
+        dialog.close()

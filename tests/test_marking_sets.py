@@ -33,7 +33,7 @@ from app.core.marking.models import (
     OperationKind,
     OperationStatus,
 )
-from app.core.marking.sets import SetDocument, SetDraft, SetUnit
+from app.core.marking.sets import SetDocument, SetDraft, SetSpecSlot, SetUnit
 
 SET_GTIN = "04607001239994"
 ITEM1_GTIN = "04607001230014"
@@ -129,6 +129,112 @@ def test_повторы_вложений_и_совпадение_с_кин_от�
         "совпадает с одним из кодов вложений" in p
         for p in _doc(item_codes=(ITEM1_RAW, SET_RAW)).problems
     )
+
+
+def test_подпартия_по_спецификации_сохраняет_лишние_коды_для_следующей_поставки():
+    set_codes = [SET_RAW, f"01{SET_GTIN}21SET002", f"01{SET_GTIN}21SET003"]
+    cream = [f"01{ITEM1_GTIN}21CREAM{i:03d}" for i in range(1, 7)]
+    perfume = [f"01{ITEM2_GTIN}21SCENT{i:03d}" for i in range(1, 3)]
+    slots = [
+        SetSpecSlot(1, "Крем", gtin=ITEM1_GTIN, quantity_per_set=2),
+        SetSpecSlot(2, "Духи", gtin=ITEM2_GTIN),
+        SetSpecSlot(3, "Спонж", marked=False, unmarked_ready_count=3),
+    ]
+
+    assert sets.available_sets(set_codes, [*cream, *perfume], slots) == (2, [])
+    units, problems = sets.build_units(
+        set_codes, [*cream, *perfume], slots=slots, limit_sets=1
+    )
+    assert problems == []
+    assert len(units) == 1
+    assert units[0].item_codes == (cream[0], cream[1], perfume[0])
+    remaining_sets, remaining_items = sets.remaining_codes(
+        set_codes, [*cream, *perfume], units
+    )
+    assert remaining_sets == set_codes[1:]
+    assert remaining_items == [*cream[2:], perfume[1]]
+
+    later_units, problems = sets.build_units(
+        remaining_sets, [*remaining_items, f"01{ITEM2_GTIN}21SCENT003"], slots=slots
+    )
+    assert problems == []
+    assert len(later_units) == 2
+
+
+def test_подпартия_отклоняет_чужой_gtin_и_превышение_доступного_количества():
+    slots = [SetSpecSlot(1, "Крем", gtin=ITEM1_GTIN)]
+    set_codes = [SET_RAW, f"01{SET_GTIN}21SET002"]
+    units, problems = sets.build_units(
+        set_codes, [ITEM1_RAW, ITEM2_RAW], slots=slots
+    )
+    assert units == ()
+    assert any("не входит в спецификацию" in problem for problem in problems)
+
+    units, problems = sets.build_units(
+        set_codes, [ITEM1_RAW], slots=slots, limit_sets=2
+    )
+    assert units == ()
+    assert any("от 1 до 1" in problem for problem in problems)
+
+    units, problems = sets.build_units(set_codes, [ITEM1_RAW], limit_sets=1)
+    assert units == ()
+    assert any("нужна спецификация" in problem for problem in problems)
+
+
+def test_мультитоварный_набор_принимает_косметику_и_парфюм_при_соблюдении_правил():
+    unit = SetUnit(set_code=SET_RAW, item_codes=(ITEM1_RAW, ITEM2_RAW))
+    checks = {
+        SET_KI: _checked_set(product_group="cosmetics"),
+        ITEM1_KI: _checked_item(
+            ITEM1_KI, ITEM1_GTIN, product_group="cosmetics", owner_inn=SUPPLIER_INN
+        ),
+        ITEM2_KI: _checked_item(
+            ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=OUR_INN
+        ),
+    }
+    result = sets.verify_codes(unit, checks, our_inn=OUR_INN, product_group="cosmetics")
+    assert result.ok
+    assert any("ОСУ" in note for note in result.notes)
+    assert _doc(product_group="perfumery").problems == []
+    assert _doc(product_group="perfumery").wire_type("perfumery") == "AGGREGATION_DOCUMENT"
+
+    checks[SET_KI] = _checked_set(product_group="perfumery")
+    result = sets.verify_codes(unit, checks, our_inn=OUR_INN, product_group="perfumery")
+    assert result.ok
+
+    checks[ITEM2_KI] = _checked_item(
+        ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=SUPPLIER_INN
+    )
+    result = sets.verify_codes(unit, checks, our_inn=OUR_INN, product_group="cosmetics")
+    assert any("другому участнику" in problem for problem in result.problems)
+
+
+def test_мультитоварному_набору_нужны_общая_группа_и_статус_в_обороте():
+    unit = SetUnit(set_code=SET_RAW, item_codes=(ITEM1_RAW, ITEM2_RAW))
+    checks = {
+        SET_KI: _checked_set(product_group="cosmetics"),
+        ITEM1_KI: _checked_item(ITEM1_KI, ITEM1_GTIN, product_group="perfumery", owner_inn=OUR_INN),
+        ITEM2_KI: _checked_item(ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=OUR_INN),
+    }
+    result = sets.verify_codes(unit, checks, our_inn=OUR_INN, product_group="cosmetics")
+    assert any("хотя бы одно вложение" in problem for problem in result.problems)
+
+    checks[ITEM1_KI] = _checked_item(ITEM1_KI, ITEM1_GTIN, product_group="cosmetics")
+    checks[ITEM2_KI] = _checked_item(
+        ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=OUR_INN,
+        state=CodeState.APPLIED,
+    )
+    result = sets.verify_codes(unit, checks, our_inn=OUR_INN, product_group="cosmetics")
+    assert any("все КИ мультитоварного набора" in problem for problem in result.problems)
+
+    checks[ITEM2_KI] = _checked_item(
+        ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=OUR_INN
+    )
+    result = sets.verify_codes(
+        unit, checks, our_inn=OUR_INN, product_group="cosmetics",
+        slots=[SetSpecSlot(1, "Крем", gtin=ITEM1_GTIN, product_group="perfumery")],
+    )
+    assert any("не совпадает со спецификацией" in problem for problem in result.problems)
 
 
 # --- предпросмотр состава набора ---------------------------------------------------
@@ -421,6 +527,35 @@ def test_черновик_набора_атомарно_сохраняется_�
     assert sets.load_draft(path).set_code == ""
 
 
+def test_импорт_спецификации_csv_и_xlsx(tmp_path):
+    csv_path = tmp_path / "spec.csv"
+    csv_path.write_text(
+        "Ячейка;Наименование;Маркируемый;GTIN;Количество в наборе\n"
+        f"1;Крем;Да;{ITEM1_GTIN};2\n"
+        "2;Спонж;Нет;;1\n",
+        encoding="utf-8-sig",
+    )
+    slots = sets.read_spec(str(csv_path))
+    assert len(slots) == 2
+    assert slots[0].quantity_per_set == 2
+    assert slots[1].marked is False
+
+    cp1251_path = tmp_path / "spec_windows.csv"
+    cp1251_path.write_text(
+        f"Наименование;GTIN\nКрем;{ITEM1_GTIN}\n", encoding="cp1251"
+    )
+    assert sets.read_spec(str(cp1251_path))[0].name == "Крем"
+
+    from openpyxl import Workbook
+
+    xlsx_path = tmp_path / "spec.xlsx"
+    book = Workbook()
+    book.active.append(["Наименование", "GTIN", "Количество"])
+    book.active.append(["Крем", ITEM1_GTIN, 1])
+    book.save(xlsx_path)
+    assert sets.read_spec(str(xlsx_path))[0].gtin == ITEM1_GTIN
+
+
 # --- отправка в True API -----------------------------------------------------------
 
 @pytest.fixture
@@ -574,6 +709,111 @@ def _settle(application) -> None:
         application.processEvents()
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_экспортированный_json_открывается_в_формировании_наборов(
+    application, world, tmp_path, monkeypatch, batch
+):
+    from PySide6.QtWidgets import QFileDialog
+
+    tab, state, draft_path = world
+    tab.group_box.setCurrentIndex(tab.group_box.findData("perfumery"))
+    tab.inn_edit.setText(SUPPLIER_INN)
+    # Окончание серийного номера похоже на короткий криптохвост.
+    first_item = f"01{ITEM1_GTIN}21ITEM93ABCD{GS}91EE11{GS}92ZXhhbXBsZQ=="
+    if batch:
+        tab.load_set_codes(f"{SET_RAW}\n01{SET_GTIN}21SET002")
+        tab.slots = [
+            SetSpecSlot(1, "Второй товар", gtin=ITEM2_GTIN, product_group="perfumery"),
+            SetSpecSlot(2, "Первый товар", gtin=ITEM1_GTIN, product_group="perfumery"),
+        ]
+        tab.add_many(f"{first_item}\n{ITEM2_RAW}\n01{ITEM1_GTIN}21ITM003\n01{ITEM2_GTIN}21ITM004")
+    else:
+        tab.set_set_code(SET_RAW)
+        tab.add_many(f"{first_item}\n{ITEM2_RAW}")
+    _settle(application)
+    path = tmp_path / "sets.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(path), ""))
+    tab.file_save_button.click()
+    exported = json.loads(path.read_text("utf-8"))
+    assert exported["participantId"] == SUPPLIER_INN
+    assert f"01{ITEM1_GTIN}21ITEM93ABCD" in exported["aggregationUnits"][0]["sntins"]
+
+    # Загрузка через кнопку в пустой черновик с сохранённой товарной группой.
+    tab.clear()
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+    tab.file_load_button.click()
+    _settle(application)
+
+    assert json.loads(tab.document().render()) == exported
+    assert tab.batch_mode == batch
+    assert tab.table.rowCount() == (4 if batch else 2)
+    assert tab.group == "perfumery"
+    assert state["sent"] == []
+
+    saved = sets.load_draft(draft_path)
+    assert saved.inn == SUPPLIER_INN
+    assert saved.item_codes == tab.codes
+    reopened = type(tab)(tab.settings, inn=lambda: OUR_INN, draft_path=draft_path)
+    reopened.prefill_inn()
+    _settle(application)
+    assert reopened.group == "perfumery"
+    assert json.loads(reopened.document().render()) == exported
+
+
+def test_загрузка_json_сохраняет_черновик_при_ошибке_отмене_и_ожидании_статуса(
+    application, world, tmp_path
+):
+    tab, state, draft_path = world
+    tab.set_set_code(SET_RAW)
+    tab.add_code(ITEM1_RAW)
+    _settle(application)
+    path = tmp_path / "sets.json"
+    path.write_text("{", encoding="utf-8")
+    original = Path(draft_path).read_bytes()
+
+    tab.load_document_file(str(path))
+    _settle(application)
+    assert "Не удалось загрузить JSON" in state["told"][-1][0]
+    assert tab.codes == [ITEM1_RAW]
+    assert Path(draft_path).read_bytes() == original
+
+    path.write_text(_doc().render(), encoding="utf-8-sig")
+    state["yes"] = False
+    tab.load_document_file(str(path))
+    _settle(application)
+    assert tab.codes == [ITEM1_RAW]
+    assert Path(draft_path).read_bytes() == original
+
+    state["yes"] = True
+    tab.load_document_file(str(path))
+    _settle(application)
+    assert tab.codes == [ITEM1_KI, ITEM2_KI]
+
+    tab._doc_id = "ожидающий-документ"
+    tab._sync()
+    assert not tab.file_load_button.isEnabled()
+    tab.load_document_file(str(path))
+    assert tab._doc_id == "ожидающий-документ"
+    assert state["sent"] == []
+
+
+def test_загрузка_json_отклоняет_дубли_и_перераспределение_кодов(tmp_path):
+    path = tmp_path / "sets.json"
+    body = json.loads(_doc().render())
+    first = body["aggregationUnits"][0]
+    second = dict(first, unitSerialNumber=f"01{SET_GTIN}21SET002")
+    body["aggregationUnits"].append(second)
+    path.write_text(json.dumps(body), encoding="utf-8")
+    with pytest.raises(ValueError, match="включён в другой набор"):
+        sets.read_document(str(path), "cosmetics")
+
+    first["sntins"] = [ITEM1_KI]
+    second["sntins"] = [ITEM2_KI]
+    path.write_text(json.dumps(body), encoding="utf-8")
+    with pytest.raises(ValueError, match="распределения вложений"):
+        sets.read_document(str(path), "cosmetics")
+
+
 def test_сканирование_кин_и_вложений_заполняет_таблицу_и_сводку(world):
     tab, _, _ = world
 
@@ -607,6 +847,8 @@ def test_сканирование_кин_в_поле_вложений_или_д�
 def test_проверка_кодов_в_чз_отображает_статусы_и_блокирует_отправку_при_ошибке(
     application, world
 ):
+    from app.ui.widgets.sets_tab import _SetCheckDialog
+
     tab, state, _ = world
     tab.set_set_code(SET_RAW)
     tab.add_code(ITEM1_RAW)
@@ -616,14 +858,117 @@ def test_проверка_кодов_в_чз_отображает_статусы
         _checked_item(ITEM1_KI, ITEM1_GTIN, state=CodeState.INTRODUCED),
     ]
 
-    tab.check_codes_in_gis()
+    previous_hint = tab.hint.text()
+    tab.check_button.click()
+    dialog = tab.findChild(_SetCheckDialog)
     _settle(application)
 
     assert not tab._verification.ok
-    assert "отчёт о нанесении" in tab.hint.text()
+    assert "отчёт о нанесении" in dialog.details.toPlainText()
+    assert tab.hint.text() == previous_hint
+    assert not state["told"]
+    dialog.close_button.click()
     tab.create_document()
     assert state["sent"] == []
     assert "отчёт о нанесении" in state["told"][-1][0]
+
+
+@pytest.mark.parametrize("network_error", [False, True])
+def test_окно_проверки_кодов_показывает_ожидание_и_итог(
+    application, world, monkeypatch, network_error
+):
+    from app.ui.widgets import sets_tab as module
+
+    tab, state, _ = world
+    tab.set_set_code(SET_RAW)
+    tab.add_code(ITEM1_RAW)
+    state["checked"] = [_checked_set(), _checked_item(ITEM1_KI, ITEM1_GTIN)]
+    if network_error:
+        def fail(*_args):
+            raise OSError("Сервис временно недоступен")
+
+        monkeypatch.setattr(module, "_check_codes", fail)
+
+    tab.check_button.click()
+    dialog = tab.findChild(module._SetCheckDialog)
+    assert dialog.isVisible()
+    assert dialog.progress.isVisible()
+    assert dialog.progress.minimum() == dialog.progress.maximum() == 0
+    assert not dialog.close_button.isEnabled()
+    assert not tab.check_button.isEnabled()
+    dialog.reject()
+    assert not dialog.close()
+    assert dialog.isVisible()
+
+    _settle(application)
+    assert dialog.isVisible()
+    assert not dialog.progress.isVisible()
+    assert dialog.close_button.isEnabled()
+    assert tab.check_button.isEnabled()
+    if network_error:
+        assert dialog.summary.text() == "Не удалось проверить коды в ЧЗ"
+        assert dialog.details.toPlainText() == "Сервис временно недоступен"
+    else:
+        assert dialog.summary.text() == "Коды прошли проверку ЧЗ"
+        assert tab._verification.ok
+    assert not state["told"]
+
+    dialog.close_button.click()
+    assert not dialog.isVisible()
+
+
+def test_изъятие_из_окна_проверки_отправляет_только_выбранный_код(
+    application, world, monkeypatch
+):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QDialog, QListWidget, QPushButton
+    from app.ui.widgets import sets_tab as module
+
+    tab, state, _ = world
+    package = "TEST-BOX-1"
+    tab.set_set_code(SET_RAW)
+    tab.add_many(f"{ITEM1_RAW}\n{ITEM2_RAW}")
+    state["checked"] = [
+        _checked_set(),
+        _checked_item(ITEM1_KI, ITEM1_GTIN),
+        _checked_item(ITEM2_KI, ITEM2_GTIN),
+    ]
+    for item in state["checked"][1:]:
+        item.raw = {"cisInfo": {"parent": package}}
+    submitted = []
+
+    def send(parent, codes, inn, thumbprint, contour):
+        submitted.append((parent, codes, inn, contour))
+        return Operation(status=OperationStatus.DONE, document_id="test-removal")
+
+    monkeypatch.setattr(module.reaggregation, "send", send)
+    monkeypatch.setattr(module.QInputDialog, "getItem", lambda *_: (package, True))
+    tab.check_button.click()
+    _settle(application)
+    dialog = tab.findChild(module._SetCheckDialog)
+    assert dialog.remove_button.isVisible()
+    assert not submitted
+
+    def choose():
+        picker = application.activeModalWidget()
+        assert isinstance(picker, QDialog)
+        items = picker.findChild(QListWidget)
+        button = next(
+            button for button in picker.findChildren(QPushButton)
+            if button.text() == "Подписать и отправить"
+        )
+        assert not button.isEnabled()
+        items.item(1).setSelected(True)
+        button.click()
+
+    QTimer.singleShot(0, choose)
+    dialog.remove_button.click()
+    _settle(application)
+    assert submitted == [(package, (ITEM2_KI,), OUR_INN, Contour.SANDBOX)]
+    assert tab.codes == [ITEM1_RAW, ITEM2_RAW]
+    assert "test-removal" in dialog.details.toPlainText()
+    assert "Повторите проверку" in dialog.details.toPlainText()
+    dialog.close_button.click()
 
 
 def test_успешное_формирование_набора_записывает_операцию_и_очищает_черновик(
@@ -651,6 +996,59 @@ def test_успешное_формирование_набора_записыва
     assert op.codes == [SET_KI, ITEM1_KI, ITEM2_KI]
     assert tab.codes == [] and tab.set_code == ""
     assert not os.path.exists(draft_file)
+
+
+def test_вкладка_формирует_подпартию_и_сохраняет_остаток_после_checked_ok(
+    application, world, tmp_path
+):
+    tab, state, draft_file = world
+    second_set = f"01{SET_GTIN}21SET002"
+    third_set = f"01{SET_GTIN}21SET003"
+    item_a = f"01{ITEM1_GTIN}21CREAM001"
+    item_b = f"01{ITEM1_GTIN}21CREAM002"
+    item_c = f"01{ITEM1_GTIN}21CREAM003"
+    scent_a = f"01{ITEM2_GTIN}21SCENT001"
+    scent_b = f"01{ITEM2_GTIN}21SCENT002"
+    spec_path = tmp_path / "spec.csv"
+    spec_path.write_text(
+        "Наименование;GTIN;Количество;Товарная группа\n"
+        f"Крем;{ITEM1_GTIN};1;cosmetics\n"
+        f"Шампунь;{ITEM2_GTIN};1;cosmetics\n",
+        encoding="utf-8",
+    )
+
+    assert tab.load_set_codes("\n".join([SET_RAW, second_set, third_set])) == 3
+    tab.add_many("\n".join([item_a, item_b, item_c, scent_a, scent_b]))
+    tab.load_spec_file(str(spec_path))
+    _settle(application)
+    assert "полных наборов доступно: 2 из 3" in tab.spec_label.text()
+    assert "на 3 наборов" in tab.spec_table.item(0, 3).text()
+    tab.limit_box.setValue(1)
+    assert len(tab.document().units) == 1
+    assert tab.document().units[0].item_codes == (item_a, scent_a)
+
+    assert not tab.send_button.isEnabled()
+    state["checked"] = [
+        _checked_set(),
+        _checked_item(sets.key_of(item_a), ITEM1_GTIN),
+        _checked_item(sets.key_of(scent_a), ITEM2_GTIN),
+    ]
+    tab.check_codes_in_gis()
+    _settle(application)
+    assert tab.send_button.isEnabled()
+
+    state["answer"] = introduce.Sent(
+        "док-подпартия", introduce.DocStatus(code="CHECKED_OK")
+    )
+    tab.create_document()
+    _settle(application)
+
+    assert len(state["sent"]) == 1
+    assert tab.set_codes_pool == [second_set, third_set]
+    assert tab.codes == [item_b, item_c, scent_b]
+    assert sets.load_draft(draft_file).slots[0].gtin == ITEM1_GTIN
+    assert sets.load_draft(draft_file).limit_sets == 1
+    assert tab.document().units[0].item_codes == (item_b, scent_b)
 
 
 def test_незавершённый_документ_сохраняется_в_черновике_и_опрашивается_без_повтора(
@@ -705,6 +1103,112 @@ def test_незавершённый_документ_сохраняется_в_�
     [updated_op] = service.history()
     assert updated_op.status is OperationStatus.DONE
     assert reopened.codes == [] and reopened.set_code == ""
+
+
+def test_подпартия_после_перезапуска_списывает_только_отправленные_коды(
+    application, world, tmp_path, monkeypatch
+):
+    from app.core.settings import AppSettings
+    from app.ui.widgets import sets_tab as module
+
+    tab, state, draft_file = world
+    second_set = f"01{SET_GTIN}21SET002"
+    second_item = f"01{ITEM1_GTIN}21ITM003"
+    spec_path = tmp_path / "spec.csv"
+    spec_path.write_text(
+        f"Наименование,GTIN\nКрем,{ITEM1_GTIN}\n", encoding="utf-8"
+    )
+    tab.load_set_codes(f"{SET_RAW}\n{second_set}")
+    tab.add_many(f"{ITEM1_RAW}\n{second_item}")
+    tab.load_spec_file(str(spec_path))
+    _settle(application)
+    tab.limit_box.setValue(1)
+    state["checked"] = [_checked_set(), _checked_item(ITEM1_KI, ITEM1_GTIN)]
+    tab.check_codes_in_gis()
+    _settle(application)
+    state["answer"] = introduce.Sent(
+        "док-подпартия", introduce.DocStatus(code="IN_PROGRESS")
+    )
+    tab.create_document()
+    _settle(application)
+
+    reopened = module.SetsTab(
+        AppSettings(_path=tmp_path / "settings.json"),
+        contour=lambda: Contour.SANDBOX,
+        thumbprint=lambda: "ААББ",
+        inn=lambda: OUR_INN,
+        draft_path=draft_file,
+    )
+    assert reopened._doc_id == "док-подпартия"
+    assert reopened.limit_box.value() == 1
+    monkeypatch.setattr(
+        module.introduce,
+        "status",
+        lambda doc_id, pg, contour: introduce.DocStatus(code="CHECKED_OK"),
+    )
+    reopened.poll_document_status()
+    _settle(application)
+
+    assert len(state["sent"]) == 1
+    assert reopened.set_code == second_set
+    assert reopened.codes == [second_item]
+    assert sets.load_draft(draft_file).doc_id == ""
+
+
+def test_вкладка_блокирует_подпартию_при_чужом_gtin_или_отсутствии_группы_кин(
+    application, world, tmp_path
+):
+    tab, _, _ = world
+    spec_path = tmp_path / "spec.csv"
+    spec_path.write_text(
+        "Наименование;GTIN;Товарная группа\n"
+        f"Крем;{ITEM1_GTIN};cosmetics\n",
+        encoding="utf-8",
+    )
+    tab.set_set_code(SET_RAW)
+    tab.add_many(f"{ITEM1_RAW}\n{ITEM2_RAW}")
+    tab.load_spec_file(str(spec_path))
+    _settle(application)
+    assert "не входит в спецификацию" in tab.spec_label.text()
+    assert not tab.send_button.isEnabled()
+    tab.remove_outside_spec()
+    assert tab.codes == [ITEM1_RAW]
+
+    spec_path.write_text(
+        "Наименование;GTIN;Товарная группа\n"
+        f"Крем;{ITEM1_GTIN};perfumery\n",
+        encoding="utf-8",
+    )
+    tab.load_spec_file(str(spec_path))
+    _settle(application)
+    assert "нет вложения из товарной группы КИН" in tab.document().problems[0]
+    assert not tab.send_button.isEnabled()
+
+
+def test_вкладка_разрешает_проверенный_мультитоварный_набор(application, world, tmp_path):
+    tab, state, _ = world
+    spec_path = tmp_path / "mixed.csv"
+    spec_path.write_text(
+        "Наименование;GTIN;Товарная группа\n"
+        f"Крем;{ITEM1_GTIN};cosmetics\n"
+        f"Духи;{ITEM2_GTIN};perfumery\n",
+        encoding="utf-8",
+    )
+    tab.set_set_code(SET_RAW)
+    tab.add_many(f"{ITEM1_RAW}\n{ITEM2_RAW}")
+    tab.load_spec_file(str(spec_path))
+    _settle(application)
+    assert tab.document().problems == []
+    state["checked"] = [
+        _checked_set(),
+        _checked_item(ITEM1_KI, ITEM1_GTIN),
+        _checked_item(ITEM2_KI, ITEM2_GTIN, product_group="perfumery", owner_inn=OUR_INN),
+    ]
+    tab.check_codes_in_gis()
+    _settle(application)
+    assert tab._verification.ok
+    assert tab.send_button.isEnabled()
+    assert "Духи и туалетная вода" in tab.table.item(1, 6).text()
 
 
 def test_сбой_после_создания_документа_сохраняет_id_и_запрещает_повтор(

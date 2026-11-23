@@ -835,6 +835,7 @@ class MarkingPage(QWidget):
             ["Товар", "Код", "Состояние", "Владелец", "РД", "Замечания"])
         self.result.verticalHeader().setVisible(False)
         self.result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.result.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.result.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result.setAlternatingRowColors(True)
         self.result.cellDoubleClicked.connect(self._on_result_activated)
@@ -850,8 +851,18 @@ class MarkingPage(QWidget):
         self.result.setColumnWidth(5, 240)
         body.addWidget(self.result, 1)
 
+        footer = QHBoxLayout()
         self.result_hint = Hint(_RESULT_INTRO, card)
-        body.addWidget(self.result_hint)
+        footer.addWidget(self.result_hint, 1)
+        self.result_print = self._action(card, "Печать этикеток…", "run",
+                                         self.print_selected_codes)
+        self.result_print.setToolTip(
+            "Выберите строки через Ctrl+щелчок или Shift+щелчок, "
+            "затем откройте печать этикеток")
+        self.result_print.setEnabled(False)
+        self.result.itemSelectionChanged.connect(self._sync_result_print)
+        footer.addWidget(self.result_print, 0, Qt.AlignmentFlag.AlignVCenter)
+        body.addLayout(footer)
         return card
 
     def _journal_card(self) -> Card:
@@ -2792,19 +2803,69 @@ class MarkingPage(QWidget):
         из СУЗ. В кодах из УПД хвоста не бывает вовсе.
         """
         wanted = codes_module.parse(info.code).identity
-        if not all(wanted):
-            return ""
+        return self._full_codes({wanted}).get(wanted, "")
+
+    def _full_codes(self, identities: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """Ищет полные коды по GTIN и серийному номеру одним проходом по источникам."""
+        wanted = {identity for identity in identities if all(identity)}
+        found: dict[tuple[str, str], str] = {}
+        if not wanted:
+            return found
         for code in self._batch.codes:
-            if code.identity == wanted and code.full:
-                return code.full
+            if code.identity in wanted and (full := code.full):
+                found[code.identity] = full
+                wanted.remove(code.identity)
+                if not wanted:
+                    return found
+        gtins = {gtin for gtin, _ in wanted}
         for batch in self._batches:
-            if batch.gtin != wanted[0]:
+            if batch.gtin not in gtins:
                 continue
             for raw in batch.codes:
                 code = codes_module.parse(raw)
-                if code.identity == wanted and code.full:
-                    return code.full
-        return ""
+                if code.identity in wanted and (full := code.full):
+                    found[code.identity] = full
+                    wanted.remove(code.identity)
+                    if not wanted:
+                        return found
+        return found
+
+    def _sync_result_print(self) -> None:
+        count = len(self.result.selectionModel().selectedRows())
+        self.result_print.setEnabled(bool(count) and not self._busy)
+        self.result_print.setText(f"Печать этикеток ({count})…" if count else "Печать этикеток…")
+
+    def print_selected_codes(self) -> None:
+        if self._busy:
+            return
+        rows = sorted(index.row() for index in self.result.selectionModel().selectedRows())
+        selected: dict[tuple[str, str], str] = {}
+        for row in rows:
+            info = self._shown[row]
+            identity = codes_module.parse(info.code).identity
+            selected.setdefault(identity, info.product_name or identity[0])
+        if not selected:
+            return
+        full = self._full_codes(set(selected))
+        if not full:
+            self.notify(
+                "У выбранных кодов нет криптохвоста. Отсканируйте полные коды с этикеток.",
+                ToastKind.WARNING)
+            return
+        if missing := len(selected) - len(full):
+            answer = QMessageBox.question(
+                self, "Печать выбранных этикеток",
+                f"Кодов без криптохвоста: {missing}. Открыть печать для остальных ({len(full)})?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        codes = [full[identity] for identity in selected if identity in full]
+        names = [name for identity, name in selected.items() if identity in full]
+        batch = issue_module.Batch(
+            created=datetime.now().isoformat(timespec="seconds"),
+            name="Выбранные коды", codes=codes)
+        PrintDialog(batch, self, names=names).exec()
 
     def _print_code(self, info: CodeInfo, full: str) -> None:
         """Печать этикетки с этим кодом, например взамен порванной.
@@ -2905,6 +2966,7 @@ class MarkingPage(QWidget):
             self.result.resizeColumnToContents(column)
             head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.result.setUpdatesEnabled(True)
+        self._sync_result_print()
         if not self._result:
             self.result_hint.setText(_RESULT_INTRO)
             return
@@ -3547,6 +3609,7 @@ class MarkingPage(QWidget):
         self.contour_box.setEnabled(not busy)
         self.check_button.setEnabled(
             signed and bool(self._batch.valid) and not self._busy)
+        self._sync_result_print()
         # Проверка связи с СУЗ входа по сертификату не требует: это другая
         # система и другой способ представиться.
         self.suz_check_button.setEnabled(not self._busy)

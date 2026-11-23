@@ -1108,6 +1108,90 @@ def test_код_без_криптохвоста_не_печатается(applic
     assert seen == [False] and printed == []
 
 
+def test_печать_выбранных_строк_сохраняет_порядок_и_названия(
+    application, tmp_path, stub, monkeypatch
+):
+    from PySide6.QtCore import QItemSelectionModel
+    from app.core.marking import issue
+    from app.core.marking.codes import parse
+    from app.ui import marking_page
+
+    page = _page(application, tmp_path)
+    archive_code = f"010461060025006221SetAb8{GS}91EE11{GS}92sample=="
+    archive = issue.Batch(id="source", gtin=parse(archive_code).gtin, codes=[archive_code])
+    page._batches = [archive]
+    page.codes_edit.setPlainText(PERFUME)
+    page._reparse()
+    page._show_result([
+        _info(KI, product_name="Парфюм"),
+        _info(parse(OTHER).ki),
+        _info(parse(archive_code).ki, product_name="Набор"),
+    ])
+
+    opened = []
+
+    class Spy:
+        def __init__(self, batch, parent, *, names):
+            opened.append((batch, names))
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(marking_page, "PrintDialog", Spy)
+    assert not page.result_print.isEnabled()
+    select_rows = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    for row in (2, 0):
+        page.result.selectionModel().select(page.result.model().index(row, 0), select_rows)
+    assert page.result_print.isEnabled()
+    assert "(2)" in page.result_print.text()
+    page.result_print.click()
+
+    (batch, names), = opened
+    assert batch.codes == [PERFUME, archive_code]
+    assert names == ["Парфюм", "Набор"]
+    assert batch.id == "" and archive.printed_count == 0
+    page.problems_box.setChecked(True)
+    assert not page.result_print.isEnabled()
+
+
+def test_печать_выбранных_кодов_спрашивает_о_неполных_кодах(
+    application, tmp_path, stub, monkeypatch
+):
+    from app.core.marking.codes import parse
+    from app.ui import marking_page
+
+    page = _page(application, tmp_path)
+    page._batches = []
+    page.codes_edit.setPlainText(PERFUME)
+    page._reparse()
+    page._show_result([_info(KI), _info(parse(OTHER).ki)])
+    page.result.selectAll()
+    answers = iter([marking_page.QMessageBox.StandardButton.No,
+                    marking_page.QMessageBox.StandardButton.Yes])
+    prompts = []
+
+    def question(_parent, _title, message, _buttons, _default):
+        prompts.append(message)
+        return next(answers)
+
+    printed = []
+
+    class Spy:
+        def __init__(self, batch, _parent, *, names):
+            self.batch = batch
+
+        def exec(self):
+            printed.extend(self.batch.codes)
+
+    monkeypatch.setattr(marking_page.QMessageBox, "question", question)
+    monkeypatch.setattr(marking_page, "PrintDialog", Spy)
+    page.result_print.click()
+    assert not printed
+    page.result_print.click()
+    assert printed == [PERFUME]
+    assert len(prompts) == 2 and "Кодов без криптохвоста: 1" in prompts[0]
+
+
 def test_криптохвост_берётся_из_блока_суз(application, tmp_path, stub):
     from app.core.marking import issue
 

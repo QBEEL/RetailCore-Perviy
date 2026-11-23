@@ -28,13 +28,18 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QStyledItemDelegate,
@@ -45,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.marking import codes as codes_module, introduce, pdf_codes, service, sets
+from ...core.marking import reaggregation
 from ...core.marking.models import (
     CodeInfo,
     Contour,
@@ -88,6 +94,71 @@ class _NameEditor(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+class _SetCheckDialog(QDialog):
+    """Ход проверки кодов набора и итог в одном окне."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("Проверка кодов в ЧЗ")
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.setMinimumWidth(490)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(Metrics.PAD, Metrics.PAD, Metrics.PAD, Metrics.PAD)
+        layout.setSpacing(Metrics.GAP)
+        self.summary = SectionTitle("Проверяем статусы КИН и вложений…", self)
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.progress = QProgressBar(self)
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+        self.details = QPlainTextEdit(self)
+        self.details.setReadOnly(True)
+        self.details.hide()
+        layout.addWidget(self.details, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.remove_button = QPushButton("Изъять коды…", self)
+        self.remove_button.hide()
+        buttons.addWidget(self.remove_button)
+        self.close_button = QPushButton("Закрыть", self)
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.accept)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+    def show_waiting(self, text: str) -> None:
+        self.summary.setText(text)
+        self.summary.setStyleSheet("")
+        self.progress.show()
+        self.details.hide()
+        self.remove_button.hide()
+        self.close_button.setEnabled(False)
+
+    def show_result(self, summary: str, details: tuple[str, ...], colour: str) -> None:
+        self.progress.hide()
+        self.summary.setText(summary)
+        self.summary.setStyleSheet(f"color: {colour};")
+        self.details.setPlainText("\n".join(details))
+        self.details.setVisible(bool(details))
+        self.close_button.setEnabled(True)
+        self.close_button.setFocus()
+        self.adjustSize()
+
+    def reject(self) -> None:
+        if self.close_button.isEnabled():
+            super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self.close_button.isEnabled():
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
 class SetsTab(QWidget):
     """Формирование наборов (`AGGREGATION_DOCUMENT`)."""
 
@@ -118,6 +189,7 @@ class SetsTab(QWidget):
         self._restoring = False
         self._finding = False
         self._busy = False
+        self._check_dialog: _SetCheckDialog | None = None
 
         self.set_code: str = ""
         self.set_codes_pool: list[str] = []
@@ -488,6 +560,10 @@ class SetsTab(QWidget):
         self.poll_button = self._button(
             card, "Статус документа", "refresh", self.poll_document_status
         )
+        self.file_load_button = self._button(
+            card, "Загрузить JSON…", "open", self.load_document_file
+        )
+        self.file_load_button.setToolTip("Восстановить ИНН, КИН и вложения из сохранённого JSON")
         self.file_save_button = self._button(
             card, "Сохранить JSON…", "save", self.save_file
         )
@@ -498,6 +574,7 @@ class SetsTab(QWidget):
         for button in (
             self.check_button,
             self.poll_button,
+            self.file_load_button,
             self.file_save_button,
             self.send_button,
         ):
@@ -674,7 +751,7 @@ class SetsTab(QWidget):
         selected_idx = 0
         if has_pool:
             self.set_pool_box.addItem(
-                f"Все КИН из CSV — партия ({len(self.set_codes_pool)} наборов)",
+                f"Все КИН — партия ({len(self.set_codes_pool)} наборов)",
                 "__ALL__",
             )
         for idx, code in enumerate(self.set_codes_pool):
@@ -1046,6 +1123,12 @@ class SetsTab(QWidget):
                 ToastKind.WARNING,
             )
             return
+        self._reset_content()
+        sets.clear_draft(self._draft_path)
+        self._sync()
+        self.focus_scan()
+
+    def _reset_content(self) -> None:
         self.set_code = ""
         self.set_codes_pool.clear()
         self._use_all_pool = True
@@ -1068,9 +1151,6 @@ class SetsTab(QWidget):
         self.verdict_label.setText("")
         self.verdict_label.setStyleSheet("")
         self.verdict_label.hide()
-        sets.clear_draft(self._draft_path)
-        self._sync()
-        self.focus_scan()
 
     def _renumber(self) -> None:
         for row in range(self.table.rowCount()):
@@ -1235,31 +1315,39 @@ class SetsTab(QWidget):
 
     def check_codes_in_gis(self) -> None:
         """Запрашивает в ГИС МТ свежие статусы КИН и всех КИ вложений."""
+        if self._busy:
+            return
+        dialog = _SetCheckDialog(self)
+        dialog.open()
         units, batch_problems = self.units_and_problems()
         if batch_problems and not self.slots:
-            self._tell(f"Проверка не запущена: {batch_problems[0]}", ToastKind.WARNING)
+            dialog.show_result("Проверка не запущена", (batch_problems[0],), Palette.WARNING)
             return
         for idx, unit in enumerate(units, start=1):
             if problems := unit.problems:
                 prefix = f"набор №{idx}: " if len(units) > 1 else ""
-                self._tell(f"Проверка не запущена: {prefix}{problems[0]}", ToastKind.WARNING)
+                dialog.show_result("Проверка не запущена", (prefix + problems[0],), Palette.WARNING)
                 return
         if not service.signed_in():
-            self._tell(
-                "Для проверки кодов войдите по сертификату на вкладке «Проверка кодов»",
-                ToastKind.WARNING,
+            dialog.show_result(
+                "Требуется вход в ЧЗ",
+                ("Войдите по сертификату на вкладке «Проверка кодов»",),
+                Palette.WARNING,
             )
             return
         contour = self._contour()
         if service.current().contour != contour:
-            self._tell("Вход выполнен в другом контуре — войдите заново", ToastKind.WARNING)
+            dialog.show_result(
+                "Проверка не запущена",
+                ("Вход выполнен в другом контуре. Войдите заново.",),
+                Palette.WARNING,
+            )
             return
 
         all_codes = [*self.active_set_codes, *self.codes]
+        self._check_dialog = dialog
         self._busy = True
         self._sync()
-        self.hint.setStyleSheet("")
-        self.hint.setText("Проверяем статусы КИН и вложений в «Честном ЗНАКе»…")
         run_task(
             _check_codes,
             all_codes,
@@ -1269,7 +1357,6 @@ class SetsTab(QWidget):
         )
 
     def _on_codes_checked(self, items: list[CodeInfo]) -> None:
-        self._busy = False
         for item in items:
             if item.code:
                 self._checks[item.code] = item
@@ -1289,33 +1376,111 @@ class SetsTab(QWidget):
             batch_problems=batch_problems,
         )
         self._refresh_table_statuses()
-        self._save_draft()
-        self._sync()
+        result = self._verification
+        details = result.problems + result.warnings + result.notes
+        try:
+            self._save_draft()
+        except OSError as error:
+            details += (f"Не удалось сохранить черновик: {error}",)
 
-        if self._verification.problems:
-            text = "Проверка выявила замечания: " + "; ".join(self._verification.problems[:5])
-            if len(self._verification.problems) > 5:
-                text += f" (и ещё {len(self._verification.problems) - 5})"
-            self.hint.setStyleSheet(f"color: {Palette.DANGER};")
-            self.hint.setText(text)
-            self._tell(self._verification.problems[0], ToastKind.WARNING)
-            return
-
-        notes = list(self._verification.warnings) + list(self._verification.notes)
-        summary = (
-            "Все коды набора и вложений прошли проверку ЧЗ."
-            + (" " + " ".join(notes) if notes else "")
-        )
-        self.hint.setStyleSheet(f"color: {Palette.SUCCESS};")
-        self.hint.setText(summary)
-        self._tell("Коды набора и вложений проверены в ЧЗ — ошибок нет", ToastKind.SUCCESS)
+        if result.ok:
+            self._finish_code_check("Коды прошли проверку ЧЗ", details, Palette.SUCCESS)
+        else:
+            wanted = {code for unit in units for code in unit.item_kis}
+            self._enable_removal(reaggregation.blocked_items(item for item in items if item.code in wanted))
+            self._finish_code_check("Проверка выявила замечания", details, Palette.DANGER)
 
     def _on_check_error(self, message: str) -> None:
+        self._finish_code_check("Не удалось проверить коды в ЧЗ", (message,), Palette.DANGER)
+
+    def _finish_code_check(self, summary: str, details: tuple[str, ...], colour: str) -> None:
         self._busy = False
         self._sync()
-        self.hint.setStyleSheet(f"color: {Palette.DANGER};")
-        self.hint.setText(f"Не удалось проверить коды в ЧЗ: {message}")
-        self._tell(f"Не удалось проверить коды: {message}", ToastKind.ERROR)
+        if self._check_dialog is not None:
+            self._check_dialog.show_result(summary, details, colour)
+            self._check_dialog = None
+
+    def _enable_removal(self, packages: dict[str, list[str]]) -> None:
+        dialog = self._check_dialog
+        if dialog is None or not packages:
+            return
+        dialog.remove_button.show()
+        dialog.remove_button.clicked.connect(lambda: self._select_removal(dialog, packages))
+
+    def _select_removal(self, dialog: _SetCheckDialog, packages: dict[str, list[str]]) -> None:
+        if self._busy or self._pending_submission():
+            return
+        contour = self._contour()
+        current = service.current()
+        inn = self.inn_edit.text().strip()
+        thumbprint = self._thumbprint()
+        if not service.signed_in() or current.contour is not contour or current.inn != inn or not thumbprint:
+            self._tell("Для изъятия войдите в ЧЗ под организацией черновика", ToastKind.WARNING)
+            return
+        package, accepted = QInputDialog.getItem(
+            dialog, "Изъять коды", "Выберите транспортную упаковку", list(packages), 0, False
+        )
+        if not accepted:
+            return
+
+        picker = QDialog(dialog)
+        picker.setWindowTitle("Изъять коды из упаковки")
+        picker.resize(520, 400)
+        layout = QVBoxLayout(picker)
+        layout.addWidget(QLabel(f"Упаковка {package} · {contour.title}", picker))
+        items = QListWidget(picker)
+        items.addItems(packages[package])
+        items.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(items, 1)
+        buttons = QHBoxLayout()
+        select_all = QPushButton("Выбрать все", picker)
+        select_all.clicked.connect(items.selectAll)
+        buttons.addWidget(select_all)
+        buttons.addStretch()
+        cancel = QPushButton("Отмена", picker)
+        cancel.setDefault(True)
+        cancel.clicked.connect(picker.reject)
+        buttons.addWidget(cancel)
+        submit = QPushButton("Подписать и отправить", picker)
+        submit.setAutoDefault(False)
+        submit.setEnabled(False)
+        submit.clicked.connect(picker.accept)
+        items.itemSelectionChanged.connect(lambda: submit.setEnabled(bool(items.selectedItems())))
+        buttons.addWidget(submit)
+        layout.addLayout(buttons)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = tuple(item.text() for item in items.selectedItems())
+        self._busy = True
+        self._check_dialog = dialog
+        self._sync()
+        dialog.show_waiting("Проверяем состав упаковки и отправляем изъятие в ЧЗ…")
+        run_task(
+            reaggregation.send, package, selected, inn, thumbprint, contour,
+            on_result=self._on_removal_sent, on_error=self._on_removal_error,
+        )
+
+    def _on_removal_sent(self, operation: Operation) -> None:
+        self.journal_changed.emit()
+        details = (f"Документ {operation.document_id}",) if operation.document_id else ()
+        if operation.error:
+            details += (operation.error,)
+        if operation.status is OperationStatus.DONE:
+            self._finish_code_check(
+                "ЧЗ подтвердил изъятие кодов",
+                details + ("Повторите проверку кодов набора.",), Palette.SUCCESS,
+            )
+        elif operation.status.pending:
+            self._finish_code_check(
+                "Результат изъятия пока неизвестен",
+                details + ("Проверьте документ в журнале или личном кабинете ЧЗ.",), Palette.WARNING,
+            )
+        else:
+            self._finish_code_check("ЧЗ не подтвердил изъятие кодов", details, Palette.DANGER)
+
+    def _on_removal_error(self, message: str) -> None:
+        self.journal_changed.emit()
+        self._finish_code_check("Изъятие кодов не завершено", (message,), Palette.DANGER)
 
     def _refresh_table_statuses(self) -> None:
         assigned = self._assigned_set_map()
@@ -1427,7 +1592,6 @@ class SetsTab(QWidget):
         try:
             if draft.inn:
                 self.inn_edit.setText(draft.inn)
-                self._filled_inn = draft.inn
             if draft.product_group:
                 self._resolved_group = draft.product_group
                 idx = self.group_box.findData(draft.product_group)
@@ -1469,7 +1633,90 @@ class SetsTab(QWidget):
         finally:
             self._restoring = False
 
-    # --- сохранение JSON и отправка в ЧЗ -------------------------------------------
+    # --- обмен JSON и отправка в ЧЗ ------------------------------------------------
+
+    def load_document_file(self, path: str = "") -> None:
+        """Загружает сохранённый документ как редактируемый черновик."""
+        if self._busy or self._pending_submission():
+            self._tell("Дождитесь завершения текущей операции с набором", ToastKind.WARNING)
+            return
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Загрузить документ формирования набора", "", "JSON (*.json)"
+            )
+        if not path:
+            return
+
+        self._busy = True
+        self.file_load_button.setText("Читаем JSON…")
+        self._sync()
+        run_task(
+            sets.read_document, path, self.group,
+            on_result=self._on_document_loaded,
+            on_error=self._on_document_load_error,
+        )
+
+    def _on_document_loaded(self, document: sets.SetDocument) -> None:
+        try:
+            if self._pending_submission():
+                self._tell("Сначала проверьте статус текущего документа в ЧЗ", ToastKind.WARNING)
+                return
+            if self.set_code or self.set_codes_pool or self.codes or self.slots:
+                confirm = QMessageBox(self)
+                confirm.setWindowTitle("Загрузка JSON")
+                confirm.setText("Заменить текущий черновик наборами из файла?")
+                replace = confirm.addButton("Заменить черновик", QMessageBox.ButtonRole.AcceptRole)
+                cancel = confirm.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+                confirm.setDefaultButton(cancel)
+                confirm.exec()
+                if confirm.clickedButton() is not replace:
+                    return
+
+            units = document.units
+            draft = sets.SetDraft(
+                inn=document.inn,
+                product_group=document.product_group,
+                set_code=units[0].set_code,
+                set_codes_pool=[unit.set_code for unit in units] if len(units) > 1 else [],
+                item_codes=[code for unit in units for code in unit.item_codes],
+                names=dict(self._names),
+            )
+            sets.save_draft(draft, self._draft_path)
+            self._restoring = True
+            try:
+                self._reset_content()
+                self.inn_edit.setText(draft.inn)
+                self._filled_inn = ""
+                self.capacity_box.setValue(draft.capacity)
+                self.set_code = draft.set_code
+                self.set_edit.setText(draft.set_code)
+                self.set_codes_pool = draft.set_codes_pool
+                self._sync_set_pool()
+                self.codes = draft.item_codes
+                self._keys = {sets.key_of(code) for code in self.codes}
+                for row, code in enumerate(self.codes):
+                    self._append_row(row, code)
+                self._refresh_table_statuses()
+            finally:
+                self._restoring = False
+            self.hint.setStyleSheet("")
+            self.hint.setText(
+                f"Из JSON загружено наборов: {len(units)}, вложений: {len(self.codes)}."
+            )
+            self._tell(self.hint.text(), ToastKind.SUCCESS)
+        except OSError as error:
+            self._tell(f"Не удалось сохранить загруженный черновик: {error}", ToastKind.ERROR)
+        finally:
+            self._finish_document_load()
+
+    def _on_document_load_error(self, message: str) -> None:
+        self._tell(f"Не удалось загрузить JSON: {message}", ToastKind.ERROR)
+        self._finish_document_load()
+
+    def _finish_document_load(self) -> None:
+        self._busy = False
+        self.file_load_button.setText("Загрузить JSON…")
+        self._sync()
 
     def save_file(self) -> None:
         """Сохраняет JSON `AGGREGATION_DOCUMENT` в файл без отправки в ГИС МТ."""
@@ -1983,7 +2230,7 @@ class SetsTab(QWidget):
             else:
                 self.set_status_label.setStyleSheet("")
                 self.set_status_label.setText(
-                    f"Партия из CSV: {n_sets} КИН (GTIN {parsed_set.gtin})"
+                    f"Партия: {n_sets} КИН (GTIN {parsed_set.gtin})"
                 )
         else:
             parsed_set = codes_module.parse(self.set_code)
@@ -2044,6 +2291,8 @@ class SetsTab(QWidget):
             self.composition_label.setText("Состав набора: " + "; ".join(parts))
 
     def _sync(self) -> None:
+        if self._restoring:
+            return
         self._sync_composition()
         self.tile_repeats.set_value(self._repeats)
         self.tile_broken.set_value(self._broken)
@@ -2116,6 +2365,7 @@ class SetsTab(QWidget):
         self.set_clear_button.setEnabled(has_set and not self._busy and not locked)
         self.check_button.setEnabled(ready and not self._busy and not locked)
         self.poll_button.setEnabled(has_pending_doc and not self._busy)
+        self.file_load_button.setEnabled(not self._busy and not locked)
         self.file_save_button.setEnabled(ready and can_build and not self._busy)
         verified = not self.slots or bool(self._verification and self._verification.ok)
         self.send_button.setEnabled(

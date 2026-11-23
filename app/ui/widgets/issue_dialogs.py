@@ -162,12 +162,16 @@ class PrintDialog(QDialog):
     _STAGE_HEIGHT = 330
     _SETTINGS_WIDTH = 350
 
-    def __init__(self, batch: issue.Batch, parent: QWidget | None = None) -> None:
+    def __init__(self, batch: issue.Batch, parent: QWidget | None = None, *,
+                 names: Sequence[str] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Печать этикеток")
         self.setModal(True)
         self.setMinimumWidth(840)
         self.batch = batch
+        if names is not None and len(names) != batch.total:
+            raise ValueError("Количество названий должно совпадать с количеством кодов")
+        self._names = list(names) if names is not None else None
         self._settings = labels.load()
         self._spec = self._settings.spec()
         # Сколько этикеток напечатано за время жизни окна — вызывающий
@@ -407,7 +411,8 @@ class PrintDialog(QDialog):
         у принтера, — а большую уменьшаем плавно: резать её по кратному зуму
         значило бы выпустить окно за край экрана.
         """
-        image = label_print.preview(spec, sample, self.batch.name or "Название товара")
+        name = (self._names[self.start.value() - 1] if self._names else self.batch.name)
+        image = label_print.preview(spec, sample, name or "Название товара")
         room_w = self._STAGE_WIDTH - 2 * Metrics.PAD - 4
         room_h = self._STAGE_HEIGHT - 2 * Metrics.PAD - 40
         factor = min(room_w / image.width(), room_h / image.height())
@@ -488,6 +493,7 @@ class PrintDialog(QDialog):
         try:
             done = label_print.print_codes(
                 selected, self.batch.name, self._spec_now(), target[0],
+                names=self._names[first:first + len(selected)] if self._names is not None else None,
                 pdf_path=target[1], progress=step)
         except label_print.PrintError as error:
             self._fail(str(error))

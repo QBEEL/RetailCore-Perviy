@@ -109,6 +109,7 @@ class OperationKind(str, Enum):
     WITHDRAWAL = "withdrawal"
     REMARK = "remark"
     AGGREGATION = "aggregation"
+    REAGGREGATION = "reaggregation"
 
     @property
     def title(self) -> str:
@@ -137,6 +138,7 @@ KIND_TITLES: dict[OperationKind, str] = {
     OperationKind.WITHDRAWAL: "Вывод из оборота",
     OperationKind.REMARK: "Перемаркировка",
     OperationKind.AGGREGATION: "Формирование набора",
+    OperationKind.REAGGREGATION: "Изъятие кодов из упаковки",
 }
 
 
@@ -405,6 +407,14 @@ class CodeInfo:
     package_type: str = ""
     emission_type: str = ""
     children: tuple[str, ...] = ()
+
+    @property
+    def parent_code(self) -> str:
+        """Код агрегата из свежего ответа ЧЗ."""
+        raw = self.raw if isinstance(self.raw, dict) else {}
+        inner = raw.get("cisInfo")
+        source = inner if isinstance(inner, dict) and "parent" in inner else raw
+        return str(source.get("parent") or "").strip()
 
     @property
     def ours(self) -> bool:

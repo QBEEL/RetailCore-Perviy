@@ -521,6 +521,64 @@ class SetDocument:
         return "JSON (*.json)"
 
 
+def read_document(path: str, product_group: str) -> SetDocument:
+    """Читает JSON формирования наборов и проверяет распределение вложений."""
+    try:
+        with open(path, encoding="utf-8-sig") as file:
+            data = json.load(file)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("файл должен содержать корректный JSON в UTF-8") from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("participantId"), str):
+        raise ValueError("в JSON документа отсутствует ИНН участника (participantId)")
+    entries = data.get("aggregationUnits")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("в JSON документа нет списка наборов (aggregationUnits)")
+
+    units: list[SetUnit] = []
+    for index, entry in enumerate(entries, start=1):
+        if (
+            not isinstance(entry, dict)
+            or entry.get("aggregationType") != AGGREGATION_TYPE
+            or entry.get("unitSerialNumberType") != UNIT_TYPE_SET
+        ):
+            raise ValueError(f"запись №{index} должна описывать формирование набора (PRODUCT_SET)")
+        kin = entry.get("unitSerialNumber")
+        items = entry.get("sntins")
+        if not isinstance(kin, str) or not isinstance(items, list) or not all(
+            isinstance(item, str) for item in items
+        ):
+            raise ValueError(f"набор №{index}: ожидаются КИН и список строк с кодами вложений")
+        units.append(SetUnit(_document_code(kin), tuple(_document_code(item) for item in items)))
+
+    document = SetDocument(data["participantId"].strip(), tuple(units), product_group)
+    if problems := document.problems:
+        raise ValueError(problems[0])
+
+    # Вкладка распределяет вложения по GTIN. Не загружаем файл, если при этом
+    # хотя бы один КИ переместится в другой набор или изменится порядок кодов.
+    rebuilt, problems = build_units(
+        [unit.set_code for unit in units],
+        [item for unit in units for item in unit.item_codes],
+    )
+    if problems or rebuilt != document.units:
+        raise ValueError("состав партии нельзя восстановить без изменения распределения вложений")
+    return document
+
+
+def _document_code(code: str) -> str:
+    parsed = codes_module.parse(code)
+    if parsed.valid and parsed.ki == code:
+        return code
+    # В экспортированном КИ серийный номер уже отделён от криптохвоста.
+    # Явная граница помогает, если конец серийного номера похож на хвост.
+    delimited = f"{code}<GS>"
+    parsed = codes_module.parse(delimited)
+    if code and parsed.valid and parsed.ki == code:
+        return delimited
+    raise ValueError("в документе есть некорректный КИН или КИ вложения")
+
+
 @dataclass(frozen=True, slots=True)
 class SetItemSummary:
     """Строка сводки состава набора по GTIN вложений."""
@@ -938,10 +996,9 @@ def _verify_item_code(
         if special not in ("", "EMPTY", "WAIT_TRANSFER_TO_OWNER"):
             problems.append(f"код вложения {ki} имеет особое состояние «{special}»")
             remarks.append(f"особое состояние {special}")
-        parent = str(raw_info.get("parent") or "").strip()
-        if parent:
-            problems.append(f"код вложения {ki} уже находится в упаковке {parent}")
-            remarks.append("уже вложен в упаковку")
+    if parent := info.parent_code:
+        problems.append(f"код вложения {ki} уже находится в упаковке {parent}")
+        remarks.append("уже вложен в упаковку")
 
     if not info.product_group:
         problems.append(f"товарная группа кода вложения {ki} не получена от ЧЗ")

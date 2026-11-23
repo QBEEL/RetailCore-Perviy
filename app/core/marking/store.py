@@ -85,6 +85,19 @@ def create(operation: Operation, path: str | None = None) -> Operation:
     operation.created_at = operation.created_at or datetime.now()
     operation.author = operation.author or _author()
     with connect(path) as connection:
+        if operation.kind is OperationKind.REAGGREGATION:
+            # Один незавершённый документ на упаковку в каждом контуре,
+            # даже если во втором окне выбрали другой список вложений.
+            connection.execute("BEGIN IMMEDIATE")
+            pending_id = connection.execute(
+                "SELECT document_id FROM operation WHERE kind = ? AND contour = ?"
+                " AND reason = ? AND status IN ('sending', 'sent') LIMIT 1",
+                (operation.kind.value, operation.contour.value, operation.reason),
+            ).fetchone()
+            if pending_id is not None:
+                doc_id = pending_id["document_id"]
+                detail = f" (документ {doc_id})" if doc_id else " (номер пока неизвестен)"
+                raise ValueError(f"По упаковке уже есть незавершённое изъятие{detail}")
         cursor = connection.execute(
             "INSERT INTO operation (local_id, kind, product_group, contour, status,"
             "                       document_id, codes, codes_hash, reason, comment,"

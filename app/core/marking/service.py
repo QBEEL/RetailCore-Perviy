@@ -411,6 +411,15 @@ def _prepare(raw_codes: Iterable[str]) -> list[str]:
     return prepared
 
 
+def check_exact(codes: Sequence[str], contour: Contour) -> list[CodeInfo]:
+    """Запрашивает идентификаторы из ответа ЧЗ без разбора и сокращения КИТУ."""
+    return [
+        item
+        for start in range(0, len(codes), BATCH_SIZE)
+        for item in _ask(codes[start:start + BATCH_SIZE], contour)
+    ]
+
+
 def _ask(batch: Sequence[str], contour: Contour) -> list[CodeInfo]:
     """Один запрос сведений. Пачка не длиннее тысячи кодов."""
     answer = session.authorized(
@@ -621,6 +630,7 @@ def can_refresh(operation: Operation) -> bool:
                 OperationKind.WITHDRAWAL,
                 OperationKind.REMARK,
                 OperationKind.AGGREGATION,
+                OperationKind.REAGGREGATION,
             )
             and bool(operation.document_id.strip() and operation.product_group.strip()))
 
