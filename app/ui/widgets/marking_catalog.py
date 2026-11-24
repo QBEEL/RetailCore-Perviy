@@ -91,7 +91,7 @@ class MissingAttributesDialog(QDialog):
             type_input = None
             if field.get("attr_value_type") or value_type:
                 type_input = self._input(field.get("attr_value_type"), value_type, editable=False)
-                type_input.setMinimumWidth(124)
+                type_input.setMinimumWidth(160)
                 type_input.setMaximumWidth(220)
                 type_input.setAccessibleName("Единица измерения или тип значения")
                 if isinstance(type_input, QComboBox):
