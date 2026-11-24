@@ -36,6 +36,7 @@ from .widgets.common import Card, Hint, MetricTile, SectionTitle, Subtitle, Titl
 from .widgets.file_picker import FilePicker
 from .widgets.inputs import SelectBox
 from .widgets.label_template_dialog import DiscountDialog, TemplateDialog, preview_zoom
+from .widgets.pdf_label_preview import PdfLabelPreview
 from .widgets.table import Column, DataTable
 from .widgets.toast import ToastKind
 
@@ -246,9 +247,9 @@ class LabelsPage(QWidget):
         body.addWidget(self.printer_box)
         self.pdf_box = QCheckBox("Сохранить в PDF вместо печати", card)
         body.addWidget(self.pdf_box)
-        self.print_pdf_button = QPushButton("Напечатать из PDF…", card)
+        self.print_pdf_button = QPushButton("Этикетки из PDF…", card)
         self.print_pdf_button.setToolTip(
-            "Готовый PDF: одна страница — одна этикетка 43 × 25 мм на выбранном принтере")
+            "Открыть PDF, просмотреть этикетки 43 × 25 мм и подтвердить печать")
         self.print_pdf_button.clicked.connect(self.print_from_pdf)
         body.addWidget(self.print_pdf_button)
 
@@ -657,28 +658,35 @@ class LabelsPage(QWidget):
         self._run_print([single], target, 1)
 
     def print_from_pdf(self) -> None:
-        name = self.printer_box.currentText()
-        if not name:
-            self._fail("Выберите принтер для печати PDF.")
+        if not self.print_pdf_button.isEnabled():
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "Выбрать PDF с этикетками", "", "PDF (*.pdf)")
         if not path:
             return
+        self.print_pdf_button.setEnabled(False)
+        self.status.setStyleSheet("")
+        self.status.setText("Подготавливаем предпросмотр PDF…")
+        run_task(pdf_label_print.prepare_labels, path, on_result=self._preview_pdf_labels,
+                 on_error=self._pdf_labels_failed)
+
+    def _pdf_labels_failed(self, message: str) -> None:
+        self.print_pdf_button.setEnabled(True)
+        self._fail(message)
+
+    def _preview_pdf_labels(self, job: pdf_label_print.LabelJob) -> None:
+        name = self.printer_box.currentText()
+        total = len(job.regions)
         document = None
         try:
-            document, size = pdf_label_print.open_labels(path)
-            total = document.pageCount()
-            width, height = size.width() * 25.4 / 72, size.height() * 25.4 / 72
-            answer = QMessageBox.question(
-                self, "Печать этикеток из PDF",
-                f"{total} этикеток. Размер страницы PDF: "
-                f"{width:.1f} × {height:.1f} мм.\n"
-                "Печать на этикетках 43 × 25 мм с сохранением пропорций.\n"
-                f"Принтер: {name}.\n\nНапечатать все страницы по порядку?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+            document, size = pdf_label_print.open_labels(job.data)
+            dialog = PdfLabelPreview(document, job, name, self)
+            try:
+                accepted = dialog.exec()
+            finally:
+                dialog.deleteLater()
+            if not accepted:
+                self.status.setText("Печать PDF отменена.")
                 return
             progress = QProgressDialog(
                 "Печатаем PDF…", "Остановить", 0, total, self)
@@ -691,7 +699,8 @@ class LabelsPage(QWidget):
                 return not progress.wasCanceled()
 
             try:
-                done = pdf_label_print.print_pdf(document, size, name, progress=step)
+                done = pdf_label_print.print_pdf(
+                    document, size, name, progress=step, regions=job.regions)
             finally:
                 progress.close()
         except (label_print.PrintError, OSError) as error:
@@ -700,6 +709,7 @@ class LabelsPage(QWidget):
         finally:
             if document is not None:
                 document.close()
+            self.print_pdf_button.setEnabled(True)
         self._save_settings()
         text = f"Передано на принтер «{name}»: {done} из {total} этикеток PDF."
         self.status.setStyleSheet("")
