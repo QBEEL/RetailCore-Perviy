@@ -1,12 +1,11 @@
-"""Связь с ГИС МТ, True API и СУЗ: адреса, лимиты, повторы, ошибки.
+"""Связь с системами маркировки: адреса, лимиты, повторы, ошибки.
 
-Систем три, и это не деталь, а устройство: документами оборота заведует ГИС МТ,
-проверкой кодов — True API, а выдачей кодов — СУЗ. Адреса у них разные, и
-токены тоже разные, поэтому хост выбирается явно на каждом запросе.
+Документами оборота заведует ГИС МТ, проверкой кодов — True API, выдачей
+кодов — СУЗ, а карточками товаров — Национальный каталог. Хост выбирается
+явно на каждом запросе.
 
-Различается и способ предъявить токен: ГИС МТ с True API ждут его заголовком
-`Authorization: Bearer`, а СУЗ — собственным заголовком `clientToken`. Отсюда
-два параметра вместо одного: `token` для первых двух, `headers` для третьей.
+Единый токен ГИС МТ передаётся заголовком `Authorization: Bearer`, а СУЗ
+использует собственный заголовок `clientToken`.
 
 Лимиты здесь — не оптимизация, а основа: тысяча кодов на запрос и полсотни
 запросов в секунду от одного участника. Держать темп обязан сам транспорт —
@@ -57,13 +56,16 @@ HOSTS: dict[tuple[str, Contour], str] = {
     # API ЭДО Лайт; токен у него тот же, что выдаёт True API при входе.
     ("edo", Contour.PRODUCTION): "https://edo-gismt.crpt.ru",
     ("edo", Contour.SANDBOX): "https://edo.sandbox.crptech.ru",
+    ("catalog", Contour.PRODUCTION): "https://xn--80aqu.xn----7sbabas4ajkhfocclk9d3cvfsa.xn--p1ai",
+    ("catalog", Contour.SANDBOX): "https://api.nk.sandbox.crptech.ru",
 }
 
 
 # Префикс пути у каждой системы свой. True API живёт под третьей версией, а не
 # под четвёртой: по `/api/v4` оба хоста отвечают 403.
 PREFIX = {"ismp": "/api/v3", "trueapi": "/api/v3/true-api",
-          "trueapi4": "/api/v4/true-api", "suz": "/api/v3", "edo": "/api/v1"}
+          "trueapi4": "/api/v4/true-api", "suz": "/api/v3", "edo": "/api/v1",
+          "catalog": "/v3"}
 
 
 def configure(system: str, contour: Contour, host: str) -> None:
@@ -101,6 +103,10 @@ class Offline(MarkingError):
 
 class RateLimited(MarkingError):
     """Превышен лимит запросов. Внутри транспорта обрабатывается сам."""
+
+
+class InvalidResponse(MarkingError):
+    """Сервер вернул тело в неизвестном формате."""
 
 
 class Limiter:
@@ -274,7 +280,12 @@ def _send(prepared: urllib.request.Request,
                 return json.loads(payload) if payload else None
             except json.JSONDecodeError:
                 pass
-        raise _failure(error.code, payload) from None
+        response_headers = error.headers or {}
+        content_type = response_headers.get("Content-Type", "")
+        authorization = prepared.get_header("Authorization", "")
+        raise _failure(error.code, payload, content_type=content_type,
+                       token=authorization.removeprefix("Bearer "),
+                       request_id=response_headers.get("X-Request-Log-Id", "")) from None
     except UnicodeEncodeError:
         # Заголовки уходят latin-1, и русская буква в токене роняет `urllib`
         # ещё до отправки. Само по себе это исключение говорит только про
@@ -288,12 +299,13 @@ def _send(prepared: urllib.request.Request,
             "Система маркировки недоступна. Проверьте подключение к сети."
             f"\n\nПодробности: {error}") from None
     except json.JSONDecodeError as error:
-        raise MarkingError(
+        raise InvalidResponse(
             "Система маркировки ответила не JSON — вероятно, обращение ушло "
             f"не туда. Подробности: {error}") from None
 
 
-def _failure(code: int, payload: bytes = b"") -> MarkingError:
+def _failure(code: int, payload: bytes = b"", *, content_type: str = "",
+             token: str = "", request_id: str = "") -> MarkingError:
     """Ответ об ошибке → исключение с человеческим текстом."""
     detail = ""
     try:
@@ -301,38 +313,49 @@ def _failure(code: int, payload: bytes = b"") -> MarkingError:
     except (ValueError, TypeError):
         answer = None
     if isinstance(answer, dict):
-        # У ГИС МТ текст ошибки лежит под разными именами в зависимости от
-        # метода, поэтому перебираем известные.
-        for name in ("error_message", "errorMessage", "description", "detail",
-                     "message", "error"):
-            if value := answer.get(name):
-                detail = str(value)
-                break
-        # У СУЗ он лежит списком, а не строкой, и списка два. `globalErrors` —
-        # про запрос целиком: {"errorCode":1110,"error":"…"}. `fieldErrors` —
-        # про отдельное поле, и устроен иначе:
-        # {"errorCode":6010,"fieldError":"…","fieldName":"reportId"}.
-        #
-        # Читать только первый — значит на разборе по полям показать человеку
-        # «Система маркировки отвергла запрос» вместо готового ответа, какого
-        # именно поля не хватает. Сервер сказал, а мы потеряли.
-        if not detail:
-            detail = _listed(answer.get("globalErrors"))
-        if not detail:
-            detail = _listed(answer.get("fieldErrors"))
-        # «ЭДО Лайт» кладёт причины в `errors`: [{"error_message": "…"}].
-        if not detail:
-            detail = _listed(answer.get("errors"))
+        detail = _error_detail(answer)
+        if not detail and isinstance(result := answer.get("result"), dict):
+            detail = _error_detail(result) or _listed(result.get("item"))
+    elif isinstance(answer, list):
+        detail = _listed(answer)
+    elif isinstance(answer, str):
+        detail = answer.strip()
+    elif content_type.split(";", 1)[0].strip().lower() == "text/plain":
+        detail = payload.decode("utf-8", "replace").strip()
+    if detail.startswith("<"):
+        detail = ""
+    if token:
+        detail = detail.replace(token, "[скрыто]")
+    detail = detail[:1500]
+    if not detail:
+        detail = {
+            400: "Система маркировки отклонила запрос без текста ошибки.",
+            401: "Требуется вход по сертификату — токен истёк или отозван.",
+            429: "Превышен лимит обращений к системе маркировки.",
+        }.get(code, f"Система маркировки ответила кодом {code}")
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]{1,100}", request_id) and not (token and token in request_id):
+        detail += f"\nID обращения: {request_id}"
     if code == 401:
-        return AuthRequired(
-            detail or "Требуется вход по сертификату — токен истёк или отозван.",
-            401)
+        return AuthRequired(detail, code)
     if code == 429:
-        return RateLimited(
-            detail or "Превышен лимит обращений к системе маркировки.", 429)
-    if code == 400 and not detail:
-        detail = "Система маркировки отвергла запрос."
-    return MarkingError(detail or f"Система маркировки ответила кодом {code}", code)
+        return RateLimited(detail, code)
+    return MarkingError(detail, code)
+
+
+def _error_detail(answer: dict) -> str:
+    for name in ("error_message", "errorMessage", "description", "detail",
+                 "message", "error", "text", "status_message"):
+        value = answer.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict) and value is not answer:
+            if detail := _listed([value]):
+                return detail
+    # СУЗ передаёт списки globalErrors и fieldErrors, ЭДО Лайт — errors.
+    for name in ("globalErrors", "fieldErrors", "errors", "detail"):
+        if detail := _listed(answer.get(name)):
+            return detail
+    return ""
 
 
 def _listed(errors: Any) -> str:
@@ -345,16 +368,20 @@ def _listed(errors: Any) -> str:
         return ""
     texts = []
     for item in errors:
+        if isinstance(item, str) and item.strip():
+            texts.append(item.strip())
+            continue
         if not isinstance(item, dict):
             continue
         text = str(item.get("error") or item.get("fieldError")
                    or item.get("errorMessage") or item.get("error_message")
-                   or item.get("message") or "").strip()
+                   or item.get("message") or item.get("text")
+                   or item.get("status_message") or "").strip()
         if not text:
             continue
-        if name := item.get("fieldName"):
+        if name := item.get("fieldName") or item.get("attribute_name"):
             text = f"{text} [{name}]"
-        if code := item.get("errorCode"):
+        if code := item.get("errorCode") or item.get("status_code"):
             text = f"{text} (код {code})"
         texts.append(text)
     return " ".join(texts)

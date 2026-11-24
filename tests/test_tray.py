@@ -87,7 +87,7 @@ def test_tray_icon_returns_window(application, tray_available) -> None:
     assert not window.isHidden()
 
 
-def test_tray_is_announced_once_per_run(application, tray_available, monkeypatch) -> None:
+def test_hiding_to_tray_is_silent(application, tray_available, monkeypatch) -> None:
     window = _window()
     shown: list[str] = []
     monkeypatch.setattr(window.tray, "message", lambda title, text, ms=0: shown.append(text))
@@ -96,7 +96,7 @@ def test_tray_is_announced_once_per_run(application, tray_available, monkeypatch
     window.restore_window()
     window.close()
 
-    assert len(shown) == 1
+    assert shown == []
 
 
 def test_real_quit_is_not_intercepted(application, tray_available) -> None:

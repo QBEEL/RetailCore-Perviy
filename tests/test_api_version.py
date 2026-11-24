@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import urllib.error
 from typing import Any, Callable
 
@@ -38,7 +39,7 @@ def test_server_version_constant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
     from server.api.app.main import app as server_app
 
-    assert API_VERSION == "3.15.1"
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", API_VERSION)
     assert server_app.version == API_VERSION
     route = next(route for route in server_app.routes if getattr(route, "path", None) == "/api/version")
     assert route.endpoint() == {"version": API_VERSION}

@@ -532,3 +532,12 @@ def read_codes_file(path: str) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def save_codes_csv(path: str, raw_codes: list[str]) -> str:
+    """Записывает список кодов одной колонкой, в том числе коды с запятыми и кавычками."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, delimiter=";", quoting=csv.QUOTE_ALL)
+        writer.writerow(("Код маркировки",))
+        writer.writerows((code,) for code in raw_codes)
+    return path

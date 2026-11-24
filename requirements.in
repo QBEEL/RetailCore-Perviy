@@ -7,6 +7,9 @@ openpyxl>=3.1
 # Счёт поставщика в PDF → Excel: текст и линии сетки со страницы.
 pdfminer.six>=20231228
 
+# Считывание Data Matrix с этикеток в PDF.
+zxing-cpp==3.1.1
+
 # Подпись через КриптоПро доступна только в Windows.
 pywin32>=306; platform_system == "Windows"
 

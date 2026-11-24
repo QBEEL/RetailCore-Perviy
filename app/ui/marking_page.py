@@ -73,8 +73,9 @@ from ..core.marking import (
     PermitState,
     codes as codes_module,
 )
-from ..core.marking import check_export, deadlines
+from ..core.marking import check_export, code_import, deadlines
 from ..core.marking import application as application_module
+from ..core.marking import catalog as marking_catalog
 from ..core.marking import issue as issue_module
 from ..core.marking import introduce as introduce_module
 from ..core.marking import orders as orders_module, service
@@ -115,6 +116,7 @@ from .widgets.marking_dialogs import (
 from .widgets.toast import ToastKind
 from .widgets.sale_tab import SaleTab
 from .widgets.sets_tab import SetsTab
+from .widgets.marking_catalog import MarkingCatalogTab
 from .widgets.withdrawal_tab import WithdrawalTab
 
 # Высота таблицы результата, когда её развернули. В свёрнутом виде таблица
@@ -147,6 +149,7 @@ WITHDRAWAL_TAB = 4
 SALE_TAB = 5
 # Формирование наборов из ОСУ (косметика и бытовая химия и др.) — следом.
 SETS_TAB = 6
+CATALOG_TAB = 7
 
 # Что делает открытая подвкладка и что ей нужно — одной строкой под заголовком.
 TAB_SUBTITLES: dict[int, str] = {
@@ -164,6 +167,7 @@ TAB_SUBTITLES: dict[int, str] = {
               "когда он подпишет документ.",
     SETS_TAB: "Формирование наборов (КИН) из товаров, принятых по ОСУ "
               "(«Косметика и бытовая химия» и др.).",
+    CATALOG_TAB: "Создание карточек товаров и проверка отправок в Национальном каталоге.",
 }
 
 # Как выглядит ответ на скан при сверке. Кладовщик смотрит на товар, а на экран
@@ -241,6 +245,7 @@ class MarkingPage(QWidget):
         self._crypto_available = True
         self._batch = codes_module.Batch()
         self._result: list[CodeInfo] = []
+        self._result_contour: Contour | None = None
         # Коды в том порядке, в каком они стоят в таблице результата: с
         # переключателем «только замечания» номер строки не равен номеру кода.
         self._shown: list[CodeInfo] = []
@@ -357,6 +362,8 @@ class MarkingPage(QWidget):
             inn=self._participant_inn, organisations=self._saved_organisations)
         self.sets_tab.journal_changed.connect(self.reload_journal)
         self.tabs.addTab(self.sets_tab, icons.icon("order"), "Формирование наборов")
+        self.marking_catalog_tab = MarkingCatalogTab(lambda: self.contour, self)
+        self.tabs.addTab(self.marking_catalog_tab, icons.icon("order"), "Национальный каталог")
         # Сверку ведут сканером, а сканер печатает туда, где курсор. Ставить его
         # в поле сканирования при открытии вкладки — не удобство, а условие
         # работы: иначе первый же код уедет в поле поиска или в никуда.
@@ -740,8 +747,13 @@ class MarkingPage(QWidget):
         header.setSpacing(9)
         header.addWidget(SectionTitle("Коды", card))
         header.addStretch(1)
-        header.addWidget(self._action(card, "Взять из файла", "open", self.load_file))
-        header.addWidget(self._action(card, "Очистить", "clear", self.clear_codes))
+        self.load_codes_button = self._action(card, "Взять из файла", "open", self.load_file)
+        header.addWidget(self.load_codes_button)
+        self.save_codes_button = self._action(card, "Сохранить CSV", "export", self.save_codes)
+        self.save_codes_button.setEnabled(False)
+        header.addWidget(self.save_codes_button)
+        self.clear_codes_button = self._action(card, "Очистить", "clear", self.clear_codes)
+        header.addWidget(self.clear_codes_button)
         body.addLayout(header)
 
         self.codes_edit = QPlainTextEdit(card)
@@ -764,6 +776,12 @@ class MarkingPage(QWidget):
 
         self.codes_hint = Hint("Пока ни одного кода.", card)
         body.addWidget(self.codes_hint)
+        self.codes_import_report = QPlainTextEdit(card)
+        self.codes_import_report.setReadOnly(True)
+        self.codes_import_report.setAccessibleName("Итог импорта кодов")
+        self.codes_import_report.setMaximumHeight(144)
+        self.codes_import_report.hide()
+        body.addWidget(self.codes_import_report)
 
         actions = QHBoxLayout()
         actions.setSpacing(9)
@@ -810,7 +828,7 @@ class MarkingPage(QWidget):
                                           self._toggle_result)
         self.result_expand.setToolTip(
             "Растянуть таблицу по высоте, чтобы видеть больше строк. "
-            "Двойной щелчок по строке открывает сведения о коде")
+            "Двойной щелчок по строке открывает сведения о коде и действия с ним")
         header.addWidget(self.result_expand)
         body.addLayout(header)
 
@@ -2696,21 +2714,92 @@ class MarkingPage(QWidget):
         return " · ".join(parts)
 
     def load_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Список кодов", "", "Списки кодов (*.txt *.csv);;Все файлы (*.*)")
-        if not path:
+        if not self.load_codes_button.isEnabled():
             return
-        try:
-            text = _read_text(path)
-        except OSError as error:
-            self.notify(f"Не удалось прочитать файл: {error}", ToastKind.ERROR)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Список кодов", "", "Списки кодов (*.txt *.csv *.pdf);;Все файлы (*.*)")
+        if not paths:
             return
+        self.load_codes_button.setEnabled(False)
+        self._sync_state()
+        self.codes_import_report.show()
+        self._show_import_progress(0, len(paths))
+        run_task(code_import.read_files, paths, on_result=self._codes_loaded,
+                 on_error=self._codes_import_failed, on_progress=self._show_import_progress)
+
+    def _show_import_progress(self, done: int, total: int) -> None:
+        self.codes_import_report.setPlainText(f"Чтение файлов · {done} из {total}")
+
+    def _append_codes(self, text: str) -> None:
         existing = self.codes_edit.toPlainText()
         self.codes_edit.setPlainText(f"{existing}\n{text}" if existing.strip() else text)
+        self._parse_timer.stop()
         self._reparse()
+
+    def _codes_loaded(self, files: list[code_import.ImportedFile]) -> None:
+        self.load_codes_button.setEnabled(True)
+        imported = [code for file in files for code in file.batch.codes]
+        if imported:
+            self._append_codes("\n".join(code.raw for code in imported))
+        else:
+            self._sync_state()
+
+        valid = [code for code in imported if code.valid]
+        missing = sum(file.pdf.missing_crypto for file in files if file.pdf is not None)
+        repeated = len(valid) - len({code.identity for code in valid})
+        failed = sum(bool(file.error) for file in files)
+        lines = [
+            f"Файлов: {len(files)} · Считано кодов: {len(valid)} · "
+            f"Не разобрано: {len(imported) - len(valid) + missing} · Повторов: {repeated}",
+            f"С криптохвостом: {sum(bool(code.full) for code in valid)} · "
+            f"Файлов с ошибкой чтения: {failed}",
+            "",
+        ]
+        for file in files:
+            if file.error:
+                lines.append(f"{file.name} — ошибка чтения: {file.error}")
+                continue
+            counts = f"считано {len(file.batch.valid)}, не разобрано {len(file.batch.broken)}"
+            if file.pdf is not None:
+                counts = f"считано полных марок {len(file.batch.valid)}"
+                if file.pdf.missing_crypto:
+                    counts += f", криптохвост не считан по подписям: {file.pdf.missing_crypto}"
+                if file.pdf.pages_without_marks:
+                    counts += f", страниц без считанных Data Matrix: {file.pdf.pages_without_marks}"
+            lines.append(f"{file.name} — {counts}")
+        self.codes_import_report.setPlainText("\n".join(lines))
+
+    def _codes_import_failed(self, message: str) -> None:
+        self.load_codes_button.setEnabled(True)
+        self._sync_state()
+        self.codes_import_report.setPlainText(f"Не удалось импортировать файлы: {message}")
+
+    def save_codes(self) -> None:
+        """Сохраняет разобранные коды из поля ввода, включая ещё не проверенные."""
+        if self._parse_timer.isActive():
+            self._parse_timer.stop()
+            self._reparse()
+        raw_codes = [code.raw for code in self._batch.valid]
+        if not raw_codes:
+            self.notify("Нет разобранных кодов для сохранения", ToastKind.WARNING)
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить список кодов", "Коды маркировки.csv", "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        run_task(
+            codes_module.save_codes_csv, path, raw_codes,
+            on_result=lambda saved: self.notify(
+                f"Коды сохранены: {os.path.basename(saved)}", ToastKind.SUCCESS),
+            on_error=lambda message: self.notify(
+                f"Не удалось сохранить коды: {message}", ToastKind.ERROR),
+        )
 
     def clear_codes(self) -> None:
         self.codes_edit.clear()
+        self.codes_import_report.hide()
         self._result = []
         self._batch = codes_module.Batch()
         self._reparse()
@@ -2720,6 +2809,8 @@ class MarkingPage(QWidget):
     # --- проверка -----------------------------------------------------------------
 
     def run_check(self) -> None:
+        if not self.load_codes_button.isEnabled():
+            return
         if not service.signed_in():
             self.notify("Сначала войдите по сертификату", ToastKind.WARNING)
             return
@@ -2745,6 +2836,7 @@ class MarkingPage(QWidget):
 
     def _show_result(self, found: list[CodeInfo]) -> None:
         self._result = list(found)
+        self._result_contour = self.contour
         self._set_busy(False)
         self.tile_circulation.set_value(sum(1 for i in found if i.state.sellable))
         self.tile_elsewhere.set_value(
@@ -2793,6 +2885,47 @@ class MarkingPage(QWidget):
             self._remark_code(info)
         elif dialog.action == CodeInfoDialog.WITHDRAW:
             self._withdraw_code(info)
+        elif dialog.action and dialog.action == CodeInfoDialog.TECHNICAL_CARD:
+            self._technical_card(info)
+
+    def _technical_card(self, info: CodeInfo) -> None:
+        if self.marking_catalog_tab.busy or self._busy:
+            self.notify("Дождитесь завершения текущего запроса.", ToastKind.INFO)
+            return
+        if self._result_contour is not self.contour:
+            self.notify("Проверьте код заново в выбранном контуре.", ToastKind.WARNING)
+            return
+        if info.raw:
+            self._prefill_technical_card(info)
+            return
+        if not service.signed_in() or service.current().contour is not self.contour:
+            self.notify("Войдите по сертификату, чтобы получить сведения о товаре.",
+                        ToastKind.WARNING)
+            return
+        self._set_busy(True)
+
+        def received(items: list[CodeInfo]) -> None:
+            self._set_busy(False)
+            item = next((item for item in items if item.code == info.code and item.found), None)
+            if item is not None:
+                self._prefill_technical_card(item)
+            else:
+                self.notify("«Честный ЗНАК» не вернул сведения об этом коде.", ToastKind.WARNING)
+
+        def failed(message: str) -> None:
+            self._set_busy(False)
+            self.notify(f"Не удалось получить сведения о товаре: {message}", ToastKind.ERROR)
+
+        run_task(service.check_exact, [info.code], self.contour, on_result=received, on_error=failed)
+
+    def _prefill_technical_card(self, info: CodeInfo) -> None:
+        try:
+            draft = marking_catalog.technical_card_from_code(info)
+        except ValueError as error:
+            self.notify(str(error), ToastKind.WARNING)
+            return
+        if self.marking_catalog_tab.load_technical_card(draft):
+            self.tabs.setCurrentIndex(CATALOG_TAB)
 
     def _full_code(self, info: CodeInfo) -> str:
         """Код вместе с криптохвостом, если он на этом компьютере есть.
@@ -3607,8 +3740,11 @@ class MarkingPage(QWidget):
         self.organisation_button.setEnabled(bool(self.thumbprint) and not busy)
         self.certificate_box.setEnabled(not busy and not signed)
         self.contour_box.setEnabled(not busy)
+        importing_codes = not self.load_codes_button.isEnabled()
         self.check_button.setEnabled(
-            signed and bool(self._batch.valid) and not self._busy)
+            signed and bool(self._batch.valid) and not self._busy and not importing_codes)
+        self.save_codes_button.setEnabled(bool(self._batch.valid) and not importing_codes)
+        self.clear_codes_button.setEnabled(not importing_codes)
         self._sync_result_print()
         # Проверка связи с СУЗ входа по сертификату не требует: это другая
         # система и другой способ представиться.
@@ -3846,23 +3982,6 @@ def _check(raw_codes: Sequence[str], contour: Contour, use_cache: bool,
                           progress=progress)
     service.record_check(raw_codes, contour=contour)
     return found
-
-
-def _read_text(path: str) -> str:
-    """Список кодов из файла. Кодировка выясняется перебором.
-
-    Такие списки приходят и из блокнота, и выгрузкой из 1С: utf-8 и cp1251
-    встречаются одинаково часто, а ошибка кодировки выглядит как «все коды
-    испорчены».
-    """
-    for encoding in ("utf-8-sig", "cp1251"):
-        try:
-            with open(path, encoding=encoding) as handle:
-                return handle.read()
-        except UnicodeDecodeError:
-            continue
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return handle.read()
 
 
 def _onec_cell(found: LineMatch | None) -> str:

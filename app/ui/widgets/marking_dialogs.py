@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.marking import CodeInfo, Organisation, PermitState
+from ...core.marking.catalog import technical_card_blocked
 from .. import icons
 from ..theme import Metrics, Palette
 from .common import Hint, SectionTitle
@@ -274,6 +275,7 @@ class CodeInfoDialog(QDialog):
     PRINT = "print"
     REMARK = "remark"
     WITHDRAW = "withdraw"
+    TECHNICAL_CARD = "technical_card"
 
     def __init__(self, info: CodeInfo, parent: QWidget | None = None, *,
                  print_blocked: str = "") -> None:
@@ -343,13 +345,20 @@ class CodeInfoDialog(QDialog):
             "Вывод из оборота…", "trash", self.WITHDRAW,
             "" if info.state.sellable else
             "Код не в обороте: выводить из оборота нечего")
+        technical_card_error = technical_card_blocked(info)
+        self.technical_card_button = self._action_button(
+            "Техническая карточка…", "order", self.TECHNICAL_CARD,
+            technical_card_error)
         actions.addWidget(self.print_button)
         actions.addWidget(self.remark_button)
         actions.addWidget(self.withdraw_button)
+        actions.addWidget(self.technical_card_button)
         actions.addStretch(1)
         close = QPushButton("Закрыть", self)
         close.clicked.connect(self.reject)
         actions.addWidget(close)
+        if info.found and technical_card_error:
+            root.addWidget(Hint(technical_card_error, self))
         root.addLayout(actions)
 
     def _action_button(self, title: str, icon: str, action: str,

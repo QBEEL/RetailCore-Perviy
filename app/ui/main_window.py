@@ -177,7 +177,6 @@ class MainWindow(QMainWindow):
         # программы по-настоящему — только через `quit_application`.
         self.tray: AppTray | None = None
         self._quitting = False
-        self._tray_announced = False
         if session_manager := QGuiApplication.instance():
             # Windows завершает сеанс, закрывая окна: отказ из closeEvent
             # повис бы окном «программа мешает выключению».
@@ -659,17 +658,6 @@ class MainWindow(QMainWindow):
         return (not self._quitting and self.settings.tray_on_close
                 and self.tray is not None and self.tray.visible)
 
-    def _announce_tray(self) -> None:
-        # Один раз за запуск: иначе каждое закрытие окна сопровождалось бы
-        # уведомлением, которое все быстро перестали бы читать.
-        if self.tray is None or self._tray_announced:
-            return
-        self._tray_announced = True
-        self.tray.message(
-            APP_TITLE,
-            "Программа продолжает работать в трее. Вернуть окно — щелчок по "
-            "значку, выйти — правая кнопка → «Выйти».", 6000)
-
     def show_page(self, index: int) -> bool:
         """Открывает раздел. Ложь — он закрыт, и переход не состоялся."""
         if not self._page_allowed(index):
@@ -897,7 +885,6 @@ class MainWindow(QMainWindow):
         if self._hides_to_tray():
             event.ignore()
             self.hide()
-            self._announce_tray()
             return
         super().closeEvent(event)
         if self.tray is not None:

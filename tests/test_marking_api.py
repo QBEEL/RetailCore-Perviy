@@ -132,6 +132,12 @@ def test_error_text_is_taken_from_the_answer():
     assert "Код" in str(error)
 
 
+def test_plain_text_error_hides_bearer_token():
+    error = transport._failure(400, b"Invalid token: test-token",
+                               content_type="text/plain; charset=utf-8", token="test-token")
+    assert str(error) == "Invalid token: [скрыто]"
+
+
 def test_retries_do_not_repeat_a_rejected_document(monkeypatch):
     """Четырёхсотые не повторяются: принятый повтор — вторая операция."""
     calls = []

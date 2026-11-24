@@ -960,6 +960,50 @@ def test_выгрузка_берёт_видимые_коды(application, tmp_pa
     assert "1С не примет" in rows[0][8]
 
 
+def test_проверка_импортирует_несколько_файлов_показывает_итог_и_сохраняет_csv(
+        application, tmp_path, stub, monkeypatch):
+    import csv
+
+    from app.core.marking import codes, pdf_codes
+    from app.ui import marking_page
+
+    target = tmp_path / "список.csv"
+    full = f'010461060025006221ABC;,"DEFG123{GS}91TEST{GS}92{"A" * 44}'
+    source = tmp_path / "коды.csv"
+    codes.save_codes_csv(str(source), [full, "bad-code"])
+    monkeypatch.setattr(pdf_codes, "scan_full",
+                        lambda _path: pdf_codes.FullScan([full], 2, 1))
+
+    def open_files(_parent, _caption, _directory, filters):
+        assert "*.pdf" in filters
+        return [str(tmp_path / "этикетки.PDF"), str(source), str(tmp_path / "нет.txt")], ""
+
+    monkeypatch.setattr(marking_page.QFileDialog, "getOpenFileNames", open_files)
+    monkeypatch.setattr(marking_page.QFileDialog, "getSaveFileName",
+                        lambda *_args: (str(target), "CSV (*.csv)"))
+    page = _page(application, tmp_path)
+    page.codes_edit.setPlainText(PERFUME)
+    page.load_codes_button.click()
+    _settle(application)
+    assert [item.raw for item in page._batch.valid] == [PERFUME, full, full]
+    assert page.load_codes_button.isEnabled() and page.save_codes_button.isEnabled()
+    report = page.codes_import_report.toPlainText()
+    assert "Файлов: 3 · Считано кодов: 2 · Не разобрано: 3 · Повторов: 1" in report
+    assert "С криптохвостом: 2 · Файлов с ошибкой чтения: 1" in report
+    assert "этикетки.PDF — считано полных марок 1, криптохвост не считан по подписям: 2" in report
+    assert "страниц без считанных Data Matrix: 1" in report
+    assert "коды.csv — считано 1, не разобрано 1" in report
+    assert "нет.txt — ошибка чтения:" in report
+
+    page.save_codes_button.click()
+    _settle(application)
+    with target.open(encoding="utf-8-sig", newline="") as handle:
+        assert list(csv.reader(handle, delimiter=";")) == [
+            ["Код маркировки"], [PERFUME], [full], [full],
+        ]
+    assert codes.split_lines(codes.read_codes_file(str(target))) == [PERFUME, full, full]
+
+
 def test_карточка_кода_называет_РД(application):
     from app.core.marking import PermitDoc
     from app.ui.widgets.marking_dialogs import CodeInfoDialog, permits_text
@@ -1049,6 +1093,61 @@ def test_вывод_из_оборота_переносит_код_на_вкла�
 
     assert page.withdrawal_tab.codes == [PERFUME]
     assert page.tabs.currentIndex() == marking_page.WITHDRAWAL_TAB
+
+
+def test_техническая_карточка_из_проверки_заполняется_без_отправки(
+        application, tmp_path, stub, monkeypatch):
+    from app.core.marking import service as marking_service
+    from app.ui import marking_page
+
+    _choose_in_dialog(monkeypatch, "technical_card")
+    page = _page(application, tmp_path)
+    info = marking_service._info({"cisInfo": {
+        "cis": PERFUME, "productName": "Тестовый товар", "brand": "Тестовая марка",
+        "gtin": "04650139031961", "tnVedEaes": "3303001000", "country": "RU",
+        "status": "INTRODUCED", "packageType": "UNIT",
+    }})
+    page._show_result([info])
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Данные уже получены при проверке кода")
+
+    monkeypatch.setattr(marking_page, "run_task", unexpected)
+    page._on_result_activated(0, 1)
+
+    assert page.tabs.currentIndex() == marking_page.CATALOG_TAB
+    body = page.marking_catalog_tab._draft().payload()
+    assert body["is_tech_gtin"] == 1 and "gtin" not in body
+    assert body["good_name"] == "Тестовый товар"
+    assert body["brand"] == "Тестовая марка"
+    assert body["tnved"] == "3303001000"
+    assert body["good_attrs"] == [{"attr_id": 2630, "attr_value": "RU"}]
+
+
+def test_техническая_карточка_дозагружает_данные_только_выбранного_кода(
+        application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+
+    _, state = stub
+    state["signed"] = True
+    _choose_in_dialog(monkeypatch, "technical_card")
+    page = _page(application, tmp_path)
+    cached = _info(KI)
+    page._show_result([cached])
+    fresh = _info(KI, product_name="Тестовый товар", raw={
+        "brand": "Тестовая марка", "tnVedEaesGroup": "3303",
+    })
+
+    def run(function, codes, contour, *, on_result, on_error):
+        assert function is marking_page.service.check_exact
+        assert codes == [KI] and contour is Contour.SANDBOX
+        on_result([_info(OTHER, product_name="Другой товар"), fresh])
+
+    monkeypatch.setattr(marking_page, "run_task", run)
+    page._on_result_activated(0, 1)
+    assert page.tabs.currentIndex() == marking_page.CATALOG_TAB
+    assert page.marking_catalog_tab.name.text() == "Тестовый товар"
+    assert page.marking_catalog_tab.tnved.text() == "3303"
 
 
 def test_печать_кода_идёт_блоком_в_памяти(application, tmp_path, stub, monkeypatch):
