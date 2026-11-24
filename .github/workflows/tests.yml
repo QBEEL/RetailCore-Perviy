@@ -18,7 +18,7 @@ permissions:
 jobs:
   migrations:
     name: PostgreSQL migrations and server startup
-    if: ${{ github.event_name != 'push' || github.event.head_commit.message != 'Release RetailCore 3.15.15' }}
+    if: ${{ github.event_name != 'push' || (github.event.head_commit.message != 'Release RetailCore 3.15.15' && github.event.head_commit.message != 'Release RetailCore 3.15.17') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -94,7 +94,7 @@ jobs:
 
   tests:
     name: Tests (${{ matrix.os }})
-    if: ${{ inputs.skip_client_matrix != true && (github.event_name != 'push' || github.event.head_commit.message != 'Release RetailCore 3.15.15') }}
+    if: ${{ inputs.skip_client_matrix != true && (github.event_name != 'push' || (github.event.head_commit.message != 'Release RetailCore 3.15.15' && github.event.head_commit.message != 'Release RetailCore 3.15.17')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:

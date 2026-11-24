@@ -73,7 +73,7 @@ from ..core.marking import (
     PermitState,
     codes as codes_module,
 )
-from ..core.marking import check_export, code_import, deadlines
+from ..core.marking import check_export, code_import, deadlines, image_codes
 from ..core.marking import application as application_module
 from ..core.marking import catalog as marking_catalog
 from ..core.marking import issue as issue_module
@@ -748,6 +748,7 @@ class MarkingPage(QWidget):
         header.addWidget(SectionTitle("Коды", card))
         header.addStretch(1)
         self.load_codes_button = self._action(card, "Взять из файла", "open", self.load_file)
+        self.load_codes_button.setToolTip("Загрузить коды из PDF, CSV, TXT или с фото")
         header.addWidget(self.load_codes_button)
         self.save_codes_button = self._action(card, "Сохранить CSV", "export", self.save_codes)
         self.save_codes_button.setEnabled(False)
@@ -2717,7 +2718,9 @@ class MarkingPage(QWidget):
         if not self.load_codes_button.isEnabled():
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Список кодов", "", "Списки кодов (*.txt *.csv *.pdf);;Все файлы (*.*)")
+            self, "Список кодов", "",
+            f"Коды маркировки (*.txt *.csv *.pdf {image_codes.FILE_PATTERNS});;"
+            f"Фото ({image_codes.FILE_PATTERNS});;Все файлы (*.*)")
         if not paths:
             return
         self.load_codes_button.setEnabled(False)

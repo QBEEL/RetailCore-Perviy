@@ -1,11 +1,11 @@
-"""Пакетный импорт списка проверки из PDF, CSV и текстовых файлов."""
+"""Пакетный импорт списка проверки из PDF, фотографий, CSV и текстовых файлов."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import codes, pdf_codes
+from . import codes, image_codes, pdf_codes
 
 
 @dataclass
@@ -26,6 +26,8 @@ def read_files(paths: list[str], progress: Callable[[int, int], None] | None = N
             if source.suffix.lower() == ".pdf":
                 result.pdf = pdf_codes.scan_full(path)
                 lines = result.pdf.marks
+            elif image_codes.is_image(path):
+                lines = image_codes.read(path)
             else:
                 lines = codes.split_lines(codes.read_codes_file(path))
             result.batch = codes.parse_many(lines)

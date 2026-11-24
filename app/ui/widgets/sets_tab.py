@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.marking import codes as codes_module, introduce, pdf_codes, service, sets
+from ...core.marking import codes as codes_module, image_codes, introduce, pdf_codes, service, sets
 from ...core.marking import reaggregation
 from ...core.marking.models import (
     CodeInfo,
@@ -68,6 +68,10 @@ from .common import Card, Hint, MetricTile, SectionTitle
 from .toast import ToastKind
 
 DEFAULT_GROUP = sets.DEFAULT_PRODUCT_GROUP
+_CODE_FILE_FILTER = (
+    f"Коды маркировки (*.pdf *.csv *.txt {image_codes.FILE_PATTERNS});;"
+    f"Фото ({image_codes.FILE_PATTERNS});;PDF ЧЗ (*.pdf);;CSV (*.csv);;Текст (*.txt)"
+)
 
 GTIN_COLUMN = 1
 SERIAL_COLUMN = 2
@@ -275,14 +279,14 @@ class SetsTab(QWidget):
             card, "Вставить КИН", "copy", self.paste_set_code
         )
         self.set_file_button = self._button(
-            card, "PDF/CSV…", "open", self.load_set_file
+            card, "Из файла…", "open", self.load_set_file
         )
         self.set_clear_button = self._button(
             card, "Очистить КИН", "clear", self.clear_set_code
         )
         self.set_paste_button.setToolTip("Вставить код набора (КИН) из буфера обмена")
         self.set_file_button.setToolTip(
-            "Загрузить КИН из PDF ЧЗ, CSV или текстового файла"
+            "Загрузить КИН из PDF ЧЗ, CSV, TXT или с фото"
         )
         self.set_clear_button.setToolTip("Очистить код набора (КИН)")
         set_row.addWidget(self.set_edit, 1)
@@ -457,7 +461,7 @@ class SetsTab(QWidget):
         header.addWidget(SectionTitle("Вложения набора (КИ)", card))
         header.addStretch(1)
         self.paste_button = self._button(card, "Вставить", "copy", self.paste_codes)
-        self.file_button = self._button(card, "PDF/CSV…", "open", self.load_file)
+        self.file_button = self._button(card, "Из файла…", "open", self.load_file)
         self.remove_button = self._button(card, "Убрать", "trash", self.remove_selected)
         self.remove_gtin_button = self._button(
             card, "Убрать этот GTIN", "trash", self.remove_selected_gtin
@@ -465,7 +469,7 @@ class SetsTab(QWidget):
         self.clear_button = self._button(card, "Очистить всё", "clear", self.clear)
         self.paste_button.setToolTip("Вставить коды вложений (КИ) из буфера обмена")
         self.file_button.setToolTip(
-            "Загрузить КИ вложений из PDF ЧЗ, CSV или текстового файла"
+            "Загрузить КИ вложений из PDF ЧЗ, CSV, TXT или с фото"
         )
         self.remove_button.setToolTip("Убрать выбранные в таблице коды вложений")
         self.remove_gtin_button.setToolTip(
@@ -645,27 +649,28 @@ class SetsTab(QWidget):
         self._refresh_table_statuses()
 
     def load_set_file(self, path: str = "") -> int:
-        """Загружает КИН набора из PDF, CSV или TXT."""
+        """Загружает КИН набора из PDF, CSV, TXT или с фото."""
         if not path:
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 "Файл с кодами маркировки наборов (КИН)",
                 "",
-                "Коды маркировки (*.pdf *.csv *.txt);;PDF ЧЗ (*.pdf);;CSV (*.csv);;Текст (*.txt)",
+                _CODE_FILE_FILTER,
             )
         if not path:
             return 0
-        if path.lower().endswith(".pdf"):
+        photo = image_codes.is_image(path)
+        if photo or path.lower().endswith(".pdf"):
             if self._busy or self._pending_submission():
                 self._tell("Дождитесь завершения текущей операции с набором", ToastKind.WARNING)
                 return 0
             self._busy = True
             self._sync()
-            self.hint.setText("Читаем коды из PDF…")
+            self.hint.setText("Читаем коды с фото…" if photo else "Читаем коды из PDF…")
             run_task(
-                pdf_codes.read, path,
-                on_result=self._on_set_pdf_loaded,
-                on_error=self._on_pdf_error,
+                image_codes.read if photo else pdf_codes.read, path,
+                on_result=self._on_set_codes_loaded,
+                on_error=self._on_code_file_error,
             )
             return 0
         try:
@@ -675,12 +680,12 @@ class SetsTab(QWidget):
             return 0
         return self.load_set_codes(text)
 
-    def _on_set_pdf_loaded(self, codes: list[str]) -> None:
+    def _on_set_codes_loaded(self, codes: list[str]) -> None:
         self._busy = False
         self.hint.clear()
         self.load_set_codes("\n".join(codes))
 
-    def _on_pdf_error(self, message: str) -> None:
+    def _on_code_file_error(self, message: str) -> None:
         self._busy = False
         self.hint.setText(message)
         self._sync()
@@ -1029,13 +1034,13 @@ class SetsTab(QWidget):
         self.add_many(QApplication.clipboard().text())
 
     def load_file(self, path: str | list[str] | tuple[str, ...] = "") -> tuple[int, int, int]:
-        """Загружает КИ вложений из одного или нескольких файлов PDF/CSV/TXT."""
+        """Загружает КИ вложений из PDF, CSV, TXT и фотографий."""
         if not path:
             paths, _ = QFileDialog.getOpenFileNames(
                 self,
                 "Файлы с кодами маркировки вложений (КИ)",
                 "",
-                "Коды маркировки (*.pdf *.csv *.txt);;PDF ЧЗ (*.pdf);;CSV (*.csv);;Текст (*.txt)",
+                _CODE_FILE_FILTER,
             )
         elif isinstance(path, str):
             paths = [path]
@@ -1044,7 +1049,7 @@ class SetsTab(QWidget):
         if not paths:
             return 0, 0, 0
 
-        if any(item.lower().endswith(".pdf") for item in paths):
+        if any(item.lower().endswith(".pdf") or image_codes.is_image(item) for item in paths):
             if self._busy or self._pending_submission():
                 self._tell("Дождитесь завершения текущей операции с набором", ToastKind.WARNING)
                 return 0, 0, 0
@@ -1053,8 +1058,8 @@ class SetsTab(QWidget):
             self.hint.setText("Читаем коды из файлов…")
             run_task(
                 _read_code_files, paths,
-                on_result=self._on_items_pdf_loaded,
-                on_error=self._on_pdf_error,
+                on_result=self._on_items_loaded,
+                on_error=self._on_code_file_error,
             )
             return 0, 0, 0
 
@@ -1070,7 +1075,7 @@ class SetsTab(QWidget):
             self._tell("В выбранном файле не найдено кодов вложений (КИ)", ToastKind.WARNING)
         return added, repeats, broken
 
-    def _on_items_pdf_loaded(self, text: str) -> None:
+    def _on_items_loaded(self, text: str) -> None:
         self._busy = False
         self.hint.clear()
         self.add_many(text)
@@ -2504,10 +2509,12 @@ def _look_up_names(
 
 
 def _read_code_files(paths: list[str]) -> str:
-    """Читает смешанный список PDF и CSV вне потока интерфейса."""
+    """Читает смешанный список файлов вне потока интерфейса."""
     chunks = []
     for path in paths:
-        if path.lower().endswith(".pdf"):
+        if image_codes.is_image(path):
+            chunks.append("\n".join(image_codes.read(path)))
+        elif path.lower().endswith(".pdf"):
             chunks.append("\n".join(pdf_codes.read(path)))
         else:
             chunks.append(codes_module.read_codes_file(path))

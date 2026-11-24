@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from pdfminer.high_level import extract_text
 
-from . import codes
+from . import codes, image_codes
 
 
 class PdfCodesProblem(ValueError):
@@ -75,10 +75,8 @@ def read_full(path: str) -> list[str]:
 
 def scan_full(path: str) -> FullScan:
     """Читает полные марки и возвращает частичный результат, если есть пропуски."""
-    from PySide6.QtCore import QSize, Qt
-    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtCore import QSize
     from PySide6.QtPdf import QPdfDocument
-    import zxingcpp
 
     document = QPdfDocument()
     if document.load(path) is not QPdfDocument.Error.None_:
@@ -97,25 +95,10 @@ def scan_full(path: str) -> FullScan:
         if image.isNull():
             pages_without_marks += 1
             continue
-        if image.hasAlphaChannel():
-            # У векторного PDF фон может быть прозрачным, а не белым.
-            painter = QPainter(image)
-            try:
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOver)
-                painter.fillRect(image.rect(), Qt.GlobalColor.white)
-            finally:
-                painter.end()
-        image = image.convertToFormat(QImage.Format.Format_Grayscale8)
-        view = zxingcpp.ImageView(image.constBits(), image.width(), image.height(),
-                                  zxingcpp.ImageFormat.Lum, image.bytesPerLine())
-        barcodes = zxingcpp.read_barcodes(view, formats=zxingcpp.BarcodeFormat.DataMatrix)
-        barcodes.sort(key=lambda barcode: (barcode.position.top_left.y, barcode.position.top_left.x))
         before = len(found)
-        for barcode in barcodes:
-            if barcode.bytes.isascii():
-                raw = barcode.bytes.decode("ascii")
-                if _with_crypto(codes.parse(raw)):
-                    found.append(raw)
+        for raw in image_codes.decode(image):
+            if _with_crypto(codes.parse(raw)):
+                found.append(raw)
         if len(found) == before:
             pages_without_marks += 1
 
