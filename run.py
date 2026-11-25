@@ -51,6 +51,8 @@ def selftest(argv: list[str]) -> int:
     ok &= _check_pdf(report)
     ok &= _check_pdf_labels(report)
     ok &= _check_mail(report)
+    if "__compiled__" in globals():
+        ok &= _check_native_build(report)
 
     report.append("РЕЗУЛЬТАТ: " + ("успешно" if ok else "есть ошибки"))
     text = "\n".join(report)
@@ -65,6 +67,24 @@ def selftest(argv: list[str]) -> int:
         except (OSError, ValueError):
             pass
     return 0 if ok else 1
+
+
+def _check_native_build(report: list[str]) -> bool:
+    """Проверяет зависимости запуска и пути в нативной onefile-сборке."""
+    from app import main  # noqa: F401 — импорты окна и входа должны загрузиться
+    from app.core import changelog, updater
+    from app.core.vpn import binary
+
+    exe = Path(updater.current_exe_path())
+    checks = {
+        "загрузчик обновлений": updater.is_frozen() and exe.is_file()
+        and exe.parent != Path(__file__).resolve().parent,
+        "история изменений": changelog.bundled_path().is_file(),
+        "компонент sing-box": binary.bundled_path() is not None,
+    }
+    for label, success in checks.items():
+        report.append(f"{label}: {'на месте' if success else 'ОШИБКА'}")
+    return all(checks.values())
 
 
 def _check_icons(report: list[str]) -> bool:

@@ -1,0 +1,4 @@
+# Nuitka поставляется исходным архивом, остальные зависимости — колёсами.
+-c requirements-build.txt
+nuitka[onefile]>=4.3.5,<4.4
+wheel

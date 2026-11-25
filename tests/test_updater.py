@@ -62,13 +62,13 @@ def test_verify_sha256_empty_expected_skips_check(tmp_path: Path) -> None:
     assert updater.verify_sha256(str(file_path), "")
 
 
-# --- подмена exe и очистка ---------------------------------------------------------
+# --- запуск установщика и очистка -------------------------------------------------
 
-def test_apply_update_renames_and_replaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_windows_update_opens_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     current = tmp_path / "RetailCore.exe"
     current.write_bytes("старая версия".encode("utf-8"))
-    new_exe = tmp_path / "downloaded.exe"
-    new_exe.write_bytes("новая версия".encode("utf-8"))
+    setup = tmp_path / "RetailCore-Setup.exe"
+    setup.write_bytes(b"installer")
 
     captured: dict[str, object] = {}
 
@@ -78,19 +78,17 @@ def test_apply_update_renames_and_replaces(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(updater, "is_macos", lambda: False)
+    monkeypatch.setenv("NUITKA_ONEFILE_PARENT", "42")
 
-    updater.apply_update(str(new_exe), current_path=str(current))
+    updater.apply_update(str(setup), current_path=str(current))
 
-    assert current.read_bytes() == "новая версия".encode("utf-8")
-    old_exe = tmp_path / "RetailCore.old.exe"
-    assert old_exe.read_bytes() == "старая версия".encode("utf-8")
-    assert captured["args"] == [str(current)]
-    # Новую версию нельзя запускать с окружением старой (см. child_environment).
-    assert captured["env"] is not None
-    assert not [name for name in captured["env"] if name.startswith(("_PYI", "_MEIPASS"))]
+    assert current.read_bytes() == "старая версия".encode("utf-8")
+    assert not (tmp_path / "RetailCore.old.exe").exists()
+    assert captured["args"] == [str(setup)]
+    assert "NUITKA_ONEFILE_PARENT" not in captured["env"]
 
 
-def test_child_environment_drops_pyinstaller_variables() -> None:
+def test_child_environment_drops_bootloader_variables() -> None:
     """Унаследованный _PYI_APPLICATION_HOME_DIR уводил новый процесс в чужую
     временную папку, которую старый удалял при выходе."""
     source = {
@@ -100,11 +98,24 @@ def test_child_environment_drops_pyinstaller_variables() -> None:
         "_PYI_ARCHIVE_FILE": "C:/App/RetailCore.exe",
         "_PYI_PARENT_PROCESS_LEVEL": "0",
         "_MEIPASS2": "C:/Temp/_MEI111162",
+        "NUITKA_ONEFILE_PARENT": "42",
+        "NUITKA_ONEFILE_DIRECTORY": "C:/App",
+        "NUITKA_ORIGINAL_ARGV0": "C:/App/RetailCore.exe",
     }
 
     result = updater.child_environment(source)
 
     assert result == {"PATH": "C:/Windows", "APPDATA": "C:/Users/u/AppData/Roaming"}
+
+
+def test_nuitka_updates_the_outer_exe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    current = tmp_path / "RetailCore.exe"
+    monkeypatch.setattr(updater, "__compiled__", object(), raising=False)
+    monkeypatch.setattr(updater.sys, "argv", [str(current)])
+    monkeypatch.setattr(updater.sys, "executable", str(tmp_path / "temp" / "python.exe"))
+
+    assert updater.is_frozen()
+    assert updater.current_exe_path() == str(current)
 
 
 def test_cleanup_leftover_removes_old_exe(tmp_path: Path) -> None:
@@ -133,7 +144,7 @@ def test_release_asset_per_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     assert updater.release_asset() == "RetailCore.dmg"
 
     monkeypatch.setattr(updater.sys, "platform", "win32")
-    assert updater.release_asset() == "RetailCore.exe"
+    assert updater.release_asset() == "RetailCore-Setup.exe"
 
 
 def test_manifest_hash_per_platform(monkeypatch: pytest.MonkeyPatch) -> None:

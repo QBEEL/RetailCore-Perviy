@@ -26,7 +26,7 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # ней же), установка молча срывалась на запуске чужого бинарника, а подмена к
 # тому моменту уже происходила — приложение оставалось сломанным.
 RELEASE_ASSETS = {"darwin": "RetailCore.dmg"}
-DEFAULT_ASSET = "RetailCore.exe"
+DEFAULT_ASSET = "RetailCore-Setup.exe"
 
 
 class ManualInstallRequired(Exception):
@@ -46,12 +46,7 @@ def release_asset() -> str:
 
 
 def manifest_hash(data: dict) -> str:
-    """Контрольная сумма файла для этой платформы.
-
-    Ключ `sha256` остался за сборкой для Windows: его читают уже выпущенные
-    версии, и переселить их на новый ключ нельзя — они перестали бы
-    обновляться вовсе. Для macOS рядом лежит свой.
-    """
+    """Контрольная сумма установщика Windows или образа macOS."""
     return str(data.get("sha256_macos" if is_macos() else "sha256", ""))
 
 
@@ -94,23 +89,23 @@ def verify_sha256(path: str, expected: str) -> bool:
 
 
 def is_frozen() -> bool:
-    return bool(getattr(sys, "frozen", False))
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
 def current_exe_path() -> str:
+    if "__compiled__" in globals():
+        # В onefile Nuitka argv[0] указывает на внешний загрузчик.
+        return os.path.abspath(sys.argv[0])
     return sys.executable
 
 
 def apply_update(downloaded_path: str, current_path: str | None = None) -> None:
-    """Ставит скачанное обновление и запускает новую версию.
-
-    Вызвавший процесс обязан завершиться сразу после (см. `update_dialog.py`):
-    обе платформы рассчитывают, что старая копия вот-вот уйдёт.
-    """
+    """Запускает установщик Windows или устанавливает образ macOS."""
     if is_macos():
         _install_macos(downloaded_path, current_path)
     else:
-        _install_windows(downloaded_path, current_path)
+        subprocess.Popen([downloaded_path], env=child_environment(), close_fds=True,
+                          creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
 
 
 def app_bundle(executable: str) -> str:
@@ -183,23 +178,6 @@ def _run(*command: str, check: bool = True) -> None:
                       f"{result.stderr.strip() or result.returncode}")
 
 
-def _install_windows(new_exe_path: str, current_path: str | None = None) -> None:
-    """Подменяет запущенный exe и перезапускает приложение под тем же именем.
-
-    Windows позволяет переименовать exe-файл работающего процесса (в отличие
-    от удаления), поэтому отдельный updater-процесс не нужен: переименовываем
-    старый файл, ставим новый на его место и запускаем.
-    """
-    current = current_path or current_exe_path()
-    old_path = _old_exe_path(current)
-    if os.path.exists(old_path):
-        os.remove(old_path)
-    os.rename(current, old_path)
-    os.replace(new_exe_path, current)
-    subprocess.Popen([current], env=restart_environment(), close_fds=True,
-                      creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
-
-
 # Копию, запущенную самообновлением, отличает эта переменная: старая ещё
 # работает, и единственный экземпляр (ui/single_instance.py) должен её дождаться,
 # а не решить, что программа уже запущена.
@@ -213,7 +191,7 @@ def restart_environment() -> dict[str, str]:
 
 
 def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
-    """Окружение для новой версии — без служебных переменных PyInstaller.
+    """Окружение для новой версии без служебных переменных загрузчика.
 
     Onefile-сборка держит распакованные файлы во временной папке и сообщает
     её путь через `_PYI_APPLICATION_HOME_DIR`. Унаследовав эту переменную,
@@ -222,7 +200,9 @@ def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
     первом обращении к файлу ресурсов.
     """
     environment = dict(os.environ if source is None else source)
-    for name in [n for n in environment if n.startswith(("_PYI", "_MEIPASS"))]:
+    for name in [n for n in environment
+                 if n.startswith(("_PYI", "_MEIPASS", "NUITKA_ONEFILE_"))
+                 or n == "NUITKA_ORIGINAL_ARGV0"]:
         del environment[name]
     return environment
 

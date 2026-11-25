@@ -31,7 +31,9 @@ def installed_path() -> str:
 
 def bundled_path() -> Path | None:
     """Файл в сборке или, при запуске из исходников, в vendor/sing-box."""
-    if getattr(sys, "frozen", False):
+    if "__compiled__" in globals():
+        candidate = Path(__file__).resolve().parents[3] / BUNDLE_DIR / "sing-box.bin"
+    elif getattr(sys, "frozen", False):
         candidate = Path(getattr(sys, "_MEIPASS", "")) / BUNDLE_DIR / EXE_NAME
     else:
         candidate = Path(__file__).resolve().parents[3] / "vendor" / "sing-box" / EXE_NAME

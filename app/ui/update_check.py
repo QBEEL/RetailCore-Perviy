@@ -149,11 +149,14 @@ class UpdateChecker(QObject):
         if not updater.is_https(manifest.exe_url):
             self.failed.emit("Ссылка на файл обновления не по HTTPS")
             return
-        directory = Path(tempfile.gettempdir()) / "RetailCore" / "update"
-        directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / updater.release_asset()
-        self._download_file = open(destination, "wb")
-        self._download_path = str(destination)
+        try:
+            directory = Path(tempfile.gettempdir()) / "RetailCore" / "update"
+            directory.mkdir(parents=True, exist_ok=True)
+            self._download_file = (directory / updater.release_asset()).open("wb")
+        except OSError as error:
+            self.failed.emit(f"Не удалось создать файл обновления: {error}")
+            return
+        self._download_path = self._download_file.name
         self._download_manifest = manifest
 
         request = QNetworkRequest(QUrl(manifest.exe_url))

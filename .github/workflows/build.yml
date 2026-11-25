@@ -24,8 +24,6 @@ jobs:
   tests:
     if: github.ref != 'refs/tags/v3.15.13' && github.ref != 'refs/tags/v3.15.15' && github.ref != 'refs/tags/v3.15.17'
     uses: ./.github/workflows/tests.yml
-    with:
-      skip_client_matrix: true
 
   # ─────────────────────────────── Windows ────────────────────────────────
   build-windows:
@@ -41,7 +39,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: requirements-build.txt
+          cache-dependency-path: |
+            requirements-build.txt
+            requirements-windows-build.txt
 
       # Тег и версия в коде обязаны совпадать. Иначе клиент 3.2.1 увидит релиз
       # 3.3.0, скачает exe, который внутри всё ещё 3.2.1, и предложит
@@ -59,43 +59,57 @@ jobs:
           fi
 
       - name: Install dependencies
+        env:
+          PYTHONUTF8: '1'
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r requirements-build.txt
+          python -m pip install --require-hashes --no-build-isolation --only-binary=:all: --no-binary=nuitka -r requirements-windows-build.txt
 
       # Версия и сумма sing-box закреплены в самом скрипте: файл запускается
       # на машинах сотрудников, и подменить его при сборке нельзя.
       - name: Fetch sing-box
         run: python tools/fetch_singbox.py
 
-      - name: Build .exe
-        run: pyinstaller RetailCore.spec --noconfirm
-
-      - name: Verify build
+      - name: Fetch NSIS
         run: |
-          $exe = "dist\RetailCore.exe"
-          if (!(Test-Path $exe)) { throw "Build failed: $exe not found" }
-          $size = (Get-Item $exe).Length / 1MB
-          Write-Host "RetailCore.exe: $([math]::Round($size, 1)) MB"
+          $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+          curl.exe -fLsS --retry 3 --max-time 90 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip' -o $archive
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS download failed' }
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1') {
+            throw 'NSIS SHA-256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP
+          "RETAILCORE_MAKENSIS=$env:RUNNER_TEMP\nsis-3.11\makensis.exe" >> $env:GITHUB_ENV
 
-      - name: Smoke test packaged application
-        if: github.ref != 'refs/tags/v3.15.13' && github.ref != 'refs/tags/v3.15.15' && github.ref != 'refs/tags/v3.15.17'
+      - name: Build and verify Windows EXE and installer
+        env:
+          PYTHONUTF8: '1'
+        run: python tools/build_windows.py --makensis "$env:RETAILCORE_MAKENSIS"
+
+      - name: Smoke test installer
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          # GUI-приложение PowerShell запускает без ожидания завершения.
-          $process = Start-Process -FilePath (Resolve-Path .\dist\RetailCore.exe).Path `
-            -ArgumentList '--selftest' -WorkingDirectory (Get-Location).Path `
-            -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Packaged application selftest failed" }
-          $report = Get-Content selftest.log -Raw -Encoding utf8
-          if ($report -notmatch "этикетки PDF: QtPdf на месте" -or
-              $report -notmatch "РЕЗУЛЬТАТ: успешно") { throw "Packaged QtPdf check failed: $report" }
+          $install = Join-Path $env:RUNNER_TEMP 'RetailCore custom install'
+          $setup = Start-Process -FilePath .\dist\RetailCore-Setup.exe -ArgumentList "/S /D=$install" -Wait -PassThru -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw 'RetailCore installation failed' }
+          $expected = (Get-FileHash .\dist\RetailCore.exe).Hash
+          $installed = Join-Path $install 'RetailCore.exe'
+          if ((Get-FileHash -LiteralPath $installed).Hash -ne $expected) {
+            throw 'Installed executable differs from the build'
+          }
+          $process = Start-Process -FilePath $installed -ArgumentList '--selftest' -WorkingDirectory $env:RUNNER_TEMP -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw 'Installed application selftest failed' }
+          $uninstall = Start-Process -FilePath (Join-Path $install 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+          if ($uninstall.ExitCode -ne 0 -or (Test-Path -LiteralPath $installed)) {
+            throw 'RetailCore uninstall failed'
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RetailCore-Windows
-          path: dist/RetailCore.exe
+          path: dist/RetailCore-Setup.exe
           retention-days: 1
 
   # ─────────────────────────────── macOS ──────────────────────────────────
@@ -214,15 +228,13 @@ jobs:
       - name: Build version.json
         run: |
           python tools/make_version_json.py \
-            artifacts/RetailCore.exe CHANGELOG.md artifacts/version.json \
+            artifacts/RetailCore-Setup.exe CHANGELOG.md artifacts/version.json \
             artifacts/RetailCore.dmg
 
-      # Без version.json проверка обновлений у клиента обрывается на KeyError и
-      # показывает «Неожиданный ответ GitHub» — релиз с двумя файлами вместо
-      # трёх выглядит целым, но оставляет всех на старой версии.
+      # Без version.json клиенты не смогут проверить и скачать обновление.
       - name: Verify release assets
         run: |
-          for name in RetailCore.exe RetailCore.dmg version.json; do
+          for name in RetailCore-Setup.exe RetailCore.dmg version.json; do
             test -f "artifacts/$name" || { echo "::error::Нет файла $name"; exit 1; }
           done
           # Обе суммы обязательны: без своей платформа отклоняет скачанное как
@@ -231,7 +243,7 @@ jobs:
           import hashlib, json, pathlib, sys
           manifest = json.loads(pathlib.Path("artifacts/version.json").read_text("utf-8"))
           print("версия в манифесте:", manifest["version"])
-          for key, name in (("sha256", "RetailCore.exe"), ("sha256_macos", "RetailCore.dmg")):
+          for key, name in (("sha256", "RetailCore-Setup.exe"), ("sha256_macos", "RetailCore.dmg")):
               actual = hashlib.sha256(pathlib.Path("artifacts", name).read_bytes()).hexdigest()
               if manifest.get(key, "").lower() != actual:
                   print(f"::error::{key} не совпадает с {name}")
@@ -246,8 +258,10 @@ jobs:
         with:
           name: RetailCore ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          body: |
+            Windows. Скачайте и запустите RetailCore-Setup.exe. Для перехода с версии 3.15.18 или старше установщик нужно запустить вручную один раз. Настройки и данные сохраняются.
           files: |
-            artifacts/RetailCore.exe
+            artifacts/RetailCore-Setup.exe
             artifacts/RetailCore.dmg
             artifacts/version.json
 
@@ -262,8 +276,11 @@ jobs:
           token: ${{ secrets.RELEASES_TOKEN }}
           tag_name: ${{ steps.version.outputs.tag }}
           name: RetailCore ${{ steps.version.outputs.tag }}
-          body: RetailCore ${{ steps.version.outputs.tag }}
+          body: |
+            RetailCore ${{ steps.version.outputs.tag }}
+
+            Windows. Скачайте и запустите RetailCore-Setup.exe. Для перехода с версии 3.15.18 или старше установщик нужно запустить вручную один раз. Настройки и данные сохраняются.
           files: |
-            artifacts/RetailCore.exe
+            artifacts/RetailCore-Setup.exe
             artifacts/RetailCore.dmg
             artifacts/version.json

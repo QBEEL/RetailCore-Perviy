@@ -13,6 +13,7 @@
 |---|---|
 | Запуск клиента | `requirements.txt` |
 | Сборка клиента, включая PyInstaller | `requirements-build.txt` |
+| Дополнительно для сборки Windows через Nuitka | `requirements-windows-build.txt` |
 | Тесты клиента и сервера | `requirements-test.txt` |
 | Серверный контейнер | `server/api/requirements.txt` |
 
@@ -27,6 +28,9 @@ python -m pytest tests -q -ra
 Для сборки установите `requirements-build.txt` той же командой. CI и Docker
 используют эти файлы с проверкой хешей. `--only-binary=:all:` запрещает незаметно
 собирать зависимость из исходников с незакреплёнными инструментами сборки.
+Nuitka поставляется исходным архивом. Для него Windows-сборка разрешает
+этот формат отдельно, проверяет SHA-256 и использует установленный
+setuptools из `requirements-build.txt`.
 
 ## Обновление
 
@@ -42,6 +46,7 @@ python -m pytest tests -q -ra
 uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes --no-annotate -o requirements.txt
 uv pip compile server/api/requirements.in --universal --python-version 3.12 --generate-hashes --no-annotate -o server/api/requirements.txt
 uv pip compile requirements-build.in --universal --python-version 3.12 --generate-hashes --no-annotate -o requirements-build.txt
+uv pip compile requirements-windows-build.in --universal --python-version 3.12 --generate-hashes --no-annotate -o requirements-windows-build.txt
 uv pip compile requirements-test.in --universal --python-version 3.12 --generate-hashes --no-annotate -o requirements-test.txt
 ```
 

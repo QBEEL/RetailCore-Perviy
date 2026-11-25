@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -31,7 +32,9 @@ from app.ui import update_check  # noqa: E402
 from app.ui.update_check import UpdateChecker  # noqa: E402
 
 NEWER = "99.0.0"
-MANIFEST = {"changelog": ["Новое"], "sha256": "ab" * 32, "mandatory": False}
+INSTALLER = b"synthetic installer"
+MANIFEST = {"changelog": ["Новое"], "sha256": hashlib.sha256(INSTALLER).hexdigest(),
+            "mandatory": False}
 
 
 class FakeGithub:
@@ -60,6 +63,8 @@ class FakeGithub:
                         self._send(200, b"<html>no redirect</html>")
                 elif self.path == f"/releases/download/v{NEWER}/version.json":
                     self._send(outer.manifest_status, json.dumps(MANIFEST).encode())
+                elif self.path == f"/releases/download/v{NEWER}/RetailCore-Setup.exe":
+                    self._send(200, INSTALLER)
                 elif self.path == "/api/latest":
                     if outer.api == 200:
                         asset = updater.release_asset()
@@ -144,6 +149,25 @@ def test_version_is_found_without_touching_the_api(application, github) -> None:
     assert manifest.exe_url == (
         f"{github.base}/releases/download/v{NEWER}/{updater.release_asset()}")
     assert "/api/latest" not in github.requests, "лимит API не расходуется"
+
+
+def test_windows_download_verifies_and_returns_installer(application, github, tmp_path, monkeypatch):
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(update_check.tempfile, "gettempdir", lambda: str(tmp_path))
+    checker = UpdateChecker()
+    manifest = _run(application, checker)["found"]
+    ready = []
+    checker.ready.connect(ready.append)
+    checker.download(manifest)
+
+    end = time.monotonic() + 8
+    while not ready and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    assert ready
+    installer = Path(ready[0])
+    assert installer.name == "RetailCore-Setup.exe"
+    assert installer.read_bytes() == INSTALLER
 
 
 def test_rate_limited_api_does_not_matter_when_redirect_works(application, github) -> None:

@@ -231,12 +231,14 @@ class UpdateDialog(QWidget):
         self._reset_buttons()
         self._icon.setPixmap(icons.icon("check", Palette.SUCCESS).pixmap(28, 28))
         self._title.setText(f"Версия {self._manifest.version} готова к установке")
-        self._message.setText("Приложение перезапустится с новой версией.")
+        on_mac = updater.is_macos()
+        self._message.setText("Приложение перезапустится с новой версией." if on_mac
+                              else "RetailCore закроется. Завершите обновление в установщике.")
         # При автозагрузке это окно — первое, что человек видит об обновлении,
         # и без списка изменений оно сводилось к голому «перезапустите».
         self._show_changelog(self._manifest.changelog)
         self._progress.setVisible(False)
-        self._primary.setText("Перезапустить сейчас")
+        self._primary.setText("Перезапустить сейчас" if on_mac else "Открыть установщик")
         self._primary.setVisible(True)
         self._wire(self._primary, self._restart)
 
@@ -308,7 +310,7 @@ class UpdateDialog(QWidget):
                              "Обновление не установилось")
             self.show()
             return
-        updater.log_event("Update successful")
+        updater.log_event("Update successful" if updater.is_macos() else "Update installer started")
         self._quit_for_update()
 
     def _quit_for_update(self) -> None:

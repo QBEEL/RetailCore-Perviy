@@ -24,8 +24,9 @@ RetailCore создан для того, чтобы сократить врем�
 
 ## Запуск
 
-**Готовое приложение:** `dist\RetailCore.exe` — один файл, Python и
-библиотеки не нужны. Скопируйте его куда угодно и запускайте двойным кликом.
+**Готовое приложение:** `RetailCore-Setup.exe` позволяет выбрать папку установки,
+добавляет ярлык в меню «Пуск» и регистрирует удаление в настройках Windows. `RetailCore.exe`
+также можно запускать напрямую. Для обоих вариантов Python устанавливать не нужно.
 
 **Из исходников:** двойной клик по `start.bat`. При первом запуске создаётся
 окружение `.venv` и устанавливаются зависимости (несколько минут). Ручной
@@ -33,11 +34,17 @@ RetailCore создан для того, чтобы сократить врем�
 
 ## Сборка
 
+```powershell
+python -m pip install --require-hashes --only-binary=:all: -r requirements-build.txt
+python -m pip install --require-hashes --no-build-isolation --only-binary=:all: --no-binary=nuitka -r requirements-windows-build.txt
+python tools/fetch_singbox.py
+python tools/build_windows.py --makensis "C:\Program Files (x86)\NSIS\makensis.exe"
 ```
-.venv\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r requirements-build.txt
-.venv\Scripts\python.exe tools\make_icon.py                 # иконка из app.svg
-.venv\Scripts\pyinstaller.exe RetailCore.spec --noconfirm --clean
-```
+
+Для сборки используются Python 3.12, Nuitka, MSVC с компонентами C++ и
+NSIS 3. С флагом `--mingw64` Nuitka использует MinGW64. В `dist`
+появятся `RetailCore-Setup.exe` для публикации и `RetailCore.exe` для
+локальной самопроверки. Сборка macOS использует `RetailCore.macos.spec`.
 
 Проверка собранного файла без открытия окна — отчёт пишется в указанный файл:
 
@@ -45,7 +52,7 @@ RetailCore создан для того, чтобы сократить врем�
 "dist\RetailCore.exe" --selftest каталог.xlsx цель.xlsx отчёт.txt
 ```
 
-Версии библиотек и PyInstaller закреплены вместе с контрольными суммами.
+Версии сборочных зависимостей закреплены вместе с контрольными суммами.
 Порядок обновления зависимостей описан в [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ## Возможности
@@ -2053,7 +2060,7 @@ v4, прежняя карточка v3 остаётся запасным спо�
 изменений); журнал — `%APPDATA%\RetailCore\update.log`.
 
 Номер последней версии программа узнаёт без API GitHub: `releases/latest` на
-github.com перенаправляет на тег последнего релиза, а `version.json` и exe лежат
+github.com перенаправляет на тег последнего релиза, а `version.json` и установщик лежат
 по адресам с этим тегом. У API без токена лимит 60 запросов в час с одного IP, и
 офис за общим адресом (или общий VPN) упирался в него — менеджеры видели «Не удалось
 проверить обновления … status code 403». API остаётся запасным путём, если
@@ -2075,10 +2082,10 @@ github.com перенаправляет на тег последнего рел�
 
 1. В [app/__init__.py](app/__init__.py) поднимите `__version__` (semver:
    `MAJOR.MINOR.PATCH`).
-2. Соберите exe: `.venv\Scripts\pyinstaller.exe RetailCore.spec --noconfirm --clean`.
+2. Соберите `RetailCore.exe` и `RetailCore-Setup.exe` по инструкции из раздела «Сборка».
 3. Посчитайте контрольную сумму:
    ```
-   certutil -hashfile "dist\RetailCore.exe" SHA256
+   certutil -hashfile "dist\RetailCore-Setup.exe" SHA256
    ```
 4. Создайте `version.json` (не путать с `__version__` в коде — это отдельный
    файл, который публикуется только на GitHub, в репозитории его нет):
@@ -2092,8 +2099,8 @@ github.com перенаправляет на тег последнего рел�
    `mandatory: true` не даёт пропустить версию или отложить обновление —
    используйте только для критичных исправлений.
 5. На GitHub: **Releases → Draft a new release**, тег `vX.Y.Z` (например,
-   `v2.4.0`, обязательно с `v`), к релизу приложите два файла:
-   `RetailCore.exe` и `version.json`. Заголовок и описание релиза —
+   `v2.4.0`, обязательно с `v`), к релизу Windows приложите
+   `RetailCore-Setup.exe` и `version.json`. Заголовок и описание релиза —
    произвольные, приложение их не читает (текст «Что нового» берётся из
    `changelog` в `version.json`).
 6. Опубликуйте релиз. Проверьте на тестовой машине со старой версией: при
