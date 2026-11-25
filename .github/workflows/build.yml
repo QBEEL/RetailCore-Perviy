@@ -82,9 +82,11 @@ jobs:
           "RETAILCORE_MAKENSIS=$env:RUNNER_TEMP\nsis-3.11\makensis.exe" >> $env:GITHUB_ENV
 
       - name: Build and verify Windows EXE and installer
+        timeout-minutes: 40
         env:
           PYTHONUTF8: '1'
-        run: python tools/build_windows.py --makensis "$env:RETAILCORE_MAKENSIS"
+          PYTHONUNBUFFERED: '1'
+        run: python tools/build_windows.py --makensis "$env:RETAILCORE_MAKENSIS" --mingw64 --show-scons
 
       - name: Smoke test installer
         env:

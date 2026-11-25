@@ -34,6 +34,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--makensis", required=True, type=Path, help="Путь к makensis.exe")
     parser.add_argument("--mingw64", action="store_true", help="Использовать MinGW64 вместо MSVC")
+    parser.add_argument("--show-scons", action="store_true", help="Выводить команды компилятора C")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     makensis = args.makensis.resolve(strict=True)
@@ -50,9 +51,12 @@ def main() -> None:
         # Nuitka исключает EXE из файлов данных; файл с пометкой .bin будет
         # распакован как ресурс и скопирован приложением под исходным именем.
         report = stage / "compilation.xml"
+        compiler = ["--mingw64" if args.mingw64 else "--msvc=latest"]
+        if args.show_scons:
+            compiler.append("--show-scons")
         subprocess.run([
             sys.executable, "-m", "nuitka", "--mode=onefile",
-            "--mingw64" if args.mingw64 else "--msvc=latest",
+            *compiler,
             "--assume-yes-for-downloads",
             "--enable-plugin=pyside6",
             "--include-qt-plugins=multimedia",
