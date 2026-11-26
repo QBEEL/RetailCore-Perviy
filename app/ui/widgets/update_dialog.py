@@ -38,7 +38,7 @@ class UpdateDialog(QWidget):
         checker.error.connect(self._on_error)
         checker.progress.connect(self._on_progress)
         checker.ready.connect(self._on_ready)
-        checker.failed.connect(self._on_error)
+        checker.failed.connect(self._on_download_failed)
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -54,6 +54,8 @@ class UpdateDialog(QWidget):
         root.addLayout(head)
 
         self._message = Hint("", self)
+        self._message.setTextFormat(Qt.TextFormat.PlainText)
+        self._message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self._message)
 
         self._changelog = QLabel("", self)
@@ -126,13 +128,13 @@ class UpdateDialog(QWidget):
             self.show()
 
     def _on_error(self, message: str) -> None:
-        if self._manifest is not None:
-            # Фоновая автозагрузка не удалась — оставляем обычное предложение
-            # обновиться вручную вместо голой ошибки без выхода.
-            self._show_available(self._manifest, extra_hint=message)
-            self.show()
-        elif not self._respect_snooze:
+        if not self._respect_snooze:
             self._show_error(message)
+            self.show()
+
+    def _on_download_failed(self, message: str) -> None:
+        if self._manifest is not None:
+            self._show_available(self._manifest, extra_hint=message)
             self.show()
 
     def _on_progress(self, percent: int) -> None:
@@ -210,13 +212,19 @@ class UpdateDialog(QWidget):
         self._reset_buttons()
         self._icon.setPixmap(icons.icon("update", Palette.PRIMARY).pixmap(28, 28))
         self._title.setText(f"Доступна новая версия {manifest.version}")
-        self._message.setText(extra_hint or "Обновить сейчас?")
+        open_in_browser = bool(extra_hint) or not updater.is_frozen()
+        hint = "Скачайте обновление со страницы релиза." if open_in_browser else "Обновить сейчас?"
+        self._message.setText(f"{extra_hint}\n\n{hint}" if extra_hint else hint)
         self._show_changelog(manifest.changelog)
         self._progress.setVisible(False)
 
-        self._primary.setText("Обновить")
         self._primary.setVisible(True)
-        self._wire(self._primary, lambda: self._start_update(manifest))
+        if open_in_browser:
+            self._primary.setText("Открыть GitHub")
+            self._wire(self._primary, lambda: self._open_release(manifest))
+        else:
+            self._primary.setText("Обновить")
+            self._wire(self._primary, lambda: self._start_update(manifest))
 
         if not manifest.mandatory:
             self._secondary.setText("Напомнить позже")
@@ -263,12 +271,15 @@ class UpdateDialog(QWidget):
 
     # --- действия -------------------------------------------------------------
 
-    def _start_update(self, manifest: updater.ReleaseManifest) -> None:
-        if not updater.is_frozen():
-            # Из исходников подменять нечего — открываем страницу релиза.
-            QDesktopServices.openUrl(QUrl(_RELEASES_PAGE))
+    def _open_release(self, manifest: updater.ReleaseManifest) -> None:
+        url = manifest.release_url or _RELEASES_PAGE
+        if QDesktopServices.openUrl(QUrl(url)):
             self.close()
-            return
+        else:
+            self._message.setText(f"Не удалось открыть браузер. Скопируйте ссылку:\n{url}")
+            self.adjustSize()
+
+    def _start_update(self, manifest: updater.ReleaseManifest) -> None:
         self._show_checking(f"Загружается версия {manifest.version}…")
         self._animation.set_version(manifest.version)
         self._set_animation(True)

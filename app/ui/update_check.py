@@ -69,7 +69,7 @@ class UpdateChecker(QObject):
             exe_url = f"{_RELEASES_URL}/download/{tag}/{updater.release_asset()}"
             manifest_url = f"{_RELEASES_URL}/download/{tag}/{_MANIFEST_ASSET}"
             if updater.is_https(exe_url) and updater.is_https(manifest_url):
-                self._fetch_manifest(tag.lstrip("vV"), exe_url, manifest_url)
+                self._fetch_manifest(tag, exe_url, manifest_url)
                 return
         updater.log_event(
             f"Latest release not found by redirect ({reply.errorString()}), asking the API")
@@ -96,7 +96,7 @@ class UpdateChecker(QObject):
             # Windows, которую здесь скачивали до версии 3.3.1.
             exe_url = assets[updater.release_asset()]
             manifest_url = assets[_MANIFEST_ASSET]
-            version = str(data["tag_name"]).lstrip("vV")
+            tag = str(data["tag_name"])
         except (KeyError, ValueError, TypeError) as exc:
             message = f"Неожиданный ответ GitHub при проверке обновлений: {exc}"
             updater.log_event(message)
@@ -107,15 +107,15 @@ class UpdateChecker(QObject):
             updater.log_event(message)
             self.error.emit(message)
             return
-        self._fetch_manifest(version, exe_url, manifest_url)
+        self._fetch_manifest(tag, exe_url, manifest_url)
 
-    def _fetch_manifest(self, version: str, exe_url: str, manifest_url: str) -> None:
+    def _fetch_manifest(self, tag: str, exe_url: str, manifest_url: str) -> None:
         request = QNetworkRequest(QUrl(manifest_url))
         request.setRawHeader(b"User-Agent", _USER_AGENT)
         reply = self._net.get(request)
-        reply.finished.connect(lambda: self._on_manifest(reply, version, exe_url))
+        reply.finished.connect(lambda: self._on_manifest(reply, tag, exe_url))
 
-    def _on_manifest(self, reply: QNetworkReply, version: str, exe_url: str) -> None:
+    def _on_manifest(self, reply: QNetworkReply, tag: str, exe_url: str) -> None:
         reply.deleteLater()
         if reply.error() != QNetworkReply.NetworkError.NoError:
             message = f"Не удалось загрузить описание релиза: {reply.errorString()}"
@@ -125,11 +125,12 @@ class UpdateChecker(QObject):
         try:
             data = json.loads(bytes(reply.readAll()).decode("utf-8"))
             manifest = updater.ReleaseManifest(
-                version=version,
+                version=tag.lstrip("vV"),
                 exe_url=exe_url,
                 mandatory=bool(data.get("mandatory", False)),
                 sha256=updater.manifest_hash(data),
                 changelog=[str(item) for item in data.get("changelog", [])],
+                release_url=f"{_RELEASES_URL}/tag/{tag}",
             )
         except (ValueError, TypeError) as exc:
             message = f"Неожиданный формат version.json: {exc}"

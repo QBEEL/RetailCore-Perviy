@@ -333,10 +333,49 @@ def test_анимация_обновления_только_на_время_за
     assert dialog._animation.version == "9.9.9"
     assert dialog._animation._timer.isActive()
 
-    dialog._on_error("сеть пропала")
+    dialog.checker.failed.emit("сеть пропала")
     assert dialog._animation.isHidden(), "после ошибки анимация не нужна"
     assert not dialog._animation.is_playing
     assert not dialog._animation._timer.isActive()
+
+
+@pytest.mark.parametrize("frozen, browser_opened", [(False, True), (True, True), (True, False)])
+def test_ручное_обновление_открывает_страницу_релиза(application, monkeypatch, frozen, browser_opened):
+    from app.core import updater
+    from app.ui.update_check import UpdateChecker
+    from app.ui.widgets import update_dialog as module
+
+    monkeypatch.setattr(updater, "is_frozen", lambda: frozen)
+    requested_urls = []
+
+    def open_url(url):
+        requested_urls.append(url.toString())
+        return browser_opened
+
+    monkeypatch.setattr(module.QDesktopServices, "openUrl", open_url)
+    checker = UpdateChecker()
+    dialog = module.UpdateDialog(AppSettings(update_download_auto=False), checker)
+    url = "https://github.com/QBEEL/RetailCore-Releases/releases/tag/v3.15.20"
+    manifest = updater.ReleaseManifest("3.15.20", f"{url}/installer", release_url=url)
+
+    def fail_download(release):
+        assert release is manifest
+        checker.failed.emit("Загрузка прервалась")
+
+    monkeypatch.setattr(checker, "download", fail_download)
+    checker.found.emit(manifest)
+    if frozen:
+        assert dialog._primary.text() == "Обновить"
+        dialog._primary.click()
+        assert "Загрузка прервалась" in dialog._message.text()
+
+    assert dialog._primary.text() == "Открыть GitHub"
+    dialog._primary.click()
+    assert requested_urls == [url]
+    assert dialog.isVisible() is not browser_opened
+    if not browser_opened:
+        assert url in dialog._message.text()
+    dialog.close()
 
 
 def test_анимация_и_при_автозагрузке(application, monkeypatch):

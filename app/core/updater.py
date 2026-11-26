@@ -59,6 +59,7 @@ class ReleaseManifest:
     mandatory: bool = False
     sha256: str = ""
     changelog: list[str] = field(default_factory=list)
+    release_url: str = ""
 
 
 def parse_version(text: str) -> tuple[int, int, int]:

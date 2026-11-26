@@ -148,6 +148,7 @@ def test_version_is_found_without_touching_the_api(application, github) -> None:
     assert manifest.sha256 == updater.manifest_hash(MANIFEST)
     assert manifest.exe_url == (
         f"{github.base}/releases/download/v{NEWER}/{updater.release_asset()}")
+    assert manifest.release_url == f"{github.base}/releases/tag/v{NEWER}"
     assert "/api/latest" not in github.requests, "лимит API не расходуется"
 
 
@@ -185,6 +186,7 @@ def test_falls_back_to_api_when_redirect_is_missing(application, github) -> None
     outcome = _run(application, UpdateChecker())
 
     assert outcome["found"].version == NEWER
+    assert outcome["found"].release_url == f"{github.base}/releases/tag/v{NEWER}"
     assert "/api/latest" in github.requests
 
 
