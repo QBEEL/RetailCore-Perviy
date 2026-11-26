@@ -116,6 +116,7 @@ from .widgets.marking_dialogs import (
 from .widgets.toast import ToastKind
 from .widgets.sale_tab import SaleTab
 from .widgets.sets_tab import SetsTab
+from .widgets.marking_packages import PackagesDialog
 from .widgets.marking_catalog import MarkingCatalogTab
 from .widgets.withdrawal_tab import WithdrawalTab
 
@@ -2882,14 +2883,29 @@ class MarkingPage(QWidget):
             "ключа проверки — «сомнительный товар». Отсканируйте код с товара в "
             "поле кодов и проверьте заново — тогда его можно напечатать"))
         dialog.exec()
+        if not dialog.action:
+            return
         if dialog.action == CodeInfoDialog.PRINT:
             self._print_code(info, full)
         elif dialog.action == CodeInfoDialog.REMARK:
             self._remark_code(info)
         elif dialog.action == CodeInfoDialog.WITHDRAW:
             self._withdraw_code(info)
-        elif dialog.action and dialog.action == CodeInfoDialog.TECHNICAL_CARD:
+        elif dialog.action == CodeInfoDialog.TECHNICAL_CARD:
             self._technical_card(info)
+        elif dialog.action == CodeInfoDialog.PACKAGE:
+            self._show_code_package(info.code)
+
+    def _show_code_package(self, code: str) -> None:
+        current = service.current()
+        if (not service.signed_in() or current.contour is not self.contour
+                or self._result_contour is not self.contour):
+            self.notify("Войдите в ЧЗ и проверьте код в выбранном контуре.", ToastKind.WARNING)
+            return
+        dialog = PackagesDialog((code,), self.contour, current.inn, current.thumbprint, self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.journal_changed.connect(self.reload_journal)
+        dialog.open()
 
     def _technical_card(self, info: CodeInfo) -> None:
         if self.marking_catalog_tab.busy or self._busy:

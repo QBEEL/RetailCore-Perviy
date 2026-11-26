@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.marking import introduce, reaggregation, service, store
-from app.core.marking.models import CodeInfo, CodeState, Contour, OperationStatus
+from app.core.marking.models import CodeInfo, CodeState, Contour, OperationKind, OperationStatus
 
 BOX = "TEST-BOX-01"
 ITEM = "010460700123001421REMOVEME"
@@ -98,3 +98,71 @@ def test_check_exact_sends_parent_without_normalizing(monkeypatch):
     monkeypatch.setattr(service, "_ask", lambda batch, _: asked.extend(batch) or [])
     service.check_exact((raw_parent,), CONTOUR)
     assert asked == [raw_parent]
+
+
+def test_locate_uses_current_parent_and_ignores_a_previous_link(fresh):
+    fresh[BOX] = replace(fresh[BOX], package_type="SET", product_name="Тестовый набор")
+    groups, packages, unknown = reaggregation.locate((ITEM,), INN, "test", CONTOUR)
+    assert groups == {BOX: [ITEM]}
+    assert packages[BOX].children == (ITEM, LEFT)
+    assert not unknown
+
+    fresh[ITEM] = replace(fresh[ITEM], raw={})
+    assert reaggregation.locate((ITEM,), INN, "test", CONTOUR) == ({}, {}, ())
+
+
+def test_disband_is_signed_once_and_pending_status_is_refreshed(fresh, monkeypatch):
+    parent = replace(fresh[BOX], package_type="SET")
+    fresh[BOX] = parent
+    submissions = []
+
+    def submit(document, thumbprint, group, contour, *, on_created):
+        submissions.append((json.loads(document.render()), document.wire_type(group), thumbprint, contour))
+        on_created("test-disband")
+        return introduce.Sent("test-disband", introduce.DocStatus("IN_PROGRESS"))
+
+    monkeypatch.setattr(introduce, "send", submit)
+    operation = reaggregation.disband(BOX, (ITEM,), parent, INN, "test", CONTOUR)
+    assert operation.kind is OperationKind.DISAGGREGATION
+    assert operation.status is OperationStatus.SENT
+    assert service.can_refresh(operation)
+    with pytest.raises(ValueError, match="незавершённое расформирование"):
+        reaggregation.disband(BOX, (LEFT,), parent, INN, "test", CONTOUR)
+    assert submissions == [({"participant_inn": INN, "products_list": [{"uitu": BOX}]},
+                            "DISAGGREGATION_DOCUMENT", "test", CONTOUR)]
+
+    polled = []
+
+    def status(doc_id, group, contour):
+        polled.append((doc_id, group, contour))
+        return introduce.DocStatus("CHECKED_OK")
+
+    monkeypatch.setattr(introduce, "status", status)
+    updated, = service.refresh_pending()
+    assert updated.status is OperationStatus.DONE
+    assert polled == [("test-disband", "chemistry", CONTOUR)]
+    assert len(submissions) == 1
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"owner_inn": "1111111111"}, "принадлежит вашей организации"),
+    ({"state": CodeState.DISAGGREGATED}, "уже расформирован"),
+    ({"package_type": "LEVEL1"}, "относится к набору"),
+    ({"children": (ITEM,)}, "Состав или товарная группа набора изменились"),
+    ({"raw": {"cisInfo": {"parent": "TEST-OUTER"}}}, "вложен в другую упаковку"),
+])
+def test_disband_rejects_an_ineligible_or_changed_parent(fresh, change, message):
+    parent = replace(fresh[BOX], package_type="SET")
+    fresh[BOX] = replace(parent, **change)
+    with pytest.raises(ValueError, match=message):
+        reaggregation.disband(BOX, (ITEM,), parent, INN, "test", CONTOUR)
+    assert not store.pending()
+
+
+def test_disband_rejects_a_changed_member_link(fresh):
+    parent = replace(fresh[BOX], package_type="LEVEL1", raw={"cisInfo": {"generalPackageType": "SET"}})
+    fresh[BOX] = parent
+    fresh[ITEM] = replace(fresh[ITEM], raw={"cisInfo": {"parent": "TEST-OTHER"}})
+    with pytest.raises(ValueError, match="Привязка проверяемого кода изменилась"):
+        reaggregation.disband(BOX, (ITEM,), parent, INN, "test", CONTOUR)
+    assert not store.pending()

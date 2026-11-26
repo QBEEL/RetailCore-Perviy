@@ -631,6 +631,7 @@ def can_refresh(operation: Operation) -> bool:
                 OperationKind.REMARK,
                 OperationKind.AGGREGATION,
                 OperationKind.REAGGREGATION,
+                OperationKind.DISAGGREGATION,
             )
             and bool(operation.document_id.strip() and operation.product_group.strip()))
 

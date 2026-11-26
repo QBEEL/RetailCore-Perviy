@@ -634,6 +634,7 @@ def world(application, tmp_path, monkeypatch):
     class Session:
         contour = Contour.SANDBOX
         inn = OUR_INN
+        thumbprint = "ААББ"
 
     class FakeBox:
         Icon = QMessageBox.Icon
@@ -982,15 +983,14 @@ def test_окно_проверки_кодов_показывает_ожидан�
     assert not dialog.isVisible()
 
 
-def test_изъятие_из_окна_проверки_отправляет_только_выбранный_код(
-    application, world, monkeypatch
-):
-    from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QDialog, QListWidget, QPushButton
+@pytest.mark.parametrize("kind", ["BOX", "SET"])
+def test_действие_с_упаковкой_из_окна_проверки(application, world, monkeypatch, kind):
+    from PySide6.QtWidgets import QMessageBox
+    from app.ui.widgets.marking_packages import PackagesDialog
     from app.ui.widgets import sets_tab as module
 
     tab, state, _ = world
-    package = "TEST-BOX-1"
+    package = "TEST-PARENT-1"
     tab.set_set_code(SET_RAW)
     tab.add_many(f"{ITEM1_RAW}\n{ITEM2_RAW}")
     state["checked"] = [
@@ -1000,40 +1000,58 @@ def test_изъятие_из_окна_проверки_отправляет_то
     ]
     for item in state["checked"][1:]:
         item.raw = {"cisInfo": {"parent": package}}
+    parent = CodeInfo(code=package, found=True, valid=True, state=CodeState.INTRODUCED,
+                      package_type=kind, owner_inn=OUR_INN, product_group="cosmetics",
+                      product_name="Тестовый набор", children=(ITEM1_KI, ITEM2_KI))
+    by_code = {item.code: item for item in [*state["checked"], parent]}
+    monkeypatch.setattr(service, "check_exact", lambda codes, _: [by_code[code] for code in codes])
     submitted = []
 
     def send(parent, codes, inn, thumbprint, contour):
         submitted.append((parent, codes, inn, contour))
-        return Operation(status=OperationStatus.DONE, document_id="test-removal")
+        return Operation(status=OperationStatus.DONE, document_id="test-document")
+
+    def disband(package, codes, expected, inn, thumbprint, contour):
+        assert expected is parent
+        return send(package, codes, inn, thumbprint, contour)
 
     monkeypatch.setattr(module.reaggregation, "send", send)
-    monkeypatch.setattr(module.QInputDialog, "getItem", lambda *_: (package, True))
+    monkeypatch.setattr(module.reaggregation, "disband", disband)
     tab.check_button.click()
     _settle(application)
-    dialog = tab.findChild(module._SetCheckDialog)
-    assert dialog.remove_button.isVisible()
+    check_dialog = tab.findChild(module._SetCheckDialog)
+    assert check_dialog.packages_button.isVisible()
+    check_dialog.packages_button.click()
+    _settle(application)
+    dialog = check_dialog.findChild(PackagesDialog)
+    assert dialog.isVisible()
+    for text in (package, parent.product_name, ITEM1_KI, ITEM2_KI):
+        assert text in dialog.details.toPlainText()
     assert not submitted
 
-    def choose():
-        picker = application.activeModalWidget()
-        assert isinstance(picker, QDialog)
-        items = picker.findChild(QListWidget)
-        button = next(
-            button for button in picker.findChildren(QPushButton)
-            if button.text() == "Подписать и отправить"
-        )
-        assert not button.isEnabled()
-        items.item(1).setSelected(True)
-        button.click()
+    if kind == "BOX":
+        assert dialog.action.text() == "Изъять выбранные коды…"
+        assert not dialog.action.isEnabled()
+        dialog.selection.item(1).setSelected(True)
+        selected = (ITEM2_KI,)
+    else:
+        assert dialog.action.text() == "Расформировать набор…"
+        assert dialog.selection.isHidden()
+        selected = (ITEM1_KI, ITEM2_KI)
 
-    QTimer.singleShot(0, choose)
-    dialog.remove_button.click()
+    monkeypatch.setattr(QMessageBox, "exec", lambda _: QMessageBox.StandardButton.Cancel)
+    dialog.action.click()
+    assert not submitted
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda _: QMessageBox.StandardButton.Yes)
+    dialog.action.click()
     _settle(application)
-    assert submitted == [(package, (ITEM2_KI,), OUR_INN, Contour.SANDBOX)]
+    assert submitted == [(package, selected, OUR_INN, Contour.SANDBOX)]
     assert tab.codes == [ITEM1_RAW, ITEM2_RAW]
-    assert "test-removal" in dialog.details.toPlainText()
-    assert "Повторите проверку" in dialog.details.toPlainText()
+    assert "test-document" in dialog.message.text()
+    assert "Повторите проверку" in dialog.message.text()
     dialog.close_button.click()
+    check_dialog.close_button.click()
 
 
 def test_успешное_формирование_набора_записывает_операцию_и_очищает_черновик(

@@ -34,10 +34,8 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -65,6 +63,7 @@ from .. import icons
 from ..tasks import run_task
 from ..theme import Metrics, Palette
 from .common import Card, Hint, MetricTile, SectionTitle
+from .marking_packages import PackagesDialog
 from .toast import ToastKind
 
 DEFAULT_GROUP = sets.DEFAULT_PRODUCT_GROUP
@@ -126,22 +125,14 @@ class _SetCheckDialog(QDialog):
         layout.addWidget(self.details, 1)
         buttons = QHBoxLayout()
         buttons.addStretch()
-        self.remove_button = QPushButton("Изъять коды…", self)
-        self.remove_button.hide()
-        buttons.addWidget(self.remove_button)
+        self.packages_button = QPushButton("Где находятся коды…", self)
+        self.packages_button.hide()
+        buttons.addWidget(self.packages_button)
         self.close_button = QPushButton("Закрыть", self)
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.accept)
         buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
-
-    def show_waiting(self, text: str) -> None:
-        self.summary.setText(text)
-        self.summary.setStyleSheet("")
-        self.progress.show()
-        self.details.hide()
-        self.remove_button.hide()
-        self.close_button.setEnabled(False)
 
     def show_result(self, summary: str, details: tuple[str, ...], colour: str) -> None:
         self.progress.hide()
@@ -1432,8 +1423,10 @@ class SetsTab(QWidget):
         if result.ok:
             self._finish_code_check("Коды прошли проверку ЧЗ", details, Palette.SUCCESS)
         else:
-            wanted = {code for unit in units for code in unit.item_kis}
-            self._enable_removal(reaggregation.blocked_items(item for item in items if item.code in wanted))
+            self._enable_packages(tuple(
+                item.code for item in items if item.found and item.valid and item.code
+                and (item.parent_code or (reaggregation.is_set(item) and item.children))
+            ))
             self._finish_code_check("Проверка выявила замечания", details, Palette.DANGER)
 
     def _on_check_error(self, message: str) -> None:
@@ -1446,87 +1439,27 @@ class SetsTab(QWidget):
             self._check_dialog.show_result(summary, details, colour)
             self._check_dialog = None
 
-    def _enable_removal(self, packages: dict[str, list[str]]) -> None:
+    def _enable_packages(self, codes: tuple[str, ...]) -> None:
         dialog = self._check_dialog
-        if dialog is None or not packages:
-            return
-        dialog.remove_button.show()
-        dialog.remove_button.clicked.connect(lambda: self._select_removal(dialog, packages))
-
-    def _select_removal(self, dialog: _SetCheckDialog, packages: dict[str, list[str]]) -> None:
-        if self._busy or self._pending_submission():
+        if dialog is None or not codes:
             return
         contour = self._contour()
+        dialog.packages_button.show()
+        dialog.packages_button.clicked.connect(lambda: self._show_packages(dialog, codes, contour))
+
+    def _show_packages(self, parent: _SetCheckDialog, codes: tuple[str, ...], contour: Contour) -> None:
+        if self._busy:
+            return
         current = service.current()
-        inn = self.inn_edit.text().strip()
-        thumbprint = self._thumbprint()
-        if not service.signed_in() or current.contour is not contour or current.inn != inn or not thumbprint:
-            self._tell("Для изъятия войдите в ЧЗ под организацией черновика", ToastKind.WARNING)
+        if not service.signed_in() or current.contour is not contour or self._contour() is not contour:
+            QMessageBox.warning(parent, "Сеанс ЧЗ", "Войдите в ЧЗ в контуре, где проверялись коды.")
             return
-        package, accepted = QInputDialog.getItem(
-            dialog, "Изъять коды", "Выберите транспортную упаковку", list(packages), 0, False
-        )
-        if not accepted:
-            return
-
-        picker = QDialog(dialog)
-        picker.setWindowTitle("Изъять коды из упаковки")
-        picker.resize(520, 400)
-        layout = QVBoxLayout(picker)
-        layout.addWidget(QLabel(f"Упаковка {package} · {contour.title}", picker))
-        items = QListWidget(picker)
-        items.addItems(packages[package])
-        items.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        layout.addWidget(items, 1)
-        buttons = QHBoxLayout()
-        select_all = QPushButton("Выбрать все", picker)
-        select_all.clicked.connect(items.selectAll)
-        buttons.addWidget(select_all)
-        buttons.addStretch()
-        cancel = QPushButton("Отмена", picker)
-        cancel.setDefault(True)
-        cancel.clicked.connect(picker.reject)
-        buttons.addWidget(cancel)
-        submit = QPushButton("Подписать и отправить", picker)
-        submit.setAutoDefault(False)
-        submit.setEnabled(False)
-        submit.clicked.connect(picker.accept)
-        items.itemSelectionChanged.connect(lambda: submit.setEnabled(bool(items.selectedItems())))
-        buttons.addWidget(submit)
-        layout.addLayout(buttons)
-        if picker.exec() != QDialog.DialogCode.Accepted:
-            return
-        selected = tuple(item.text() for item in items.selectedItems())
-        self._busy = True
-        self._check_dialog = dialog
-        self._sync()
-        dialog.show_waiting("Проверяем состав упаковки и отправляем изъятие в ЧЗ…")
-        run_task(
-            reaggregation.send, package, selected, inn, thumbprint, contour,
-            on_result=self._on_removal_sent, on_error=self._on_removal_error,
-        )
-
-    def _on_removal_sent(self, operation: Operation) -> None:
-        self.journal_changed.emit()
-        details = (f"Документ {operation.document_id}",) if operation.document_id else ()
-        if operation.error:
-            details += (operation.error,)
-        if operation.status is OperationStatus.DONE:
-            self._finish_code_check(
-                "ЧЗ подтвердил изъятие кодов",
-                details + ("Повторите проверку кодов набора.",), Palette.SUCCESS,
-            )
-        elif operation.status.pending:
-            self._finish_code_check(
-                "Результат изъятия пока неизвестен",
-                details + ("Проверьте документ в журнале или личном кабинете ЧЗ.",), Palette.WARNING,
-            )
-        else:
-            self._finish_code_check("ЧЗ не подтвердил изъятие кодов", details, Palette.DANGER)
-
-    def _on_removal_error(self, message: str) -> None:
-        self.journal_changed.emit()
-        self._finish_code_check("Изъятие кодов не завершено", (message,), Palette.DANGER)
+        draft_inn = self.inn_edit.text().strip()
+        read_only = self._pending_submission() or draft_inn != current.inn
+        dialog = PackagesDialog(codes, contour, current.inn, current.thumbprint, parent, read_only=read_only)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.journal_changed.connect(self.journal_changed)
+        dialog.open()
 
     def _refresh_table_statuses(self) -> None:
         assigned = self._assigned_set_map()

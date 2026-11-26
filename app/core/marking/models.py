@@ -110,6 +110,7 @@ class OperationKind(str, Enum):
     REMARK = "remark"
     AGGREGATION = "aggregation"
     REAGGREGATION = "reaggregation"
+    DISAGGREGATION = "disaggregation"
 
     @property
     def title(self) -> str:
@@ -139,6 +140,7 @@ KIND_TITLES: dict[OperationKind, str] = {
     OperationKind.REMARK: "Перемаркировка",
     OperationKind.AGGREGATION: "Формирование набора",
     OperationKind.REAGGREGATION: "Изъятие кодов из упаковки",
+    OperationKind.DISAGGREGATION: "Расформирование набора",
 }
 
 

@@ -276,6 +276,7 @@ class CodeInfoDialog(QDialog):
     REMARK = "remark"
     WITHDRAW = "withdraw"
     TECHNICAL_CARD = "technical_card"
+    PACKAGE = "package"
 
     def __init__(self, info: CodeInfo, parent: QWidget | None = None, *,
                  print_blocked: str = "") -> None:
@@ -312,6 +313,7 @@ class CodeInfoDialog(QDialog):
             ("Разрешительные документы", permits_text(info)),
             ("Замечания", "\n".join(info.remarks) or "—"),
             ("Код", info.code or "—"),
+            ("Родительская упаковка", info.parent_code or "—"),
         )
         form = QFormLayout()
         form.setHorizontalSpacing(Metrics.GAP)
@@ -324,6 +326,10 @@ class CodeInfoDialog(QDialog):
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             form.addRow(f"{title}:", value)
         root.addLayout(form)
+
+        if info.code:
+            self.package_button = self._action_button("Где находится код…", "order", self.PACKAGE, "")
+            root.addWidget(self.package_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         if info.raw:
             root.addWidget(Hint("Ответ «Честного ЗНАКа» как он пришёл:", self))

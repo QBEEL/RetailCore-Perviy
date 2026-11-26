@@ -1,4 +1,4 @@
-"""Частичное изъятие кодов единиц товара из транспортной упаковки."""
+"""Проверка состава, частичное изъятие из КИТУ и расформирование КИН."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,7 @@ from .models import (
 )
 
 DOCUMENT_TYPE = "REAGGREGATION_DOCUMENT"
+DISAGGREGATION_TYPE = "DISAGGREGATION_DOCUMENT"
 
 
 def _value(info: CodeInfo, name: str) -> str:
@@ -29,6 +30,32 @@ def blocked_items(items: Iterable[CodeInfo]) -> dict[str, list[str]]:
             if item.code not in codes:
                 codes.append(item.code)
     return result
+
+
+def package_type(info: CodeInfo) -> str:
+    return _value(info, "generalPackageType").upper() or info.package_type
+
+
+def is_set(info: CodeInfo) -> bool:
+    return package_type(info) in ("SET", "PRODUCT_SET")
+
+
+def locate(codes: tuple[str, ...], inn: str, thumbprint: str, contour: Contour
+           ) -> tuple[dict[str, list[str]], dict[str, CodeInfo], tuple[str, ...]]:
+    """Возвращает текущие привязки кодов и сведения об их упаковках из ЧЗ."""
+    _check_session(inn, thumbprint, contour)
+    items = {item.code: item for item in service.check_exact(codes, contour)}
+    groups = blocked_items(items.values())
+    for item in items.values():
+        if item.found and item.valid and is_set(item) and item.children:
+            groups.setdefault(item.code, [])
+    packages = {code: items[code] for code in groups if code in items}
+    if missing := tuple(code for code in groups if code not in packages):
+        packages.update((item.code, item) for item in service.check_exact(missing, contour))
+    _check_session(inn, thumbprint, contour)
+    unconfirmed = tuple(code for code in codes
+                        if code not in items or not items[code].found or not items[code].valid)
+    return groups, packages, unconfirmed
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +97,7 @@ def prepare(package: str, codes: tuple[str, ...], inn: str, contour: Contour) ->
     box = fresh.get(package)
     if not box or not box.found or not box.valid:
         raise ValueError("ЧЗ не подтвердил сведения об упаковке")
-    if box.package_type != "BOX":
+    if package_type(box) != "BOX":
         raise ValueError("Частичное изъятие доступно для транспортной упаковки (КИТУ)")
     if not inn or box.owner_inn.strip() != inn:
         raise ValueError("ЧЗ не подтвердил, что транспортная упаковка принадлежит вашей организации")
@@ -113,17 +140,93 @@ def prepare(package: str, codes: tuple[str, ...], inn: str, contour: Contour) ->
 def send(package: str, codes: tuple[str, ...], inn: str, thumbprint: str,
          contour: Contour) -> Operation:
     document = prepare(package, codes, inn, contour)
-    current = service.current()
-    if not service.signed_in() or (current.contour, current.inn, current.thumbprint) != (
-        contour, inn, thumbprint,
-    ):
-        raise ValueError("Сеанс ЧЗ сменился. Повторите проверку под нужным сертификатом")
-    operation = store.create(Operation(
+    return _send(document, Operation(
         kind=OperationKind.REAGGREGATION, status=OperationStatus.SENDING,
         contour=contour, product_group=document.group, reason=package,
-        codes=[package, *codes], certificate=current.owner,
-        comment=f"Изъятие вложений: {len(codes)}",
-    ))
+        codes=[package, *codes], comment=f"Изъятие вложений: {len(codes)}",
+    ), thumbprint)
+
+
+@dataclass(frozen=True, slots=True)
+class Disband:
+    inn: str
+    group: str
+    package: str
+
+    wire_format = "MANUAL"
+
+    def wire_type(self, group: str) -> str:
+        if group != self.group:
+            raise introduce.IntroduceProblem("Товарная группа набора изменилась")
+        return DISAGGREGATION_TYPE
+
+    def render(self, extension: str = ".json") -> str:
+        return json.dumps({"participant_inn": self.inn, "products_list": [{"uitu": self.package}]},
+                          ensure_ascii=False)
+
+
+def disband_problem(info: CodeInfo, codes: Iterable[str], inn: str) -> str:
+    from .sets import SUPPORTED_SET_GROUPS
+
+    if not info.found or not info.valid or not is_set(info):
+        return "ЧЗ не подтвердил, что этот код относится к набору (КИН)."
+    if info.state is CodeState.DISAGGREGATED:
+        return "Набор уже расформирован. Повторите проверку кодов."
+    if not inn or info.owner_inn.strip() != inn:
+        return "ЧЗ не подтвердил, что набор принадлежит вашей организации."
+    if info.product_group not in SUPPORTED_SET_GROUPS:
+        return "Товарная группа набора не определена или не поддерживается."
+    if info.parent_code:
+        return "Набор вложен в другую упаковку. Сначала освободите его из неё."
+    if info.state not in (CodeState.APPLIED, CodeState.INTRODUCED):
+        return f"Статус набора «{info.state.title}» не подходит для расформирования."
+    special = (_value(info, "statusEx") or _value(info, "statusExt")).upper()
+    if special not in ("", "EMPTY") and not (
+        info.state is CodeState.INTRODUCED and special == "WAIT_TRANSFER_TO_OWNER"
+    ):
+        return "Особое состояние набора не подходит для расформирования."
+    if not info.children or not set(info.children).issuperset(codes):
+        return "ЧЗ не подтвердил состав набора или привязку проверяемых кодов."
+    return ""
+
+
+def disband(package: str, codes: tuple[str, ...], expected: CodeInfo,
+            inn: str, thumbprint: str, contour: Contour) -> Operation:
+    if not package or expected.code != package or package in codes:
+        raise ValueError("Код набора отличается от подтверждённого в карточке.")
+    _check_session(inn, thumbprint, contour)
+    fresh = {item.code: item for item in service.check_exact((package, *codes), contour)}
+    info = fresh.get(package, CodeInfo())
+    if problem := disband_problem(info, codes, inn):
+        raise ValueError(problem)
+    if info.product_group != expected.product_group or set(info.children) != set(expected.children):
+        raise ValueError("Состав или товарная группа набора изменились. Проверьте набор заново.")
+    for code in codes:
+        item = fresh.get(code, CodeInfo())
+        if not item.found or not item.valid or item.parent_code != package:
+            raise ValueError("Привязка проверяемого кода изменилась. Проверьте набор заново.")
+
+    document = Disband(inn, info.product_group, package)
+    return _send(document, Operation(
+        kind=OperationKind.DISAGGREGATION, status=OperationStatus.SENDING,
+        contour=contour, product_group=document.group, reason=package,
+        codes=[package], comment=f"Вложений перед расформированием: {len(info.children)}",
+    ), thumbprint)
+
+
+def _check_session(inn: str, thumbprint: str, contour: Contour) -> None:
+    current = service.current()
+    if not service.signed_in() or (contour, inn, thumbprint) != (
+        current.contour, current.inn, current.thumbprint,
+    ):
+        raise ValueError("Сеанс ЧЗ сменился. Войдите под нужной организацией и сертификатом.")
+
+
+def _send(document: Removal | Disband, operation: Operation, thumbprint: str) -> Operation:
+    contour = operation.contour
+    _check_session(document.inn, thumbprint, contour)
+    operation.certificate = service.current().owner
+    store.create(operation)
 
     def created(doc_id: str) -> None:
         operation.document_id = doc_id

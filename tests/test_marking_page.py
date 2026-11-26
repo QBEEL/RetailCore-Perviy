@@ -1029,6 +1029,38 @@ def test_результат_показывает_все_коды_без_обре
     assert "показаны первые" not in page.result_hint.text()
 
 
+def test_карточка_кода_заново_проверяет_родительскую_упаковку(application, tmp_path, stub, monkeypatch):
+    from app.ui import marking_page
+    from app.ui.widgets.marking_packages import PackagesDialog
+
+    class ChoosePackage(marking_page.CodeInfoDialog):
+        def exec(self):
+            self.package_button.click()
+
+    _, state = stub
+    state["signed"] = True
+    state["session"].thumbprint = "test"
+    monkeypatch.setattr(marking_page, "CodeInfoDialog", ChoosePackage)
+    requests = []
+
+    def check_exact(codes, contour):
+        requests.append((tuple(codes), contour))
+        return [_info(KI)]
+
+    monkeypatch.setattr(marking_page.service, "check_exact", check_exact)
+    page = _page(application, tmp_path)
+    cached = _info(KI)
+    cached.raw = {"cisInfo": {"parent": "PREVIOUS-SET"}}
+    page._show_result([cached])
+    page._on_result_activated(0, 0)
+    _settle(application)
+    dialog = page.findChild(PackagesDialog)
+    assert requests == [((KI,), page.contour)]
+    assert "нет родительской упаковки" in dialog.details.toPlainText()
+    assert dialog.action.isHidden()
+    dialog.close_button.click()
+
+
 def test_двойной_щелчок_открывает_сведения_о_коде(application, tmp_path, stub, monkeypatch):
     """С отбором «только замечания» номер строки не равен номеру кода."""
     from app.ui import marking_page
